@@ -1,6 +1,7 @@
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::deepgram_client::DeepgramSession;
+use crate::injector;
 use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
@@ -12,6 +13,9 @@ use std::time::Duration;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = env!("ASHE_BUILD_ID");
+const OVERLAY_TICK_MS: u64 = 16;
+const OVERLAY_SMOOTHING: f32 = 0.28;
+const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,6 +30,7 @@ enum DictationState {
 
 struct DictationSession {
     target_hwnd: isize,
+    selected_context: Option<String>,
     raw_transcript: String,
 }
 
@@ -45,6 +50,7 @@ pub struct UiApp {
     session: Option<DictationSession>,
     window_id: Option<window::Id>,
     position: Option<Point>,
+    target_position: Option<Point>,
     visible: bool,
     status: String,
     transcript: String,
@@ -84,6 +90,7 @@ impl UiApp {
             session: None,
             window_id: None,
             position: None,
+            target_position: None,
             visible: false,
             status: "Ready".to_string(),
             transcript: String::new(),
@@ -97,7 +104,7 @@ impl UiApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(40)).map(|_| Message::Tick)
+        iced::time::every(Duration::from_millis(OVERLAY_TICK_MS)).map(|_| Message::Tick)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -132,6 +139,9 @@ impl UiApp {
         }
         self.pump_transcripts_and_statuses();
         self.join_finished_threads();
+        if self.visible && self.advance_overlay_position() {
+            tasks.push(self.apply_window_state());
+        }
         if self.state == DictationState::Stopping {
             self.complete_stop_if_ready(&mut tasks);
         }
@@ -143,13 +153,10 @@ impl UiApp {
             Win32Event::ToggleRequested { target_hwnd, x, y } => {
                 self.toggle(target_hwnd, Point::new(x as f32, y as f32))
             }
+            Win32Event::CancelRequested => self.cancel_operation(),
             Win32Event::PositionChanged { x, y } => {
-                self.position = Some(Point::new(x as f32, y as f32));
-                if self.visible {
-                    self.apply_window_state()
-                } else {
-                    Task::none()
-                }
+                self.target_position = Some(Point::new(x as f32, y as f32));
+                Task::none()
             }
             Win32Event::ReloadConfigRequested => {
                 self.reload_config();
@@ -175,10 +182,7 @@ impl UiApp {
                 Task::none()
             }
             Win32Event::QuitRequested => self.quit(),
-            Win32Event::PasteCompleted(result) => {
-                self.finish_insert(result);
-                Task::none()
-            }
+            Win32Event::PasteCompleted(result) => self.finish_insert(result),
             Win32Event::ServiceStopped => {
                 logger::info("Win32 service stopped event received");
                 Task::none()
@@ -234,6 +238,25 @@ impl UiApp {
         }
     }
 
+    fn cancel_operation(&mut self) -> Task<Message> {
+        if self.state == DictationState::Idle {
+            return Task::none();
+        }
+        logger::info("Cancel operation requested");
+        self.stop_workers_for_cancel();
+        self.session = None;
+        self.state = DictationState::Idle;
+        self.visible = false;
+        self.status = "Cancelled".to_string();
+        self.polished = None;
+        self.error = None;
+        self.send_win32(Win32Command::SetActive(false));
+        self.send_win32(Win32Command::SetTooltip(
+            "Ashe Dictate RS - Cancelled - Ctrl+Shift+D".to_string(),
+        ));
+        self.apply_window_state()
+    }
+
     fn start(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
         if let Err(err) = self.config.validate_for_dictation() {
             logger::info(format!("Config validation failed: {err:#}"));
@@ -247,12 +270,15 @@ impl UiApp {
         self.state = DictationState::Starting;
         self.visible = true;
         self.position = Some(position);
+        self.target_position = Some(position);
         self.status = "Connecting...".to_string();
         self.transcript.clear();
         self.polished = None;
         self.error = None;
+        let selected_context = self.capture_selected_context();
         self.session = Some(DictationSession {
             target_hwnd,
+            selected_context,
             raw_transcript: String::new(),
         });
         self.send_win32(Win32Command::SetActive(true));
@@ -264,12 +290,12 @@ impl UiApp {
             Ok(audio) => audio,
             Err(err) => {
                 logger::info(format!("Audio start failed: {err:#}"));
-                self.finish_without_transcript();
+                let hide_task = self.finish_without_transcript();
                 self.send_win32(Win32Command::ShowMessageBox {
                     title: "Ashe Dictate RS".to_string(),
                     text: format!("Audio capture failed: {err}"),
                 });
-                return Task::none();
+                return hide_task;
             }
         };
         let deepgram = DeepgramSession::start(
@@ -330,14 +356,12 @@ impl UiApp {
 
     fn begin_polishing(&mut self) -> Task<Message> {
         let Some(session) = self.session.as_ref() else {
-            self.finish_without_transcript();
-            return Task::none();
+            return self.finish_without_transcript();
         };
         let raw = session.raw_transcript.trim().to_string();
         if raw.is_empty() {
             logger::info("No transcript captured");
-            self.finish_without_transcript();
-            return Task::none();
+            return self.finish_without_transcript();
         }
         self.state = DictationState::Polishing;
         self.status = "Polishing with Kimi...".to_string();
@@ -345,9 +369,10 @@ impl UiApp {
             "Ashe Dictate RS - Polishing... - Ctrl+Shift+D".to_string(),
         ));
         let config = self.config.clone();
+        let context = session.selected_context.clone();
         Task::perform(
             async move {
-                llm_client::polish_transcript(config, raw)
+                llm_client::polish_transcript(config, raw, context)
                     .await
                     .map_err(|err| format!("{err:#}"))
             },
@@ -360,8 +385,7 @@ impl UiApp {
             return Task::none();
         }
         let Some(session) = self.session.as_ref() else {
-            self.finish_without_transcript();
-            return Task::none();
+            return self.finish_without_transcript();
         };
         let raw = session.raw_transcript.trim().to_string();
         let text = match result {
@@ -385,7 +409,7 @@ impl UiApp {
         Task::none()
     }
 
-    fn finish_insert(&mut self, result: Result<(), String>) {
+    fn finish_insert(&mut self, result: Result<(), String>) -> Task<Message> {
         if let Err(err) = result {
             logger::info(format!("Text injection failed: {err}"));
             self.error = Some("Paste failed".to_string());
@@ -397,20 +421,14 @@ impl UiApp {
                 "Ashe Dictate RS - Inserted - Ctrl+Shift+D".to_string(),
             ));
         }
-        self.session = None;
-        self.state = DictationState::Idle;
-        self.visible = false;
-        self.send_win32(Win32Command::SetActive(false));
+        self.hide_overlay_after_session()
     }
 
-    fn finish_without_transcript(&mut self) {
-        self.session = None;
-        self.state = DictationState::Idle;
-        self.visible = false;
-        self.send_win32(Win32Command::SetActive(false));
+    fn finish_without_transcript(&mut self) -> Task<Message> {
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Dictate RS - Idle - Ctrl+Shift+D".to_string(),
         ));
+        self.hide_overlay_after_session()
     }
 
     fn reload_config(&mut self) {
@@ -441,6 +459,16 @@ impl UiApp {
         });
     }
 
+    fn capture_selected_context(&self) -> Option<String> {
+        match injector::capture_selected_text() {
+            Ok(context) => context,
+            Err(err) => {
+                logger::info(format!("Selection context capture failed: {err:#}"));
+                None
+            }
+        }
+    }
+
     fn quit(&mut self) -> Task<Message> {
         logger::info("Quit requested");
         self.request_stop();
@@ -465,6 +493,48 @@ impl UiApp {
                 }
             }
         }
+    }
+
+    fn hide_overlay_after_session(&mut self) -> Task<Message> {
+        self.session = None;
+        self.state = DictationState::Idle;
+        self.visible = false;
+        self.target_position = self.position;
+        self.send_win32(Win32Command::SetActive(false));
+        self.apply_window_state()
+    }
+
+    fn stop_workers_for_cancel(&mut self) {
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop();
+        }
+        if let Some(mut deepgram) = self.deepgram.take() {
+            deepgram.request_stop();
+        }
+    }
+
+    fn advance_overlay_position(&mut self) -> bool {
+        let Some(target) = self.target_position else {
+            return false;
+        };
+        let Some(current) = self.position else {
+            self.position = Some(target);
+            return true;
+        };
+        let dx = target.x - current.x;
+        let dy = target.y - current.y;
+        if dx.hypot(dy) <= OVERLAY_SNAP_DISTANCE {
+            if current != target {
+                self.position = Some(target);
+                return true;
+            }
+            return false;
+        }
+        self.position = Some(Point::new(
+            current.x + dx * OVERLAY_SMOOTHING,
+            current.y + dy * OVERLAY_SMOOTHING,
+        ));
+        true
     }
 
     fn apply_window_state(&self) -> Task<Message> {

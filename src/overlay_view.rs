@@ -8,8 +8,8 @@ use iced::{Background, Color, Element, Length, Point, Shadow, Size, Task, Vector
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Ashe Dictate Rs - Iced";
-const WIDTH: f32 = 430.0;
-const HEIGHT: f32 = 180.0;
+pub const WIDTH: f32 = 430.0;
+pub const HEIGHT: f32 = 180.0;
 
 pub fn window_settings() -> window::Settings {
     logger::info(format!(
@@ -43,6 +43,7 @@ pub fn view<'a, Message: 'a>(
             (!text.is_empty()).then_some(text)
         })
         .unwrap_or("Speak naturally. Your dictated text will appear here.");
+    let listening = status.starts_with("Listening") || status == "Speech detected";
     let status = if let Some(error) = error {
         format!("{status} · {error}")
     } else {
@@ -57,18 +58,24 @@ pub fn view<'a, Message: 'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(16)
-        .style(|_| container::Style {
-            text_color: Some(Color::from_rgb(0.96, 0.98, 1.0)),
-            background: Some(Background::Color(Color::from_rgba(0.04, 0.05, 0.08, 0.94))),
-            border: iced::border::rounded(16)
-                .width(1)
-                .color(Color::from_rgba(0.36, 0.45, 0.62, 0.55)),
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-                offset: Vector::new(0.0, 8.0),
-                blur_radius: 24.0,
-            },
-            ..Default::default()
+        .style(move |_| {
+            let background = Color::from_rgba(0.025, 0.035, 0.055, 0.95);
+            let border = if listening {
+                Color::from_rgba(0.0, 0.88, 1.0, 0.88)
+            } else {
+                background
+            };
+            container::Style {
+                text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
+                background: Some(Background::Color(background)),
+                border: iced::border::rounded(22).width(2).color(border),
+                shadow: Shadow {
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                    offset: Vector::new(0.0, 10.0),
+                    blur_radius: 28.0,
+                },
+                ..Default::default()
+            }
         })
         .into()
 }

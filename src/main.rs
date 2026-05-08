@@ -12,11 +12,15 @@ mod win32_service;
 
 use anyhow::Result;
 use ui_app::UiApp;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = env!("ASHE_BUILD_ID");
 
 fn main() -> Result<()> {
+    init_process_dpi_awareness();
     logger::init();
     init_rustls_crypto_provider();
     logger::info(format!("Build version={APP_VERSION} build_id={BUILD_ID}"));
@@ -32,6 +36,12 @@ fn main() -> Result<()> {
 
 fn app_title(_app: &UiApp) -> String {
     overlay_view::TITLE.to_string()
+}
+
+fn init_process_dpi_awareness() {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
 }
 
 fn init_rustls_crypto_provider() {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_FIREWORKS_API_BASE: &str = "https://api.fireworks.ai/inference/v1";
 const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/kimi-k2p6";
-const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
+const DEFAULT_LLM_MAX_TOKENS: u32 = 1536;
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
 
 #[derive(Clone)]

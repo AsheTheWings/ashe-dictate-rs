@@ -2,16 +2,20 @@
 
 use crate::injector;
 use crate::logger;
+use crate::overlay_view;
 use crate::util::{pcwstr, wide};
 use crossbeam_channel::{Receiver, Sender};
 use std::ffi::c_void;
 use std::process::Command;
 use std::ptr::null_mut;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
+    MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -19,8 +23,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const HOTKEY_ID: i32 = 1001;
+const TOGGLE_HOTKEY_ID: i32 = 1001;
+const CANCEL_HOTKEY_ID: i32 = 1002;
 const TIMER_SERVICE: usize = 2001;
+const TIMER_INTERVAL_MS: u32 = 16;
+const CURSOR_OVERLAY_GAP: i32 = 8;
 const WM_TRAY: u32 = WM_APP + 1;
 const MENU_TOGGLE: usize = 3001;
 const MENU_RELOAD_CONFIG: usize = 3002;
@@ -32,6 +39,7 @@ const MENU_QUIT: usize = 3006;
 #[derive(Debug, Clone)]
 pub enum Win32Event {
     ToggleRequested { target_hwnd: isize, x: i32, y: i32 },
+    CancelRequested,
     PositionChanged { x: i32, y: i32 },
     ReloadConfigRequested,
     OpenLogRequested,
@@ -57,6 +65,7 @@ struct ServiceState {
     event_tx: Sender<Win32Event>,
     command_rx: Receiver<Win32Command>,
     active: bool,
+    cancel_hotkey_registered: bool,
 }
 
 pub fn spawn(
@@ -109,10 +118,11 @@ unsafe fn run_message_loop(
         event_tx,
         command_rx,
         active: false,
+        cancel_hotkey_registered: false,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     register_hotkey(hwnd);
-    let timer_id = SetTimer(Some(hwnd), TIMER_SERVICE, 80, None);
+    let timer_id = SetTimer(Some(hwnd), TIMER_SERVICE, TIMER_INTERVAL_MS, None);
     if timer_id == 0 {
         logger::info("Win32 service SetTimer failed");
     }
@@ -134,9 +144,9 @@ unsafe extern "system" fn window_proc(
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ServiceState;
     let state = state_ptr.as_mut();
     match message {
-        WM_HOTKEY => {
-            if wparam.0 as i32 == HOTKEY_ID {
-                logger::info("Hotkey pressed");
+        WM_HOTKEY => match wparam.0 as i32 {
+            TOGGLE_HOTKEY_ID => {
+                logger::info("Toggle hotkey pressed");
                 if let Some(state) = state {
                     let (x, y) = active_input_position();
                     let target_hwnd = target_window(hwnd);
@@ -146,7 +156,15 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
-        }
+            CANCEL_HOTKEY_ID => {
+                logger::info("Cancel hotkey pressed");
+                if let Some(state) = state {
+                    let _ = state.event_tx.send(Win32Event::CancelRequested);
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        },
         WM_TIMER => {
             if let Some(state) = state {
                 drain_commands(hwnd, state);
@@ -203,7 +221,8 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             remove_tray(hwnd);
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), TOGGLE_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
             if !state_ptr.is_null() {
                 let _ = Box::from_raw(state_ptr);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -219,7 +238,10 @@ unsafe extern "system" fn window_proc(
 unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
     while let Ok(command) = state.command_rx.try_recv() {
         match command {
-            Win32Command::SetActive(active) => state.active = active,
+            Win32Command::SetActive(active) => {
+                state.active = active;
+                set_cancel_hotkey(hwnd, state, active);
+            }
             Win32Command::SetTooltip(tooltip) => set_tray_tooltip(hwnd, &tooltip),
             Win32Command::ShowMessageBox { title, text } => message_box(hwnd, &text, &title),
             Win32Command::OpenLog(path) => {
@@ -258,7 +280,7 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
 unsafe fn register_hotkey(hwnd: HWND) {
     if let Err(err) = RegisterHotKey(
         Some(hwnd),
-        HOTKEY_ID,
+        TOGGLE_HOTKEY_ID,
         MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
         'D' as u32,
     ) {
@@ -271,29 +293,79 @@ unsafe fn register_hotkey(hwnd: HWND) {
     }
 }
 
-unsafe fn active_input_position() -> (i32, i32) {
-    let foreground = GetForegroundWindow();
-    if !foreground.0.is_null() {
-        let thread_id = GetWindowThreadProcessId(foreground, None);
-        let mut info = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
-        if GetGUIThreadInfo(thread_id, &mut info).is_ok() && !info.hwndCaret.0.is_null() {
-            let mut point = POINT {
-                x: info.rcCaret.left,
-                y: info.rcCaret.bottom,
-            };
-            if ClientToScreen(info.hwndCaret, &mut point).as_bool() {
-                return (point.x + 10, point.y + 16);
-            }
+unsafe fn set_cancel_hotkey(hwnd: HWND, state: &mut ServiceState, active: bool) {
+    if active == state.cancel_hotkey_registered {
+        return;
+    }
+    if active {
+        match RegisterHotKey(
+            Some(hwnd),
+            CANCEL_HOTKEY_ID,
+            MOD_NOREPEAT,
+            VK_ESCAPE.0 as u32,
+        ) {
+            Ok(()) => state.cancel_hotkey_registered = true,
+            Err(err) => logger::info(format!("Escape cancel hotkey registration failed: {err:#}")),
         }
+    } else {
+        let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
+        state.cancel_hotkey_registered = false;
     }
-    let mut point = POINT::default();
-    if GetCursorPos(&mut point).is_ok() {
-        return (point.x + 18, point.y + 18);
+}
+
+unsafe fn active_input_position() -> (i32, i32) {
+    let mut cursor = POINT::default();
+    if GetCursorPos(&mut cursor).is_err() {
+        return (120, 120);
     }
-    (120, 120)
+
+    let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    let scale = monitor_scale_factor(monitor);
+    let overlay_width = overlay_view::WIDTH;
+    let overlay_height = overlay_view::HEIGHT;
+    let gap = CURSOR_OVERLAY_GAP as f32;
+    let cursor_x = cursor.x as f32 / scale;
+    let cursor_y = cursor.y as f32 / scale;
+    let mut x = cursor_x + gap;
+    let mut y = cursor_y + gap;
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        let work_left = info.rcWork.left as f32 / scale;
+        let work_top = info.rcWork.top as f32 / scale;
+        let work_right = info.rcWork.right as f32 / scale;
+        let work_bottom = info.rcWork.bottom as f32 / scale;
+        if x + overlay_width > work_right {
+            x = cursor_x - overlay_width - gap;
+        }
+        if y + overlay_height > work_bottom {
+            y = cursor_y - overlay_height - gap;
+        }
+        x = clamp_to_work_area(x, work_left, work_right - overlay_width);
+        y = clamp_to_work_area(y, work_top, work_bottom - overlay_height);
+    }
+
+    (x.round() as i32, y.round() as i32)
+}
+
+unsafe fn monitor_scale_factor(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f32 {
+    let mut dpi_x = 96;
+    let mut dpi_y = 96;
+    if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_err() || dpi_x == 0 {
+        return 1.0;
+    }
+    dpi_x as f32 / 96.0
+}
+
+fn clamp_to_work_area(value: f32, min: f32, max: f32) -> f32 {
+    if min > max {
+        min
+    } else {
+        value.clamp(min, max)
+    }
 }
 
 unsafe fn target_window(service_hwnd: HWND) -> isize {

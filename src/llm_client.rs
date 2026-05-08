@@ -4,12 +4,16 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ReasoningEffort,
 };
 
-const SYSTEM_PROMPT: &str = "You rewrite dictated speech into clear, coherent text. Correct grammar, punctuation, casing, and formatting. Remove filler words, false starts, repeated phrases, and disfluencies. Preserve the speaker's intent and meaning. Do not add facts. Return only the final rewritten text.";
+const SYSTEM_PROMPT: &str = "Rewrite dictated speech into clear text as fast as possible. Do not reason. Do not explain. Correct grammar, punctuation, casing, and formatting. Remove filler words, false starts, repeated phrases, and disfluencies. Preserve intent and meaning. Do not add facts. Return only the final rewritten text.";
 
-pub async fn polish_transcript(config: AppConfig, transcript: String) -> Result<String> {
+pub async fn polish_transcript(
+    config: AppConfig,
+    transcript: String,
+    context: Option<String>,
+) -> Result<String> {
     let transcript = transcript.trim();
     if transcript.is_empty() {
         return Ok(String::new());
@@ -29,10 +33,11 @@ pub async fn polish_transcript(config: AppConfig, transcript: String) -> Result<
             ),
             ChatCompletionRequestMessage::User(
                 ChatCompletionRequestUserMessageArgs::default()
-                    .content(transcript.to_string())
+                    .content(user_prompt(transcript, context.as_deref()))
                     .build()?,
             ),
         ])
+        .reasoning_effort(ReasoningEffort::None)
         .temperature(config.llm_temperature)
         .max_completion_tokens(config.llm_max_tokens)
         .build()?;
@@ -51,4 +56,13 @@ pub async fn polish_transcript(config: AppConfig, transcript: String) -> Result<
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("Fireworks returned an empty response"))?;
     Ok(text)
+}
+
+fn user_prompt(transcript: &str, context: Option<&str>) -> String {
+    let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) else {
+        return transcript.to_string();
+    };
+    format!(
+        "Use the selected context only for terminology, style, and local reference. Rewrite only the dictated text. Do not include the selected context unless the dictated text explicitly asks for it.\n\nSelected context:\n{context}\n\nDictated text:\n{transcript}"
+    )
 }

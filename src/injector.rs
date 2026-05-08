@@ -20,12 +20,46 @@ use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 const CLIPBOARD_RETRIES: usize = 12;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(25);
+const COPY_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(180);
 
 pub fn copy_text(text: &str) -> Result<()> {
     set_clipboard_text(text).context("failed to set clipboard text")?;
     logger::info("Copied text to clipboard");
     Ok(())
+}
+
+pub fn capture_selected_text() -> Result<Option<String>> {
+    let previous_text = read_clipboard_text().ok().flatten();
+    set_clipboard_text("").context("failed to clear clipboard before selection capture")?;
+    send_ctrl_c().context("failed to send Ctrl+C")?;
+    thread::sleep(COPY_SETTLE_DELAY);
+    let selected_text = read_clipboard_text()
+        .context("failed to read clipboard after selection capture")?
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+
+    match previous_text {
+        Some(previous_text) => {
+            if let Err(err) = set_clipboard_text(&previous_text) {
+                logger::info(format!(
+                    "Clipboard restore failed after selection capture: {err:#}"
+                ));
+            }
+        }
+        None => {
+            if let Err(err) = set_clipboard_text("") {
+                logger::info(format!(
+                    "Clipboard clear failed after selection capture: {err:#}"
+                ));
+            }
+        }
+    }
+
+    if let Some(text) = selected_text.as_ref() {
+        logger::info(format!("Captured selected context chars={}", text.len()));
+    }
+    Ok(selected_text)
 }
 
 pub fn paste_text(text: &str) -> Result<()> {
@@ -134,12 +168,20 @@ impl Drop for ClipboardGuard {
     }
 }
 
+fn send_ctrl_c() -> Result<()> {
+    send_ctrl_key('C' as u16)
+}
+
 fn send_ctrl_v() -> Result<()> {
+    send_ctrl_key('V' as u16)
+}
+
+fn send_ctrl_key(key: u16) -> Result<()> {
     unsafe {
         let mut inputs = [
             key_input(VK_CONTROL.0 as u16, false),
-            key_input('V' as u16, false),
-            key_input('V' as u16, true),
+            key_input(key, false),
+            key_input(key, true),
             key_input(VK_CONTROL.0 as u16, true),
         ];
         let sent = SendInput(&mut inputs, size_of::<INPUT>() as i32);
