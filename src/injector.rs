@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use std::mem::size_of;
 use std::thread;
 use std::time::Duration;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     SetClipboardData,
@@ -16,6 +16,7 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL,
 };
+use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 const CLIPBOARD_RETRIES: usize = 12;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -45,6 +46,16 @@ pub fn paste_text(text: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn paste_text_to(hwnd: HWND, text: &str) -> Result<()> {
+    unsafe {
+        if !hwnd.0.is_null() {
+            let _ = SetForegroundWindow(hwnd);
+            thread::sleep(Duration::from_millis(90));
+        }
+    }
+    paste_text(text)
 }
 
 fn read_clipboard_text() -> Result<Option<String>> {

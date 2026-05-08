@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use deepgram::Deepgram;
 use deepgram::common::options::{Encoding, Endpointing, Options};
 use deepgram::common::stream_response::StreamResponse;
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -25,33 +27,41 @@ impl DeepgramSession {
         let (audio_tx, audio_rx) = unbounded_channel();
         let (stop_tx, stop_rx) = unbounded_channel();
         let thread = std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    logger::info(format!("Tokio runtime creation failed: {err:#}"));
-                    let _ = status_tx.send(format!("Error: Tokio runtime failed: {err}"));
-                    return;
-                }
-            };
-
-            runtime.block_on(async move {
-                if let Err(err) = run(
-                    config,
-                    sample_rate,
-                    audio_rx,
-                    stop_rx,
-                    transcript_tx,
-                    status_tx.clone(),
-                )
-                .await
+            let panic_status_tx = status_tx.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
                 {
-                    logger::info(format!("Deepgram error: {err:#}"));
-                    let _ = status_tx.send(format!("Error: Deepgram: {err}"));
-                }
-            });
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        logger::info(format!("Tokio runtime creation failed: {err:#}"));
+                        let _ = status_tx.send(format!("Error: Tokio runtime failed: {err}"));
+                        return;
+                    }
+                };
+
+                runtime.block_on(async move {
+                    if let Err(err) = run(
+                        config,
+                        sample_rate,
+                        audio_rx,
+                        stop_rx,
+                        transcript_tx,
+                        status_tx.clone(),
+                    )
+                    .await
+                    {
+                        logger::info(format!("Deepgram error: {err:#}"));
+                        let _ = status_tx.send(format!("Error: Deepgram: {err}"));
+                    }
+                });
+            }));
+            if let Err(payload) = result {
+                let message = panic_payload_message(payload.as_ref());
+                logger::info(format!("Deepgram worker panic: {message}"));
+                let _ = panic_status_tx.send(format!("Error: Deepgram worker panic: {message}"));
+            }
         });
 
         Self {
@@ -84,7 +94,12 @@ impl DeepgramSession {
         if let Some(thread) = self.thread.take() {
             match thread.join() {
                 Ok(()) => logger::info("Deepgram worker joined"),
-                Err(_) => logger::info("Deepgram worker panicked"),
+                Err(payload) => {
+                    logger::info(format!(
+                        "Deepgram worker panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    ));
+                }
             }
         }
         true
@@ -233,4 +248,13 @@ fn handle_response(
         }
         _ => {}
     }
+}
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
 }
