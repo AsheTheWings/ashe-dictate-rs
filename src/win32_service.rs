@@ -18,7 +18,7 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_BACK, VK_ESCAPE,
+    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_BACK, VK_ESCAPE,
     VK_RETURN,
 };
 use windows::Win32::UI::Shell::{
@@ -148,7 +148,7 @@ unsafe fn run_message_loop(
     if timer_id == 0 {
         logger::info("Win32 service SetTimer failed");
     }
-    add_tray(hwnd, "Ashe Dictate RS - Idle - Ctrl+Shift+D");
+    add_tray(hwnd, "Ashe Dictate RS - Idle - Win+Shift+H");
     let mut message = MSG::default();
     while GetMessageW(&mut message, None, 0, 0).into() {
         let _ = TranslateMessage(&message);
@@ -329,13 +329,13 @@ unsafe fn register_hotkey(hwnd: HWND) {
     if let Err(err) = RegisterHotKey(
         Some(hwnd),
         TOGGLE_HOTKEY_ID,
-        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-        'D' as u32,
+        MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+        'H' as u32,
     ) {
         logger::info(format!("RegisterHotKey failed: {err:#}"));
         message_box(
             hwnd,
-            "Ctrl+Shift+D could not be registered. Another app may already be using it.",
+            "Win+Shift+H could not be registered. Another app may already be using it.",
             "Ashe Dictate RS",
         );
     }

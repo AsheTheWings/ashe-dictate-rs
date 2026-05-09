@@ -4,7 +4,7 @@ Native Windows dictation app written in Rust.
 
 ## Features
 
-- Global hotkey: `Ctrl+Shift+D`
+- Global hotkey: `Win+Shift+H`
 - Native Win32 hidden window and message loop via the `windows` crate
 - System tray icon with start/stop and quit menu
 - Iced transcript overlay near the active input/caret while dictating
@@ -104,7 +104,7 @@ The script uses the `x86_64-pc-windows-gnu` Rust target and requires `x86_64-w64
 Then press:
 
 ```text
-Ctrl+Shift+D
+Win+Shift+H
 ```
 
 Expected behavior:

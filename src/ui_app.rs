@@ -98,7 +98,7 @@ impl UiApp {
             error: None,
         };
         app.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Idle - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Idle - Win+Shift+H".to_string(),
         ));
         (app, window::latest().map(Message::WindowReady))
     }
@@ -186,7 +186,7 @@ impl UiApp {
                     logger::log_path().display().to_string(),
                 ));
                 self.send_win32(Win32Command::SetTooltip(
-                    "Ashe Dictate RS - Log path copied - Ctrl+Shift+D".to_string(),
+                    "Ashe Dictate RS - Log path copied - Win+Shift+H".to_string(),
                 ));
                 Task::none()
             }
@@ -221,7 +221,7 @@ impl UiApp {
             self.status = status.clone();
             if !(self.state == DictationState::Stopping && status == "Idle") {
                 self.send_win32(Win32Command::SetTooltip(format!(
-                    "Ashe Dictate RS - {status} - Ctrl+Shift+D"
+                    "Ashe Dictate RS - {status} - Win+Shift+H"
                 )));
             }
             if (status.starts_with("Listening") || status == "Speech detected")
@@ -268,7 +268,7 @@ impl UiApp {
         self.error = None;
         self.send_win32(Win32Command::SetActive(false));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Cancelled - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Cancelled - Win+Shift+H".to_string(),
         ));
         self.apply_window_state()
     }
@@ -290,7 +290,7 @@ impl UiApp {
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Last sentence reverted - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Last sentence reverted - Win+Shift+H".to_string(),
         ));
         overlay_view::scroll_transcript_to_end()
     }
@@ -311,7 +311,7 @@ impl UiApp {
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Transcript cleared - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Transcript cleared - Win+Shift+H".to_string(),
         ));
         overlay_view::scroll_transcript_to_end()
     }
@@ -342,7 +342,7 @@ impl UiApp {
         });
         self.send_win32(Win32Command::SetActive(true));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Connecting... - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Connecting... - Win+Shift+H".to_string(),
         ));
         let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let audio = match AudioCapture::start(audio_tx, self.config.output_sample_rate) {
@@ -389,7 +389,7 @@ impl UiApp {
         self.state = DictationState::Stopping;
         self.status = "Finalizing transcript...".to_string();
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Stopping... - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Stopping... - Win+Shift+H".to_string(),
         ));
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
@@ -425,7 +425,7 @@ impl UiApp {
         self.state = DictationState::Polishing;
         self.status = "Polishing with Kimi...".to_string();
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Polishing... - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Polishing... - Win+Shift+H".to_string(),
         ));
         let config = self.config.clone();
         let context = session.selected_context.clone();
@@ -473,11 +473,11 @@ impl UiApp {
             logger::info(format!("Text injection failed: {err}"));
             self.error = Some("Paste failed".to_string());
             self.send_win32(Win32Command::SetTooltip(
-                "Ashe Dictate RS - Paste error - Ctrl+Shift+D".to_string(),
+                "Ashe Dictate RS - Paste error - Win+Shift+H".to_string(),
             ));
         } else {
             self.send_win32(Win32Command::SetTooltip(
-                "Ashe Dictate RS - Inserted - Ctrl+Shift+D".to_string(),
+                "Ashe Dictate RS - Inserted - Win+Shift+H".to_string(),
             ));
         }
         self.hide_overlay_after_session()
@@ -485,7 +485,7 @@ impl UiApp {
 
     fn finish_without_transcript(&mut self) -> Task<Message> {
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Idle - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Idle - Win+Shift+H".to_string(),
         ));
         self.hide_overlay_after_session()
     }
@@ -501,7 +501,7 @@ impl UiApp {
         self.config = AppConfig::load();
         logger::info(format!("Config reloaded: {}", self.config.log_summary()));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Config reloaded - Ctrl+Shift+D".to_string(),
+            "Ashe Dictate RS - Config reloaded - Win+Shift+H".to_string(),
         ));
     }
 
@@ -509,7 +509,7 @@ impl UiApp {
         self.send_win32(Win32Command::ShowMessageBox {
             title: "About Ashe Dictate RS".to_string(),
             text: format!(
-                "Ashe Dictate RS\r\nVersion: {}\r\nBuild: {}\r\n\r\nHotkey: Ctrl+Shift+D\r\nConfig: {}\r\nLog: {}",
+                "Ashe Dictate RS\r\nVersion: {}\r\nBuild: {}\r\n\r\nHotkey: Win+Shift+H\r\nConfig: {}\r\nLog: {}",
                 APP_VERSION,
                 BUILD_ID,
                 self.config.log_summary(),
