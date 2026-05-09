@@ -6,20 +6,23 @@ use crate::overlay_view;
 use crate::util::{pcwstr, wide};
 use crossbeam_channel::{Receiver, Sender};
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::null_mut;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{
+    FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -35,6 +38,9 @@ const MENU_OPEN_LOG: usize = 3003;
 const MENU_COPY_LOG_PATH: usize = 3004;
 const MENU_ABOUT: usize = 3005;
 const MENU_QUIT: usize = 3006;
+const ICON_FILE_NAME: &str = "ashe-dictate-rs.ico";
+const ICON_DATA_PATH: &str = "data/ashe-dictate-rs.ico";
+const APP_ICON_RESOURCE_ID: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub enum Win32Event {
@@ -91,12 +97,14 @@ unsafe fn run_message_loop(
 ) -> anyhow::Result<()> {
     let instance = GetModuleHandleW(None)?;
     let class = wide("AsheDictateRsServiceWindow");
+    let app_icon = load_app_icon(0, 0);
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         hInstance: instance.into(),
         lpfnWndProc: Some(window_proc),
         lpszClassName: pcwstr(&class),
-        hIcon: LoadIconW(None, IDI_APPLICATION)?,
+        hIcon: app_icon,
+        hIconSm: load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)),
         ..Default::default()
     };
     let _ = RegisterClassExW(&wc);
@@ -114,6 +122,7 @@ unsafe fn run_message_loop(
         Some(instance.into()),
         Some(null_mut()),
     )?;
+    set_window_icons(hwnd);
     let state = Box::new(ServiceState {
         event_tx,
         command_rx,
@@ -382,9 +391,133 @@ fn add_tray(hwnd: HWND, tooltip: &str) {
         let mut data = tray_data(hwnd, tooltip);
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        data.hIcon = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
     }
+}
+
+unsafe fn set_window_icons(hwnd: HWND) {
+    let big_icon = load_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    let small_icon = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETICON,
+        Some(WPARAM(ICON_BIG as usize)),
+        Some(LPARAM(big_icon.0 as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETICON,
+        Some(WPARAM(ICON_SMALL as usize)),
+        Some(LPARAM(small_icon.0 as isize)),
+    );
+}
+
+unsafe fn load_app_icon(width: i32, height: i32) -> HICON {
+    if let Some(icon) = load_app_icon_from_resource(width, height) {
+        return icon;
+    }
+
+    if let Some(path) = find_app_icon_path() {
+        let wide_path = wide(&path.to_string_lossy());
+        match LoadImageW(
+            None,
+            pcwstr(&wide_path),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_LOADFROMFILE,
+        ) {
+            Ok(handle) => {
+                logger::info(format!(
+                    "Loaded app icon path={} width={width} height={height}",
+                    path.display()
+                ));
+                return HICON(handle.0);
+            }
+            Err(err) => logger::info(format!(
+                "Load app icon failed path={} width={width} height={height}: {err:#}",
+                path.display()
+            )),
+        }
+    } else {
+        logger::info("App icon file not found; falling back to default Windows icon");
+    }
+
+    LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+}
+
+unsafe fn load_app_icon_from_resource(width: i32, height: i32) -> Option<HICON> {
+    let module = GetModuleHandleW(None).ok()?;
+    let group = FindResourceW(
+        Some(module.into()),
+        int_resource(APP_ICON_RESOURCE_ID),
+        RT_GROUP_ICON,
+    );
+    if group.is_invalid() {
+        return None;
+    }
+
+    let group_data = LoadResource(Some(module.into()), group).ok()?;
+    let group_ptr = LockResource(group_data) as *const u8;
+    let group_size = SizeofResource(Some(module.into()), group) as usize;
+    if group_ptr.is_null() || group_size == 0 {
+        return None;
+    }
+
+    let icon_id = LookupIconIdFromDirectoryEx(group_ptr, true, width, height, LR_DEFAULTCOLOR);
+    if icon_id == 0 {
+        return None;
+    }
+
+    let icon = FindResourceW(Some(module.into()), int_resource(icon_id as u16), RT_ICON);
+    if icon.is_invalid() {
+        return None;
+    }
+
+    let icon_data = LoadResource(Some(module.into()), icon).ok()?;
+    let icon_ptr = LockResource(icon_data) as *const u8;
+    let icon_size = SizeofResource(Some(module.into()), icon) as usize;
+    if icon_ptr.is_null() || icon_size == 0 {
+        return None;
+    }
+
+    let bits = std::slice::from_raw_parts(icon_ptr, icon_size);
+    match CreateIconFromResourceEx(bits, true, 0x0003_0000, width, height, LR_DEFAULTCOLOR) {
+        Ok(icon) => {
+            logger::info(format!(
+                "Loaded embedded app icon resource id={APP_ICON_RESOURCE_ID} width={width} height={height}"
+            ));
+            Some(icon)
+        }
+        Err(err) => {
+            logger::info(format!(
+                "Load embedded app icon failed id={APP_ICON_RESOURCE_ID} width={width} height={height}: {err:#}"
+            ));
+            None
+        }
+    }
+}
+
+fn int_resource(id: u16) -> windows::core::PCWSTR {
+    windows::core::PCWSTR(id as usize as *const u16)
+}
+
+fn find_app_icon_path() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let current_dir = std::env::current_dir().ok();
+    let manifest_dir = option_env!("CARGO_MANIFEST_DIR").map(PathBuf::from);
+
+    let candidates = [
+        exe_dir.as_ref().map(|dir| dir.join(ICON_FILE_NAME)),
+        exe_dir.as_ref().map(|dir| dir.join(ICON_DATA_PATH)),
+        current_dir.as_ref().map(|dir| dir.join(ICON_DATA_PATH)),
+        manifest_dir.as_ref().map(|dir| dir.join(ICON_DATA_PATH)),
+    ];
+
+    candidates.into_iter().flatten().find(|path| path.exists())
 }
 
 fn set_tray_tooltip(hwnd: HWND, tooltip: &str) {
