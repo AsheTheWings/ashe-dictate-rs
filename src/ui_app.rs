@@ -137,7 +137,9 @@ impl UiApp {
         while let Ok(event) = self.win32_rx.try_recv() {
             tasks.push(self.handle_win32_event(event));
         }
-        self.pump_transcripts_and_statuses();
+        if self.pump_transcripts_and_statuses() {
+            tasks.push(overlay_view::scroll_transcript_to_end());
+        }
         self.join_finished_threads();
         if self.visible && self.advance_overlay_position() {
             tasks.push(self.apply_window_state());
@@ -154,6 +156,8 @@ impl UiApp {
                 self.toggle(target_hwnd, Point::new(x as f32, y as f32))
             }
             Win32Event::CancelRequested => self.cancel_operation(),
+            Win32Event::RevertLastSentenceRequested => self.revert_last_sentence(),
+            Win32Event::ClearTranscriptRequested => self.clear_transcript(),
             Win32Event::PositionChanged { x, y } => {
                 self.target_position = Some(Point::new(x as f32, y as f32));
                 Task::none()
@@ -190,13 +194,15 @@ impl UiApp {
         }
     }
 
-    fn pump_transcripts_and_statuses(&mut self) {
+    fn pump_transcripts_and_statuses(&mut self) -> bool {
+        let mut transcript_updated = false;
         while let Ok(text) = self.transcript_rx.try_recv() {
             if let Some(session) = self.session.as_mut() {
                 session.raw_transcript.push_str(&text);
                 self.transcript = session.raw_transcript.clone();
                 self.polished = None;
                 self.error = None;
+                transcript_updated = true;
             } else {
                 logger::info(format!("Transcript without active session: {text}"));
             }
@@ -218,6 +224,7 @@ impl UiApp {
                 self.request_stop();
             }
         }
+        transcript_updated
     }
 
     fn toggle(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
@@ -255,6 +262,49 @@ impl UiApp {
             "Ashe Dictate RS - Cancelled - Ctrl+Shift+D".to_string(),
         ));
         self.apply_window_state()
+    }
+
+    fn revert_last_sentence(&mut self) -> Task<Message> {
+        if !matches!(self.state, DictationState::Starting | DictationState::Listening) {
+            return Task::none();
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Task::none();
+        };
+        let updated = remove_last_sentence(&session.raw_transcript);
+        if updated == session.raw_transcript {
+            return Task::none();
+        }
+        logger::info("Reverted last transcript sentence");
+        session.raw_transcript = updated;
+        self.transcript = session.raw_transcript.clone();
+        self.polished = None;
+        self.error = None;
+        self.send_win32(Win32Command::SetTooltip(
+            "Ashe Dictate RS - Last sentence reverted - Ctrl+Shift+D".to_string(),
+        ));
+        overlay_view::scroll_transcript_to_end()
+    }
+
+    fn clear_transcript(&mut self) -> Task<Message> {
+        if !matches!(self.state, DictationState::Starting | DictationState::Listening) {
+            return Task::none();
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Task::none();
+        };
+        if session.raw_transcript.is_empty() {
+            return Task::none();
+        }
+        logger::info("Cleared transcript buffer");
+        session.raw_transcript.clear();
+        self.transcript.clear();
+        self.polished = None;
+        self.error = None;
+        self.send_win32(Win32Command::SetTooltip(
+            "Ashe Dictate RS - Transcript cleared - Ctrl+Shift+D".to_string(),
+        ));
+        overlay_view::scroll_transcript_to_end()
     }
 
     fn start(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
@@ -549,6 +599,32 @@ impl UiApp {
             logger::info(format!("Win32 command send failed: {err}"));
         }
     }
+}
+
+fn remove_last_sentence(text: &str) -> String {
+    let trimmed_end = text.trim_end();
+    if trimmed_end.is_empty() {
+        return String::new();
+    }
+
+    let mut chars = trimmed_end.char_indices().rev().peekable();
+    while chars
+        .peek()
+        .is_some_and(|(_, ch)| matches!(ch, '.' | '!' | '?' | ';' | ':' | ','))
+    {
+        chars.next();
+    }
+    while chars.peek().is_some_and(|(_, ch)| ch.is_whitespace()) {
+        chars.next();
+    }
+
+    for (idx, ch) in chars {
+        if matches!(ch, '.' | '!' | '?' | '\n') {
+            return trimmed_end[..idx + ch.len_utf8()].trim_end().to_string();
+        }
+    }
+
+    String::new()
 }
 
 impl Drop for UiApp {

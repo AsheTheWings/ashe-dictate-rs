@@ -3,6 +3,7 @@
 use crate::logger;
 use crate::util::{pcwstr, wide};
 use iced::widget::{column, container, scrollable, text};
+use iced::widget::{operation, Id};
 use iced::window;
 use iced::{Background, Color, Element, Length, Point, Shadow, Size, Task, Vector};
 #[cfg(target_os = "windows")]
@@ -18,7 +19,10 @@ pub const TITLE: &str = "Ashe Dictate Rs - Iced";
 pub const WIDTH: f32 = 430.0;
 pub const HEIGHT: f32 = 216.0;
 const CORNER_RADIUS: u32 = 22;
+const BORDER_WIDTH: f32 = 3.0;
+const TRANSCRIPT_FONT_SIZE: u32 = 15;
 const NATIVE_CORNER_DIAMETER: i32 = 56;
+const TRANSCRIPT_SCROLL_ID: &str = "overlay-transcript-scroll";
 #[cfg(target_os = "windows")]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 #[cfg(target_os = "windows")]
@@ -73,10 +77,14 @@ pub fn view<'a, Message: 'a>(
         status.to_string()
     };
     let body_text = text(body.to_string())
-        .size(17)
+        .size(TRANSCRIPT_FONT_SIZE)
         .width(Length::Fill)
         .wrapping(text::Wrapping::WordOrGlyph);
     let transcript = scrollable(body_text)
+        .id(transcript_scroll_id())
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::hidden(),
+        ))
         .height(Length::Fill)
         .width(Length::Fill)
         .style(|_, status| {
@@ -109,7 +117,9 @@ pub fn view<'a, Message: 'a>(
             container::Style {
                 text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
                 background: Some(Background::Color(background)),
-                border: iced::border::rounded(CORNER_RADIUS).width(2).color(border),
+                border: iced::border::rounded(CORNER_RADIUS)
+                    .width(BORDER_WIDTH)
+                    .color(border),
                 shadow: Shadow {
                     color: Color::TRANSPARENT,
                     offset: Vector::ZERO,
@@ -119,6 +129,14 @@ pub fn view<'a, Message: 'a>(
             }
         })
         .into()
+}
+
+pub fn scroll_transcript_to_end<Message>() -> Task<Message> {
+    operation::snap_to_end(transcript_scroll_id())
+}
+
+fn transcript_scroll_id() -> Id {
+    Id::new(TRANSCRIPT_SCROLL_ID)
 }
 
 pub fn apply_native_styles() {

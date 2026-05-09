@@ -39,7 +39,6 @@ pub async fn polish_transcript(
         ])
         .reasoning_effort(ReasoningEffort::None)
         .temperature(config.llm_temperature)
-        .max_completion_tokens(config.llm_max_tokens)
         .build()?;
 
     let response = client

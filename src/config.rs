@@ -1,10 +1,9 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_FIREWORKS_API_BASE: &str = "https://api.fireworks.ai/inference/v1";
 const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/kimi-k2p6";
-const DEFAULT_LLM_MAX_TOKENS: u32 = 1536;
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
 
 #[derive(Clone)]
@@ -17,7 +16,6 @@ pub struct AppConfig {
     pub fireworks_api_key: String,
     pub fireworks_api_base: String,
     pub fireworks_model: String,
-    pub llm_max_tokens: u32,
     pub llm_temperature: f32,
 }
 
@@ -45,7 +43,6 @@ impl AppConfig {
                 .unwrap_or_else(|_| DEFAULT_FIREWORKS_API_BASE.to_string()),
             fireworks_model: std::env::var("FIREWORKS_MODEL")
                 .unwrap_or_else(|_| DEFAULT_FIREWORKS_MODEL.to_string()),
-            llm_max_tokens: read_u32("ASHE_LLM_MAX_TOKENS", DEFAULT_LLM_MAX_TOKENS),
             llm_temperature: read_f32("ASHE_LLM_TEMPERATURE", DEFAULT_LLM_TEMPERATURE),
         }
     }

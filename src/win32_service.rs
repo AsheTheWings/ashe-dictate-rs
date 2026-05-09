@@ -18,7 +18,7 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE,
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_BACK, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -28,6 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const TOGGLE_HOTKEY_ID: i32 = 1001;
 const CANCEL_HOTKEY_ID: i32 = 1002;
+const REVERT_SENTENCE_HOTKEY_ID: i32 = 1003;
+const CLEAR_TRANSCRIPT_HOTKEY_ID: i32 = 1004;
 const TIMER_SERVICE: usize = 2001;
 const TIMER_INTERVAL_MS: u32 = 16;
 const CURSOR_OVERLAY_GAP: i32 = 8;
@@ -46,6 +48,8 @@ const APP_ICON_RESOURCE_ID: u16 = 1;
 pub enum Win32Event {
     ToggleRequested { target_hwnd: isize, x: i32, y: i32 },
     CancelRequested,
+    RevertLastSentenceRequested,
+    ClearTranscriptRequested,
     PositionChanged { x: i32, y: i32 },
     ReloadConfigRequested,
     OpenLogRequested,
@@ -72,6 +76,8 @@ struct ServiceState {
     command_rx: Receiver<Win32Command>,
     active: bool,
     cancel_hotkey_registered: bool,
+    revert_sentence_hotkey_registered: bool,
+    clear_transcript_hotkey_registered: bool,
 }
 
 pub fn spawn(
@@ -128,6 +134,8 @@ unsafe fn run_message_loop(
         command_rx,
         active: false,
         cancel_hotkey_registered: false,
+        revert_sentence_hotkey_registered: false,
+        clear_transcript_hotkey_registered: false,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     register_hotkey(hwnd);
@@ -169,6 +177,20 @@ unsafe extern "system" fn window_proc(
                 logger::info("Cancel hotkey pressed");
                 if let Some(state) = state {
                     let _ = state.event_tx.send(Win32Event::CancelRequested);
+                }
+                return LRESULT(0);
+            }
+            REVERT_SENTENCE_HOTKEY_ID => {
+                logger::info("Revert sentence hotkey pressed");
+                if let Some(state) = state {
+                    let _ = state.event_tx.send(Win32Event::RevertLastSentenceRequested);
+                }
+                return LRESULT(0);
+            }
+            CLEAR_TRANSCRIPT_HOTKEY_ID => {
+                logger::info("Clear transcript hotkey pressed");
+                if let Some(state) = state {
+                    let _ = state.event_tx.send(Win32Event::ClearTranscriptRequested);
                 }
                 return LRESULT(0);
             }
@@ -232,6 +254,8 @@ unsafe extern "system" fn window_proc(
             remove_tray(hwnd);
             let _ = UnregisterHotKey(Some(hwnd), TOGGLE_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
             if !state_ptr.is_null() {
                 let _ = Box::from_raw(state_ptr);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -250,6 +274,7 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
             Win32Command::SetActive(active) => {
                 state.active = active;
                 set_cancel_hotkey(hwnd, state, active);
+                set_transcript_edit_hotkeys(hwnd, state, active);
             }
             Win32Command::SetTooltip(tooltip) => set_tray_tooltip(hwnd, &tooltip),
             Win32Command::ShowMessageBox { title, text } => message_box(hwnd, &text, &title),
@@ -319,6 +344,43 @@ unsafe fn set_cancel_hotkey(hwnd: HWND, state: &mut ServiceState, active: bool) 
     } else {
         let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
         state.cancel_hotkey_registered = false;
+    }
+}
+
+unsafe fn set_transcript_edit_hotkeys(hwnd: HWND, state: &mut ServiceState, active: bool) {
+    if active == state.revert_sentence_hotkey_registered
+        && active == state.clear_transcript_hotkey_registered
+    {
+        return;
+    }
+    if active {
+        match RegisterHotKey(
+            Some(hwnd),
+            REVERT_SENTENCE_HOTKEY_ID,
+            MOD_NOREPEAT,
+            VK_BACK.0 as u32,
+        ) {
+            Ok(()) => state.revert_sentence_hotkey_registered = true,
+            Err(err) => logger::info(format!(
+                "Backspace revert hotkey registration failed: {err:#}"
+            )),
+        }
+        match RegisterHotKey(
+            Some(hwnd),
+            CLEAR_TRANSCRIPT_HOTKEY_ID,
+            MOD_SHIFT | MOD_NOREPEAT,
+            VK_BACK.0 as u32,
+        ) {
+            Ok(()) => state.clear_transcript_hotkey_registered = true,
+            Err(err) => logger::info(format!(
+                "Shift+Backspace clear hotkey registration failed: {err:#}"
+            )),
+        }
+    } else {
+        let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
+        let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
+        state.revert_sentence_hotkey_registered = false;
+        state.clear_transcript_hotkey_registered = false;
     }
 }
 

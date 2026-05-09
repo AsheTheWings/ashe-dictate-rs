@@ -62,7 +62,6 @@ DEEPGRAM_KEYTERMS=Rust,Win32,Deepgram,WASAPI,TypeScript,React
 ASHE_OUTPUT_SAMPLE_RATE=48000
 FIREWORKS_API_BASE=https://api.fireworks.ai/inference/v1
 FIREWORKS_MODEL=accounts/fireworks/models/kimi-k2p6
-ASHE_LLM_MAX_TOKENS=4096
 ASHE_LLM_TEMPERATURE=0.2
 ```
 
@@ -116,6 +115,8 @@ Expected behavior:
 - Right-click the tray icon for start/stop, config reload, log utilities, about, and quit.
 - Speak into the default microphone.
 - Final Deepgram transcripts appear in the overlay in real time.
+- Press `Backspace` while dictating to remove the last buffered sentence.
+- Press `Shift+Backspace` while dictating to clear the buffered transcript.
 - Second press requests a clean stop.
 - The complete buffered transcript is polished by Fireworks/Kimi.
 - The polished output is pasted into the original active text field.
