@@ -158,6 +158,15 @@ impl UiApp {
             Win32Event::CancelRequested => self.cancel_operation(),
             Win32Event::RevertLastSentenceRequested => self.revert_last_sentence(),
             Win32Event::ClearTranscriptRequested => self.clear_transcript(),
+            Win32Event::SubmitRequested => {
+                if matches!(
+                    self.state,
+                    DictationState::Starting | DictationState::Listening
+                ) {
+                    self.request_stop();
+                }
+                Task::none()
+            }
             Win32Event::PositionChanged { x, y } => {
                 self.target_position = Some(Point::new(x as f32, y as f32));
                 Task::none()
