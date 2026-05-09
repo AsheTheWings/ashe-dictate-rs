@@ -9,24 +9,32 @@ use iced::{Background, Color, Element, Length, Point, Shadow, Size, Task, Vector
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
-#[cfg(target_os = "windows")]
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ};
+use windows::Win32::Foundation::{COLORREF, HWND};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Ashe Dictate Rs - Iced";
 pub const WIDTH: f32 = 430.0;
 pub const HEIGHT: f32 = 216.0;
-const CORNER_RADIUS: u32 = 22;
-const BORDER_WIDTH: f32 = 3.0;
+const CORNER_RADIUS: u32 = 0;
+const BORDER_WIDTH: f32 = 2.0;
 const TRANSCRIPT_FONT_SIZE: u32 = 15;
-const NATIVE_CORNER_DIAMETER: i32 = 56;
 const TRANSCRIPT_SCROLL_ID: &str = "overlay-transcript-scroll";
 #[cfg(target_os = "windows")]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 #[cfg(target_os = "windows")]
-const DWMWCP_ROUND: i32 = 2;
+const DWMWCP_DONOTROUND: i32 = 1;
+
+#[cfg(target_os = "windows")]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: HWND,
+        dwattribute: u32,
+        pvattribute: *const core::ffi::c_void,
+        cbattribute: u32,
+    ) -> i32;
+}
 
 pub fn window_settings() -> window::Settings {
     logger::info(format!(
@@ -159,7 +167,13 @@ pub fn apply_native_styles() {
             ));
             return;
         }
-        apply_rounded_window_region(hwnd);
+        let corner_preference = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_preference as *const _ as *const core::ffi::c_void,
+            size_of::<i32>() as u32,
+        );
         let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let desired = current
             | WS_EX_TOOLWINDOW.0
@@ -198,64 +212,6 @@ pub fn apply_native_styles() {
             )),
         }
     }
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn apply_rounded_window_region(hwnd: HWND) {
-    let mut rect = RECT::default();
-    if let Err(err) = GetWindowRect(hwnd, &mut rect) {
-        logger::info(format!(
-            "Overlay native rounded region skipped hwnd={:p}: {err:#}",
-            hwnd.0
-        ));
-        return;
-    }
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    if width <= 0 || height <= 0 {
-        return;
-    }
-
-    let region = CreateRoundRectRgn(
-        0,
-        0,
-        width,
-        height,
-        NATIVE_CORNER_DIAMETER,
-        NATIVE_CORNER_DIAMETER,
-    );
-    if region.is_invalid() {
-        logger::info(format!(
-            "Overlay native rounded region creation failed hwnd={:p} width={width} height={height}",
-            hwnd.0
-        ));
-        return;
-    }
-
-    if SetWindowRgn(hwnd, Some(region), true) == 0 {
-        let _ = DeleteObject(HGDIOBJ(region.0));
-        logger::info(format!(
-            "Overlay native SetWindowRgn failed hwnd={:p} width={width} height={height}",
-            hwnd.0
-        ));
-    }
-
-    let corner_preference = DWMWCP_ROUND;
-    #[link(name = "dwmapi")]
-    unsafe extern "system" {
-        fn DwmSetWindowAttribute(
-            hwnd: HWND,
-            dwattribute: u32,
-            pvattribute: *const core::ffi::c_void,
-            cbattribute: u32,
-        ) -> i32;
-    }
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_WINDOW_CORNER_PREFERENCE,
-        &corner_preference as *const _ as *const core::ffi::c_void,
-        size_of::<i32>() as u32,
-    );
 }
 
 pub fn apply_window_state<Message: 'static>(
