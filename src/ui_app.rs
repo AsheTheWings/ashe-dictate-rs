@@ -26,6 +26,19 @@ enum DictationState {
     Stopping,
     Polishing,
     Inserting,
+    FixingGrammar,
+    AnsweringQuestion,
+}
+
+#[derive(Clone, Copy)]
+enum TextActionKind {
+    FixGrammar,
+    AnswerQuestion,
+}
+
+struct TextAction {
+    kind: TextActionKind,
+    target_hwnd: isize,
 }
 
 struct DictationSession {
@@ -48,6 +61,7 @@ pub struct UiApp {
     deepgram: Option<DeepgramSession>,
     bridge_thread: Option<JoinHandle<()>>,
     session: Option<DictationSession>,
+    text_action: Option<TextAction>,
     window_id: Option<window::Id>,
     position: Option<Point>,
     target_position: Option<Point>,
@@ -63,6 +77,7 @@ pub enum Message {
     Tick,
     WindowReady(Option<window::Id>),
     PolishCompleted(PolishResult),
+    TextActionCompleted(PolishResult),
 }
 
 impl UiApp {
@@ -88,6 +103,7 @@ impl UiApp {
             deepgram: None,
             bridge_thread: None,
             session: None,
+            text_action: None,
             window_id: None,
             position: None,
             target_position: None,
@@ -117,6 +133,7 @@ impl UiApp {
             }
             Message::Tick => self.pump(),
             Message::PolishCompleted(result) => self.finish_polishing(result),
+            Message::TextActionCompleted(result) => self.finish_text_action(result),
         }
     }
 
@@ -167,6 +184,16 @@ impl UiApp {
                 }
                 Task::none()
             }
+            Win32Event::FixGrammarRequested { target_hwnd, x, y } => self.begin_text_action(
+                TextActionKind::FixGrammar,
+                target_hwnd,
+                Point::new(x as f32, y as f32),
+            ),
+            Win32Event::AnswerQuestionRequested { target_hwnd, x, y } => self.begin_text_action(
+                TextActionKind::AnswerQuestion,
+                target_hwnd,
+                Point::new(x as f32, y as f32),
+            ),
             Win32Event::PositionChanged { x, y } => {
                 self.target_position = Some(Point::new(x as f32, y as f32));
                 Task::none()
@@ -249,6 +276,10 @@ impl UiApp {
             }
             DictationState::Polishing | DictationState::Inserting => {
                 logger::info("Polishing/inserting already in progress");
+                Task::none()
+            }
+            DictationState::FixingGrammar | DictationState::AnsweringQuestion => {
+                logger::info("Text action already in progress");
                 Task::none()
             }
         }
@@ -381,7 +412,11 @@ impl UiApp {
     fn request_stop(&mut self) {
         if matches!(
             self.state,
-            DictationState::Idle | DictationState::Polishing | DictationState::Inserting
+            DictationState::Idle
+                | DictationState::Polishing
+                | DictationState::Inserting
+                | DictationState::FixingGrammar
+                | DictationState::AnsweringQuestion
         ) {
             return;
         }
@@ -423,7 +458,7 @@ impl UiApp {
             return self.finish_without_transcript();
         }
         self.state = DictationState::Polishing;
-        self.status = "Polishing with Kimi...".to_string();
+        self.status = "Polishing with Gemini...".to_string();
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Dictate RS - Polishing... - Win+Shift+H".to_string(),
         ));
@@ -518,6 +553,132 @@ impl UiApp {
         });
     }
 
+    fn begin_text_action(
+        &mut self,
+        kind: TextActionKind,
+        target_hwnd: isize,
+        position: Point,
+    ) -> Task<Message> {
+        if self.state != DictationState::Idle {
+            logger::info("Text action ignored; not idle");
+            return Task::none();
+        }
+        if let Err(err) = self.config.validate_for_llm() {
+            logger::info(format!("LLM config validation failed: {err:#}"));
+            self.send_win32(Win32Command::ShowMessageBox {
+                title: "Ashe Dictate RS".to_string(),
+                text: format!("Cannot run text action: {err}"),
+            });
+            return Task::none();
+        }
+        let selected = match injector::capture_selected_text() {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                logger::info("Text action: no text selected");
+                self.send_win32(Win32Command::SetTooltip(
+                    "Ashe Dictate RS - No text selected - Win+Shift+H".to_string(),
+                ));
+                return Task::none();
+            }
+            Err(err) => {
+                logger::info(format!("Text action selection capture failed: {err:#}"));
+                self.send_win32(Win32Command::ShowMessageBox {
+                    title: "Ashe Dictate RS".to_string(),
+                    text: format!("Could not capture selected text: {err}"),
+                });
+                return Task::none();
+            }
+        };
+
+        let (state, status, tooltip) = match kind {
+            TextActionKind::FixGrammar => (
+                DictationState::FixingGrammar,
+                "Fixing grammar...",
+                "Ashe Dictate RS - Fixing grammar... - Win+Shift+H",
+            ),
+            TextActionKind::AnswerQuestion => (
+                DictationState::AnsweringQuestion,
+                "Answering...",
+                "Ashe Dictate RS - Answering... - Win+Shift+H",
+            ),
+        };
+        logger::info(format!("Text action started chars={}", selected.len()));
+        self.state = state;
+        self.text_action = Some(TextAction { kind, target_hwnd });
+        self.visible = true;
+        self.position = Some(position);
+        self.target_position = Some(position);
+        self.status = status.to_string();
+        self.transcript = selected.clone();
+        self.polished = None;
+        self.error = None;
+        self.send_win32(Win32Command::SetTooltip(tooltip.to_string()));
+
+        let config = self.config.clone();
+        let llm_task = Task::perform(
+            async move {
+                match kind {
+                    TextActionKind::FixGrammar => {
+                        llm_client::fix_grammar(config, selected).await
+                    }
+                    TextActionKind::AnswerQuestion => {
+                        llm_client::answer_question(config, selected).await
+                    }
+                }
+                .map_err(|err| format!("{err:#}"))
+            },
+            Message::TextActionCompleted,
+        );
+        Task::batch([self.apply_window_state(), llm_task])
+    }
+
+    fn finish_text_action(&mut self, result: PolishResult) -> Task<Message> {
+        if !matches!(
+            self.state,
+            DictationState::FixingGrammar | DictationState::AnsweringQuestion
+        ) {
+            return Task::none();
+        }
+        let Some(action) = self.text_action.as_ref() else {
+            return self.finish_without_transcript();
+        };
+        let append = matches!(action.kind, TextActionKind::AnswerQuestion);
+        let target_hwnd = action.target_hwnd;
+        let text = match result {
+            Ok(text) => text,
+            Err(err) => {
+                logger::info(format!("Text action failed: {err}"));
+                self.error = Some("LLM request failed".to_string());
+                self.send_win32(Win32Command::SetTooltip(
+                    "Ashe Dictate RS - LLM error - Win+Shift+H".to_string(),
+                ));
+                return self.hide_overlay_after_session();
+            }
+        };
+        if text.trim().is_empty() {
+            logger::info("Text action returned empty result");
+            self.send_win32(Win32Command::SetTooltip(
+                "Ashe Dictate RS - Empty result - Win+Shift+H".to_string(),
+            ));
+            return self.hide_overlay_after_session();
+        }
+        logger::info("Text action completed");
+        let inject_text = if append {
+            format!("\n\n{text}")
+        } else {
+            text.clone()
+        };
+        self.polished = Some(text);
+        self.state = DictationState::Inserting;
+        self.status = "Inserting...".to_string();
+        self.send_win32(Win32Command::InjectText {
+            target_hwnd,
+            text: inject_text,
+            append_after_selection: append,
+        });
+        Task::none()
+    }
+
     fn capture_selected_context(&self) -> Option<String> {
         match injector::capture_selected_text() {
             Ok(context) => context,
@@ -556,6 +717,7 @@ impl UiApp {
 
     fn hide_overlay_after_session(&mut self) -> Task<Message> {
         self.session = None;
+        self.text_action = None;
         self.state = DictationState::Idle;
         self.visible = false;
         self.target_position = self.position;

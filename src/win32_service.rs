@@ -32,6 +32,8 @@ const CANCEL_HOTKEY_ID: i32 = 1002;
 const REVERT_SENTENCE_HOTKEY_ID: i32 = 1003;
 const CLEAR_TRANSCRIPT_HOTKEY_ID: i32 = 1004;
 const SUBMIT_HOTKEY_ID: i32 = 1005;
+const FIX_GRAMMAR_HOTKEY_ID: i32 = 1006;
+const ANSWER_QUESTION_HOTKEY_ID: i32 = 1007;
 const TIMER_SERVICE: usize = 2001;
 const TIMER_INTERVAL_MS: u32 = 16;
 const CURSOR_OVERLAY_GAP: i32 = 8;
@@ -53,6 +55,8 @@ pub enum Win32Event {
     RevertLastSentenceRequested,
     ClearTranscriptRequested,
     SubmitRequested,
+    FixGrammarRequested { target_hwnd: isize, x: i32, y: i32 },
+    AnswerQuestionRequested { target_hwnd: isize, x: i32, y: i32 },
     PositionChanged { x: i32, y: i32 },
     ReloadConfigRequested,
     OpenLogRequested,
@@ -71,6 +75,11 @@ pub enum Win32Command {
     OpenLog(String),
     CopyText(String),
     PasteText { target_hwnd: isize, text: String },
+    InjectText {
+        target_hwnd: isize,
+        text: String,
+        append_after_selection: bool,
+    },
     Shutdown,
 }
 
@@ -206,6 +215,28 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
+            FIX_GRAMMAR_HOTKEY_ID => {
+                logger::info("Fix grammar hotkey pressed");
+                if let Some(state) = state {
+                    let (x, y) = active_input_position();
+                    let target_hwnd = target_window(hwnd);
+                    let _ = state
+                        .event_tx
+                        .send(Win32Event::FixGrammarRequested { target_hwnd, x, y });
+                }
+                return LRESULT(0);
+            }
+            ANSWER_QUESTION_HOTKEY_ID => {
+                logger::info("Answer question hotkey pressed");
+                if let Some(state) = state {
+                    let (x, y) = active_input_position();
+                    let target_hwnd = target_window(hwnd);
+                    let _ = state
+                        .event_tx
+                        .send(Win32Event::AnswerQuestionRequested { target_hwnd, x, y });
+                }
+                return LRESULT(0);
+            }
             _ => {}
         },
         WM_TIMER => {
@@ -269,6 +300,8 @@ unsafe extern "system" fn window_proc(
             let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), SUBMIT_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), FIX_GRAMMAR_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), ANSWER_QUESTION_HOTKEY_ID);
             if !state_ptr.is_null() {
                 let _ = Box::from_raw(state_ptr);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -317,6 +350,16 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 let result = injector::paste_text_to(hwnd, &text).map_err(|err| format!("{err:#}"));
                 let _ = state.event_tx.send(Win32Event::PasteCompleted(result));
             }
+            Win32Command::InjectText {
+                target_hwnd,
+                text,
+                append_after_selection,
+            } => {
+                let hwnd = HWND(target_hwnd as *mut c_void);
+                let result = injector::inject_text_to(hwnd, &text, append_after_selection)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = state.event_tx.send(Win32Event::PasteCompleted(result));
+            }
             Win32Command::Shutdown => {
                 let _ = DestroyWindow(hwnd);
                 break;
@@ -336,6 +379,32 @@ unsafe fn register_hotkey(hwnd: HWND) {
         message_box(
             hwnd,
             "Win+Shift+H could not be registered. Another app may already be using it.",
+            "Ashe Dictate RS",
+        );
+    }
+    if let Err(err) = RegisterHotKey(
+        Some(hwnd),
+        FIX_GRAMMAR_HOTKEY_ID,
+        MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+        'G' as u32,
+    ) {
+        logger::info(format!("RegisterHotKey (fix grammar) failed: {err:#}"));
+        message_box(
+            hwnd,
+            "Win+Shift+G could not be registered. Another app may already be using it.",
+            "Ashe Dictate RS",
+        );
+    }
+    if let Err(err) = RegisterHotKey(
+        Some(hwnd),
+        ANSWER_QUESTION_HOTKEY_ID,
+        MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+        'Q' as u32,
+    ) {
+        logger::info(format!("RegisterHotKey (answer question) failed: {err:#}"));
+        message_box(
+            hwnd,
+            "Win+Shift+Q could not be registered. Another app may already be using it.",
             "Ashe Dictate RS",
         );
     }

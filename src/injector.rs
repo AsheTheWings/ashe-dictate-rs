@@ -14,7 +14,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_RIGHT,
 };
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
@@ -88,6 +88,24 @@ pub fn paste_text_to(hwnd: HWND, text: &str) -> Result<()> {
             let _ = SetForegroundWindow(hwnd);
             thread::sleep(Duration::from_millis(90));
         }
+    }
+    paste_text(text)
+}
+
+/// Refocus `hwnd` and inject `text`. When `append_after_selection` is set, the current
+/// selection is first collapsed to its right edge (via the Right arrow key) so the text
+/// lands *after* the selection instead of replacing it; otherwise the paste overwrites
+/// the active selection.
+pub fn inject_text_to(hwnd: HWND, text: &str, append_after_selection: bool) -> Result<()> {
+    unsafe {
+        if !hwnd.0.is_null() {
+            let _ = SetForegroundWindow(hwnd);
+            thread::sleep(Duration::from_millis(90));
+        }
+    }
+    if append_after_selection {
+        send_key(VK_RIGHT.0 as u16).context("failed to collapse selection")?;
+        thread::sleep(Duration::from_millis(30));
     }
     paste_text(text)
 }
@@ -174,6 +192,17 @@ fn send_ctrl_c() -> Result<()> {
 
 fn send_ctrl_v() -> Result<()> {
     send_ctrl_key('V' as u16)
+}
+
+fn send_key(vk: u16) -> Result<()> {
+    unsafe {
+        let mut inputs = [key_input(vk, false), key_input(vk, true)];
+        let sent = SendInput(&mut inputs, size_of::<INPUT>() as i32);
+        if sent != inputs.len() as u32 {
+            return Err(anyhow!("SendInput sent {sent}/{} events", inputs.len()));
+        }
+    }
+    Ok(())
 }
 
 fn send_ctrl_key(key: u16) -> Result<()> {

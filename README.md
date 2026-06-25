@@ -1,99 +1,75 @@
 # Ashe Dictate RS
 
-Native Windows dictation app written in Rust.
+A native Windows productivity app that turns speech into polished text and runs quick
+text actions on whatever you have selected — all from global hotkeys, anywhere in
+Windows. Speech is transcribed with Deepgram and text is processed through the tera LLM
+gateway.
 
-## Features
+## What it does
 
-- Global hotkey: `Win+Shift+H`
-- Native Win32 hidden window and message loop via the `windows` crate
-- System tray icon with start/stop and quit menu
-- Iced transcript overlay near the active input/caret while dictating
-- Microphone capture via `cpal`
-- Realtime Deepgram streaming through the Deepgram Rust SDK
-- Buffered transcript capture instead of immediate text insertion
-- Fireworks AI grammar/disfluency polishing with Kimi through an OpenAI-compatible client
-- Clipboard paste injection of the polished output into the original active input field
-- Clipboard retry and previous-text restore for Unicode clipboard text
-- Non-blocking stop/shutdown flow for Deepgram finalization
-- Configurable output sample rate with lightweight linear resampling
-- Tray utilities for reload config, open log, copy log path, and about/status
-- File logging next to the executable
+- **Dictate anywhere** (`Win+Shift+H`) — speak, and the cleaned-up text is inserted into
+  the active text field.
+- **Fix grammar** (`Win+Shift+G`) — corrects grammar, spelling, and punctuation of the
+  selected text and replaces the selection with the fixed version.
+- **Ask a question** (`Win+Shift+Q`) — sends the selected text to the LLM as a question
+  and appends the answer right after your selection.
+- A small overlay near your cursor shows live status and results.
+- Lives in the system tray with start/stop, reload config, log access, and about.
 
-## Implementation Status
+## Hotkeys
 
-The current implementation builds successfully for the Windows target in both debug-check and release modes:
+| Hotkey | Action |
+| --- | --- |
+| `Win+Shift+H` | Start / stop dictation |
+| `Win+Shift+G` | Fix grammar of the selected text (replaces it) |
+| `Win+Shift+Q` | Answer the selected text as a question (appends the answer) |
 
-```powershell
-cargo check --target x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
-```
+While dictating:
 
-Core runtime paths are implemented with explicit lifecycle state:
+| Key | Action |
+| --- | --- |
+| `Enter` | Finish and insert |
+| `Esc` | Cancel |
+| `Backspace` | Remove the last sentence |
+| `Shift+Backspace` | Clear everything captured so far |
 
-- `Idle`
-- `Starting`
-- `Listening`
-- `Stopping`
-- `Polishing`
+## Setup
 
-Stop requests do not block the Win32 UI thread. The app stops microphone capture immediately, asks the Deepgram worker to finalize/close, and polls worker completion from the timer pump. After Deepgram finalization, the buffered transcript is sent to Fireworks AI for polishing and the final output is pasted into the original target window.
-
-## Configuration
-
-The app reads environment variables from the current directory, parent directories, or the sibling C++ project file:
-
-```powershell
-E:\Desktop\ashe-dictate\.env.local
-```
-
-Required:
+Create a `.env.local` file next to the executable (or in the project root) with your keys:
 
 ```env
-DEEPGRAM_API_KEY=your_key_here
-FIREWORKS_API_KEY=your_key_here
+DEEPGRAM_API_KEY=your_deepgram_key
+TERA_API_KEY=your_tera_key
 ```
 
-Optional:
+Optional settings (sensible defaults are used if omitted):
 
 ```env
 DEEPGRAM_MODEL=nova-3
 DEEPGRAM_LANGUAGE=en-US
-DEEPGRAM_KEYTERMS=Rust,Win32,Deepgram,WASAPI,TypeScript,React
+DEEPGRAM_KEYTERMS=Rust,Win32,Deepgram,TypeScript,React
+TERA_API_BASE=https://tera.asheservices.online/v1
+TERA_MODEL=cloudcode/chat-gemini-3-flash-paid-tier
 ASHE_OUTPUT_SAMPLE_RATE=48000
-FIREWORKS_API_BASE=https://api.fireworks.ai/inference/v1
-FIREWORKS_MODEL=accounts/fireworks/models/kimi-k2p6
 ASHE_LLM_TEMPERATURE=0.2
 ```
 
-The app logs a sanitized configuration summary and never logs the API key.
-`ASHE_OUTPUT_SAMPLE_RATE` controls the outgoing mono `linear16` stream sent to Deepgram. If the microphone uses a different native sample rate, the app applies streaming linear resampling before transmission.
+`DEEPGRAM_KEYTERMS` is a comma-separated list of terms to bias transcription toward.
+API keys are never written to the log.
 
 ## Build
 
 ```powershell
-cargo check --target x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The release executable is:
-
-```powershell
-E:\Desktop\ashe-dictate-rs\target\x86_64-pc-windows-gnu\release\ashe-dictate-rs.exe
-```
-
-From Linux/WSL, build and copy the Windows executable into the mounted release folder:
+To cross-build from Linux/WSL and copy the executable into the release folder:
 
 ```bash
 ./scripts/ship-windows-release.sh
 ```
 
-The shipped executable is:
-
-```text
-/root/Desktop/releases/ashe-dictate-rs.exe
-```
-
-The script uses the `x86_64-pc-windows-gnu` Rust target and requires `x86_64-w64-mingw32-gcc`.
+This requires the `x86_64-pc-windows-gnu` Rust target and `x86_64-w64-mingw32-gcc`.
 
 ## Run
 
@@ -101,73 +77,19 @@ The script uses the `x86_64-pc-windows-gnu` Rust target and requires `x86_64-w64
 .\target\release\ashe-dictate-rs.exe
 ```
 
-Then press:
+The app starts in the tray. Press a hotkey to use it:
 
-```text
-Win+Shift+H
-```
+- **Dictation:** press `Win+Shift+H`, speak into your default microphone, and press it
+  again (or `Enter`) to finish. The polished text is pasted into the field you were in.
+- **Fix grammar:** select some text, press `Win+Shift+G`, and the corrected text replaces
+  your selection.
+- **Ask a question:** select a question, press `Win+Shift+Q`, and the answer is added
+  after it.
 
-Expected behavior:
-
-- First press starts dictation.
-- A small Iced transcript box appears near the active input/caret.
-- The tray tooltip changes through connecting/listening/status states.
-- Right-click the tray icon for start/stop, config reload, log utilities, about, and quit.
-- Speak into the default microphone.
-- Final Deepgram transcripts appear in the overlay in real time.
-- Press `Backspace` while dictating to remove the last buffered sentence.
-- Press `Shift+Backspace` while dictating to clear the buffered transcript.
-- Second press requests a clean stop.
-- The complete buffered transcript is polished by Fireworks/Kimi.
-- The polished output is pasted into the original active text field.
+Right-click the tray icon for start/stop, config reload, log access, and about.
 
 ## Logs
 
-The app writes logs beside the executable:
-
-```powershell
-E:\Desktop\ashe-dictate-rs\target\release\ashe-dictate-rs.log
-```
-
-Useful events to verify:
-
-- App startup and log path
-- Sanitized config summary
-- Overlay creation
-- Hotkey pressed
-- Audio input selected
-- Audio capture started/stopped
-- Deepgram connecting/connected
-- Deepgram chunks sent
-- Deepgram speech/transcript events
-- Fireworks/Kimi polishing completion or fallback
-- Audio input/output sample-rate diagnostics
-- Resampler enabled/disabled status
-- Clipboard retry/restore failures, if any
-- Text injection failures, if any
-- Clean worker shutdown
-
-## Error Handling
-
-Implemented safeguards include:
-
-- Missing `DEEPGRAM_API_KEY` validation before dictation starts
-- Missing `FIREWORKS_API_KEY` validation before dictation starts
-- Hotkey registration failure dialog/logging
-- Timer setup failure logging
-- Audio device/config/start errors surfaced through log/dialog
-- Deepgram runtime/connect/send/receive/finalize/close logging
-- Duplicate final transcript suppression
-- Clipboard busy retry loop
-- `SendInput` event-count validation
-- Non-blocking Deepgram worker shutdown and join polling
-- LLM polishing failure fallback to the raw transcript
-- Audio bridge thread completion logging
-- Config reload guarded while dictation is active
-- Log file open/copy utilities with error reporting
-
-## Notes
-
-This implementation currently uses `cpal` for microphone capture instead of direct WASAPI. The outgoing audio is mono little-endian 16-bit linear PCM at `ASHE_OUTPUT_SAMPLE_RATE`, defaulting to `48000`.
-
-Future parity work may include direct WASAPI capture, packaged app icon/resources, installer/startup integration, and richer persistent settings UI.
+The app writes a log file beside the executable (and the tray menu can open it or copy
+its path). Check the log if a hotkey fails to register, a microphone or network error
+occurs, or text fails to paste.
