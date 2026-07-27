@@ -72,7 +72,6 @@ ASHE_IDLE_THRESHOLD_S=120
 ASHE_MIN_ACTIVE_SECONDS=30
 ASHE_DENYLIST=1Password;Bitwarden;Private browsing
 ASHE_FRAME_RETENTION_MINUTES=30
-ASHE_CONTEXT_SUMMARY_HOURS=4
 ASHE_CONTEXT_BLOCS=6
 ASHE_MAX_SUMMARY_CHARS=1500
 ASHE_DAILY_REPORT_ENABLED=true
@@ -89,13 +88,13 @@ immediately after unlock. A block is stored without an LLM description only when
 less than `ASHE_MIN_ACTIVE_SECONDS` of input activity and no visual change beyond the
 first frame.
 
-The journal context is a non-overlapping chronological sequence. Successful reports
-older than `ASHE_CONTEXT_SUMMARY_HOURS` are folded into the rolling summary. From the
-newer window, at most the `ASHE_CONTEXT_BLOCS` newest reports are supplied in full,
-oldest first and without character truncation; any excess newer reports are folded into
-the summary too. The rolling summary is capped by `ASHE_MAX_SUMMARY_CHARS`. Increasing
-either recent-context setting does not pull reports back out after they have already
-entered the summary.
+The journal context is a non-overlapping chronological sequence. At most the
+`ASHE_CONTEXT_BLOCS` newest successful reports are supplied in full, oldest first and
+without character truncation; every earlier report is folded into the persistent rolling
+summary exactly once. Each complete recent report includes its exact start and end window.
+The rolling summary is capped by `ASHE_MAX_SUMMARY_CHARS`. Increasing
+`ASHE_CONTEXT_BLOCS` does not pull reports back out after they have already entered the
+summary.
 
 After a local day closes and the grace period elapses, a separate background worker
 sends every stored block report for that day to the LLM in one chronological,

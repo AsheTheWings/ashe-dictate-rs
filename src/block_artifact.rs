@@ -1,3 +1,4 @@
+use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -84,7 +85,12 @@ impl BlockArtifact {
             .report
             .as_deref()
             .unwrap_or("No block-description LLM report is available for this interval.");
-        let mut sections = vec![heading, report.to_string()];
+        let window = format!(
+            "Window: {} to {}",
+            local_timestamp(self.window_start),
+            local_timestamp(self.window_end),
+        );
+        let mut sections = vec![heading, window, report.to_string()];
         if !self.subjects.is_empty() {
             sections.push(format!(
                 "## Subjects\n\n{}",
@@ -112,6 +118,14 @@ impl BlockArtifact {
         }
         sections.join("\n\n")
     }
+}
+
+fn local_timestamp(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|stamp| stamp.format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 #[cfg(test)]

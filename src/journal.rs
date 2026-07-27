@@ -120,7 +120,6 @@ struct ContextState {
 #[derive(Clone, Debug)]
 struct StoredReport {
     id: String,
-    start: i64,
     content: String,
 }
 
@@ -911,13 +910,9 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
         .iter()
         .filter(|report| report.id.as_str() > state.summary_through.as_str())
         .collect::<Vec<_>>();
-    let cutoff = before - (config.journal_context_summary_hours * 3600.0) as i64;
-    let eligible_start = unsummarized.partition_point(|report| report.start < cutoff);
-    let eligible = &unsummarized[eligible_start..];
-    let detailed_offset = eligible.len().saturating_sub(config.journal_context_blocs);
-    let aged_count = eligible_start + detailed_offset;
-    let aged = &unsummarized[..aged_count];
-    let detailed = &eligible[detailed_offset..];
+    let detailed_offset = context_detailed_offset(unsummarized.len(), config.journal_context_blocs);
+    let aged = &unsummarized[..detailed_offset];
+    let detailed = &unsummarized[detailed_offset..];
 
     let stored_summary = read_rolling_summary(root);
     let mut summary = truncate_chars(&stored_summary, config.journal_context_summary_max_chars);
@@ -955,7 +950,7 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
     }
     if !detailed.is_empty() {
         sections.push(format!(
-            "### {} most recent eligible blocks (complete, oldest first)\nThese reports are passed in full and are not covered by the summary above.\n\n{}",
+            "### {} most recent blocks (complete, oldest first)\nThese reports are passed in full and are not covered by the summary above.\n\n{}",
             detailed.len(),
             detailed
                 .iter()
@@ -969,6 +964,10 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
     } else {
         Ok(sections.join("\n\n"))
     }
+}
+
+fn context_detailed_offset(report_count: usize, context_blocs: usize) -> usize {
+    report_count.saturating_sub(context_blocs)
 }
 
 fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>> {
@@ -1014,7 +1013,6 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
                     id.to_string(),
                     StoredReport {
                         id: id.to_string(),
-                        start,
                         content,
                     },
                 );
@@ -1042,7 +1040,6 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
                     artifact.block.clone(),
                     StoredReport {
                         id: artifact.block.clone(),
-                        start,
                         content: artifact.context_markdown(),
                     },
                 );
@@ -1191,11 +1188,18 @@ fn clock(ts: i64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivitySample, BlockArtifact, DedupState, capture_interval_for_sample, json_journal_entry,
-        should_suppress_description,
+        ActivitySample, BlockArtifact, DedupState, capture_interval_for_sample,
+        context_detailed_offset, json_journal_entry, should_suppress_description,
     };
     use crate::block_artifact::{ActivitySubject, BLOCK_SCHEMA_VERSION};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn context_keeps_only_the_configured_number_of_recent_blocks_in_full() {
+        assert_eq!(context_detailed_offset(3, 6), 0);
+        assert_eq!(context_detailed_offset(7, 6), 1);
+        assert_eq!(context_detailed_offset(7, 0), 7);
+    }
 
     #[test]
     fn journal_entry_is_aggregated_from_the_report_field() {
@@ -1227,6 +1231,9 @@ mod tests {
         let (_, entry) = json_journal_entry(&artifact).unwrap();
         assert!(entry.contains("Report content only."));
         assert!(!entry.contains("Structured subject must not be rendered."));
+        let context = artifact.context_markdown();
+        assert!(context.contains("Window: "));
+        assert!(context.contains(" to "));
     }
 
     #[test]

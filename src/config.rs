@@ -10,7 +10,6 @@ const DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL: u64 = 120;
 const DEFAULT_JOURNAL_BLOCK_MINUTES: u64 = 10;
 const DEFAULT_JOURNAL_DEDUP_THRESHOLD: f32 = 2.0;
 const DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS: u64 = 30;
-const DEFAULT_CONTEXT_SUMMARY_HOURS: f32 = 4.0;
 const DEFAULT_CONTEXT_BLOCS: usize = 6;
 const DEFAULT_CONTEXT_SUMMARY_MAX_CHARS: usize = 1_500;
 const DEFAULT_DAILY_REPORT_GRACE_MINUTES: u64 = 15;
@@ -42,7 +41,6 @@ pub struct AppConfig {
     pub journal_min_active_seconds: u64,
     pub journal_denylist: Vec<String>,
     pub journal_frame_retention_minutes: u64,
-    pub journal_context_summary_hours: f64,
     pub journal_context_blocs: usize,
     pub journal_context_summary_max_chars: usize,
     pub daily_report_enabled: bool,
@@ -117,11 +115,6 @@ impl AppConfig {
             ),
             journal_denylist: read_list("ASHE_DENYLIST"),
             journal_frame_retention_minutes: read_u64("ASHE_FRAME_RETENTION_MINUTES", 30),
-            journal_context_summary_hours: read_f32(
-                "ASHE_CONTEXT_SUMMARY_HOURS",
-                DEFAULT_CONTEXT_SUMMARY_HOURS,
-            )
-            .max(0.0) as f64,
             journal_context_blocs: read_usize("ASHE_CONTEXT_BLOCS", DEFAULT_CONTEXT_BLOCS),
             journal_context_summary_max_chars: read_usize(
                 "ASHE_MAX_SUMMARY_CHARS",
@@ -191,7 +184,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} context_summary_hours={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -202,7 +195,6 @@ impl AppConfig {
             self.llm_reasoning_effort.is_some(),
             self.journal_enabled,
             self.journal_artifacts_dir.display(),
-            self.journal_context_summary_hours,
             self.journal_context_blocs,
             self.journal_context_summary_max_chars,
             self.daily_report_enabled,
