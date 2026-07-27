@@ -1,12 +1,38 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=ASHE_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=ASHE_ARCHIVE_RECIPIENT_FILE");
+    println!("cargo:rerun-if-env-changed=ASHE_ARCHIVE_RECIPIENT_JSON");
     println!("cargo:rerun-if-changed=assets/ashe-worker.ico");
     let build_id = std::env::var("ASHE_BUILD_ID").unwrap_or_else(|_| "dev".to_string());
     println!("cargo:rustc-env=ASHE_BUILD_ID={build_id}");
+    embed_archive_recipient();
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_icon();
     }
+}
+
+fn embed_archive_recipient() {
+    let raw = std::env::var("ASHE_ARCHIVE_RECIPIENT_FILE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("failed to read archive recipient file {path}: {error}")
+            })
+        })
+        .or_else(|| std::env::var("ASHE_ARCHIVE_RECIPIENT_JSON").ok())
+        .unwrap_or_default();
+    if raw.trim().is_empty() {
+        println!("cargo:rustc-env=ASHE_ARCHIVE_RECIPIENT_JSON=");
+        return;
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).expect("archive recipient must be valid JSON");
+    assert!(value.is_object(), "archive recipient must be a JSON object");
+    let compact = serde_json::to_string(&value).expect("serialize archive recipient");
+    println!("cargo:rustc-env=ASHE_ARCHIVE_RECIPIENT_JSON={compact}");
 }
 
 fn embed_windows_icon() {

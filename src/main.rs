@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod activity;
+mod archive;
+mod artifact_store;
 mod audio;
 mod block_artifact;
 mod config;
@@ -9,6 +11,8 @@ mod injector;
 mod journal;
 mod llm_client;
 mod logger;
+#[cfg(all(target_os = "windows", target_env = "gnu"))]
+mod mingw_compat;
 mod overlay_view;
 mod screen_capture;
 mod ui_app;

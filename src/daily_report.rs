@@ -85,6 +85,13 @@ fn scan_closed_days(config: &AppConfig) -> Result<()> {
         .collect::<Vec<_>>();
     days.sort();
     for day in days {
+        if root
+            .join(&day)
+            .join(ashe_archive_crypto::ARCHIVE_FILENAME)
+            .is_file()
+        {
+            continue;
+        }
         if !grace_period_elapsed(&day, config.daily_report_grace_minutes) {
             continue;
         }
@@ -130,6 +137,14 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
         config.tera_model,
         report.trim(),
     );
+    let _write_guard = crate::artifact_store::lock();
+    if output.parent().is_some_and(|directory| {
+        directory
+            .join(ashe_archive_crypto::ARCHIVE_FILENAME)
+            .is_file()
+    }) {
+        return Ok(());
+    }
     write_atomic(&output, document.as_bytes())?;
     logger::info(format!(
         "Daily report written: {} ({} blocks, complete={})",
@@ -138,6 +153,13 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
         source.coverage_complete
     ));
     Ok(())
+}
+
+pub(crate) fn report_is_current(config: &AppConfig, day: &str) -> bool {
+    let output = config.journal_artifacts_dir.join(day).join("daily.md");
+    build_daily_source(config, day).is_ok_and(|source| {
+        read_frontmatter_value(&output, "source_hash").as_deref() == Some(&source.hash)
+    })
 }
 
 fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {

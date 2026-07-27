@@ -1,2 +1,3 @@
 /target
+/archive-crypto/target
 .env.local

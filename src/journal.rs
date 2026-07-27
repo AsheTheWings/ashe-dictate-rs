@@ -1,4 +1,5 @@
 use crate::activity::{self, ActivitySample};
+use crate::archive::ArchiveHandle;
 use crate::block_artifact::{ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact};
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
@@ -194,6 +195,7 @@ fn run(
 ) -> Result<()> {
     prepare_store(&config.journal_artifacts_dir)?;
     let _daily_reports = DailyReportHandle::spawn(config.clone());
+    let _archives = ArchiveHandle::spawn(config.clone());
     let mut running = config.journal_enabled;
     let block_seconds = (config.journal_block_minutes * 60) as i64;
     let mut block: Option<Block> = None;
@@ -662,6 +664,7 @@ fn legacy_report_path(root: &Path, block: &Block) -> PathBuf {
 }
 
 fn save_pending(root: &Path, block: &Block) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock();
     let path = pending_path(root, block);
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(block)?)?;
@@ -685,6 +688,7 @@ fn save_pending(root: &Path, block: &Block) -> Result<()> {
 }
 
 fn clear_pending(root: &Path, block: &Block) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock();
     let path = pending_path(root, block);
     if path.exists() {
         fs::remove_file(path)?;
@@ -698,7 +702,14 @@ fn write_report(
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
 ) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock();
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+    anyhow::ensure!(
+        !directory
+            .join(ashe_archive_crypto::ARCHIVE_FILENAME)
+            .is_file(),
+        "refusing to write a block into a sealed day"
+    );
     fs::create_dir_all(directory.join("blocks"))?;
     fs::create_dir_all(directory.join("keyframes"))?;
     let keyframe = block
@@ -835,7 +846,14 @@ fn write_terminal_block(
     reason: &str,
     metrics: &BlockMetrics,
 ) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock();
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+    anyhow::ensure!(
+        !directory
+            .join(ashe_archive_crypto::ARCHIVE_FILENAME)
+            .is_file(),
+        "refusing to write a terminal block into a sealed day"
+    );
     fs::create_dir_all(directory.join("blocks"))?;
     let path = report_path(&config.journal_artifacts_dir, block);
     let artifact = BlockArtifact {

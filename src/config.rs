@@ -13,6 +13,12 @@ const DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS: u64 = 30;
 const DEFAULT_CONTEXT_BLOCS: usize = 6;
 const DEFAULT_CONTEXT_SUMMARY_MAX_CHARS: usize = 1_500;
 const DEFAULT_DAILY_REPORT_GRACE_MINUTES: u64 = 15;
+const DEFAULT_ARCHIVE_PLAINTEXT_DAYS: u64 = 2;
+const DEFAULT_ARCHIVE_SCAN_MINUTES: u64 = 5;
+const COMPILED_ARCHIVE_RECIPIENT_JSON: &str = match option_env!("ASHE_ARCHIVE_RECIPIENT_JSON") {
+    Some(value) => value,
+    None => "",
+};
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -45,11 +51,15 @@ pub struct AppConfig {
     pub journal_context_summary_max_chars: usize,
     pub daily_report_enabled: bool,
     pub daily_report_grace_minutes: u64,
+    pub archive_recipient_json: String,
+    pub archive_plaintext_days: u64,
+    pub archive_scan_minutes: u64,
+    pub archive_upload_url: String,
+    pub archive_upload_token: String,
 }
 
 impl AppConfig {
     pub fn load() -> Self {
-        let _ = dotenvy::dotenv();
         load_env_file_near_exe();
 
         let journal_artifacts_dir = std::env::var("ASHE_ARTIFACTS_DIR")
@@ -126,6 +136,22 @@ impl AppConfig {
                 "ASHE_DAILY_REPORT_GRACE_MINUTES",
                 DEFAULT_DAILY_REPORT_GRACE_MINUTES,
             ),
+            archive_recipient_json: std::env::var("ASHE_ARCHIVE_RECIPIENT_JSON")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| COMPILED_ARCHIVE_RECIPIENT_JSON.to_string()),
+            archive_plaintext_days: read_u64(
+                "ASHE_ARCHIVE_PLAINTEXT_DAYS",
+                DEFAULT_ARCHIVE_PLAINTEXT_DAYS,
+            )
+            .max(2),
+            archive_scan_minutes: read_u64(
+                "ASHE_ARCHIVE_SCAN_MINUTES",
+                DEFAULT_ARCHIVE_SCAN_MINUTES,
+            )
+            .max(1),
+            archive_upload_url: std::env::var("ASHE_ARCHIVE_UPLOAD_URL").unwrap_or_default(),
+            archive_upload_token: std::env::var("ASHE_ARCHIVE_UPLOAD_TOKEN").unwrap_or_default(),
         }
     }
 
@@ -184,7 +210,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -199,6 +225,10 @@ impl AppConfig {
             self.journal_context_summary_max_chars,
             self.daily_report_enabled,
             self.daily_report_grace_minutes,
+            !self.archive_recipient_json.trim().is_empty(),
+            self.archive_plaintext_days,
+            !self.archive_upload_url.trim().is_empty()
+                && !self.archive_upload_token.trim().is_empty(),
         )
     }
 }
