@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="x86_64-pc-windows-gnu"
-BINARY="ashe-dictate-rs.exe"
+BINARY="ashe-worker.exe"
 RELEASE_DIR="${RELEASE_DIR:-/root/Desktop/releases}"
 
 if [[ -n "${CARGO:-}" ]]; then
@@ -34,5 +34,6 @@ BUILD_ID="${ASHE_BUILD_ID:-v${PACKAGE_VERSION}+$(date -u +%Y%m%d%H%M%S)-${GIT_SH
 ASHE_BUILD_ID="$BUILD_ID" "$CARGO_BIN" build --release --target "$TARGET"
 mkdir -p "$RELEASE_DIR"
 cp "$PROJECT_ROOT/target/$TARGET/release/$BINARY" "$RELEASE_DIR/$BINARY"
-printf '%s\n' "$BUILD_ID" > "$RELEASE_DIR/ashe-dictate-rs.build.txt"
+cp "$PROJECT_ROOT/.env.example" "$RELEASE_DIR/.env.example"
+printf '%s\n' "$BUILD_ID" > "$RELEASE_DIR/ashe-worker.build.txt"
 printf 'Shipped %s build_id=%s\n' "$RELEASE_DIR/$BINARY" "$BUILD_ID"

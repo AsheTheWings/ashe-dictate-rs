@@ -9,21 +9,22 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::null_mut;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::{
     FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_BACK, VK_ESCAPE,
+    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_BACK, VK_ESCAPE,
     VK_RETURN,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -44,8 +45,11 @@ const MENU_OPEN_LOG: usize = 3003;
 const MENU_COPY_LOG_PATH: usize = 3004;
 const MENU_ABOUT: usize = 3005;
 const MENU_QUIT: usize = 3006;
-const ICON_FILE_NAME: &str = "ashe-dictate-rs.ico";
-const ICON_DATA_PATH: &str = "data/ashe-dictate-rs.ico";
+const MENU_TOGGLE_JOURNAL: usize = 3007;
+const MENU_OPEN_ARTIFACTS: usize = 3008;
+const MENU_OPEN_JOURNAL: usize = 3009;
+const ICON_FILE_NAME: &str = "ashe-worker.ico";
+const ICON_DATA_PATH: &str = "assets/ashe-worker.ico";
 const APP_ICON_RESOURCE_ID: u16 = 1;
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,9 @@ pub enum Win32Event {
     ReloadConfigRequested,
     OpenLogRequested,
     CopyLogPathRequested,
+    ToggleJournalRequested,
+    OpenArtifactsRequested,
+    OpenJournalRequested,
     AboutRequested,
     QuitRequested,
     PasteCompleted(Result<(), String>),
@@ -72,10 +79,21 @@ pub enum Win32Command {
     SetActive(bool),
     SetFollowCursor(bool),
     SetTooltip(String),
-    ShowMessageBox { title: String, text: String },
+    SetJournalStatus {
+        running: bool,
+        status: String,
+    },
+    ShowMessageBox {
+        title: String,
+        text: String,
+    },
     OpenLog(String),
+    OpenPath(String),
     CopyText(String),
-    PasteText { target_hwnd: isize, text: String },
+    PasteText {
+        target_hwnd: isize,
+        text: String,
+    },
     InjectText {
         target_hwnd: isize,
         text: String,
@@ -93,6 +111,9 @@ struct ServiceState {
     revert_sentence_hotkey_registered: bool,
     clear_transcript_hotkey_registered: bool,
     submit_hotkey_registered: bool,
+    journal_running: bool,
+    journal_status: String,
+    last_artifacts_open: Option<Instant>,
 }
 
 pub fn spawn(
@@ -117,7 +138,7 @@ unsafe fn run_message_loop(
     command_rx: Receiver<Win32Command>,
 ) -> anyhow::Result<()> {
     let instance = GetModuleHandleW(None)?;
-    let class = wide("AsheDictateRsServiceWindow");
+    let class = wide("AsheWorkerServiceWindow");
     let app_icon = load_app_icon(0, 0);
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -132,7 +153,7 @@ unsafe fn run_message_loop(
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         pcwstr(&class),
-        pcwstr(&wide("Ashe Dictate RS Service")),
+        pcwstr(&wide("Ashe Worker Service")),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -153,6 +174,9 @@ unsafe fn run_message_loop(
         revert_sentence_hotkey_registered: false,
         clear_transcript_hotkey_registered: false,
         submit_hotkey_registered: false,
+        journal_running: false,
+        journal_status: "activity journal starting".to_string(),
+        last_artifacts_open: None,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     register_hotkey(hwnd);
@@ -160,7 +184,7 @@ unsafe fn run_message_loop(
     if timer_id == 0 {
         logger::info("Win32 service SetTimer failed");
     }
-    add_tray(hwnd, "Ashe Dictate RS - Idle - Win+Shift+H");
+    add_tray(hwnd, "Ashe Worker - Idle - Win+Shift+H");
     let mut message = MSG::default();
     while GetMessageW(&mut message, None, 0, 0).into() {
         let _ = TranslateMessage(&message);
@@ -223,9 +247,10 @@ unsafe extern "system" fn window_proc(
                 if let Some(state) = state {
                     let (x, y) = active_input_position();
                     let target_hwnd = target_window(hwnd);
-                    let _ = state
-                        .event_tx
-                        .send(Win32Event::FixGrammarRequested { target_hwnd, x, y });
+                    let _ =
+                        state
+                            .event_tx
+                            .send(Win32Event::FixGrammarRequested { target_hwnd, x, y });
                 }
                 return LRESULT(0);
             }
@@ -234,9 +259,11 @@ unsafe extern "system" fn window_proc(
                 if let Some(state) = state {
                     let (x, y) = active_input_position();
                     let target_hwnd = target_window(hwnd);
-                    let _ = state
-                        .event_tx
-                        .send(Win32Event::AnswerQuestionRequested { target_hwnd, x, y });
+                    let _ = state.event_tx.send(Win32Event::AnswerQuestionRequested {
+                        target_hwnd,
+                        x,
+                        y,
+                    });
                 }
                 return LRESULT(0);
             }
@@ -253,9 +280,27 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_TRAY => {
+            if lparam.0 as u32 == WM_LBUTTONUP {
+                if let Some(state) = state {
+                    let now = Instant::now();
+                    let should_open = state
+                        .last_artifacts_open
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(750));
+                    if should_open {
+                        state.last_artifacts_open = Some(now);
+                        let _ = state.event_tx.send(Win32Event::OpenArtifactsRequested);
+                    }
+                }
+                return LRESULT(0);
+            }
             if lparam.0 as u32 == WM_RBUTTONUP {
                 if let Some(state) = state {
-                    show_tray_menu(hwnd, state.active);
+                    show_tray_menu(
+                        hwnd,
+                        state.active,
+                        state.journal_running,
+                        &state.journal_status,
+                    );
                 }
                 return LRESULT(0);
             }
@@ -282,6 +327,18 @@ unsafe extern "system" fn window_proc(
                     }
                     MENU_COPY_LOG_PATH => {
                         let _ = state.event_tx.send(Win32Event::CopyLogPathRequested);
+                        return LRESULT(0);
+                    }
+                    MENU_TOGGLE_JOURNAL => {
+                        let _ = state.event_tx.send(Win32Event::ToggleJournalRequested);
+                        return LRESULT(0);
+                    }
+                    MENU_OPEN_ARTIFACTS => {
+                        let _ = state.event_tx.send(Win32Event::OpenArtifactsRequested);
+                        return LRESULT(0);
+                    }
+                    MENU_OPEN_JOURNAL => {
+                        let _ = state.event_tx.send(Win32Event::OpenJournalRequested);
                         return LRESULT(0);
                     }
                     MENU_ABOUT => {
@@ -330,6 +387,10 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 state.follow_cursor = follow;
             }
             Win32Command::SetTooltip(tooltip) => set_tray_tooltip(hwnd, &tooltip),
+            Win32Command::SetJournalStatus { running, status } => {
+                state.journal_running = running;
+                state.journal_status = status;
+            }
             Win32Command::ShowMessageBox { title, text } => message_box(hwnd, &text, &title),
             Win32Command::OpenLog(path) => {
                 if let Err(err) = Command::new("notepad.exe").arg(path).spawn() {
@@ -337,18 +398,30 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                     message_box(
                         hwnd,
                         &format!("Could not open log file: {err}"),
-                        "Ashe Dictate RS",
+                        "Ashe Worker",
                     );
+                }
+            }
+            Win32Command::OpenPath(path) => {
+                let mut path = PathBuf::from(&path);
+                while !path.exists() {
+                    let Some(parent) = path.parent().map(Path::to_path_buf) else {
+                        break;
+                    };
+                    if parent == path {
+                        break;
+                    }
+                    path = parent;
+                }
+                if let Err(err) = Command::new("explorer.exe").arg(path).spawn() {
+                    logger::info(format!("Open path failed: {err:#}"));
+                    message_box(hwnd, &format!("Could not open path: {err}"), "Ashe Worker");
                 }
             }
             Win32Command::CopyText(text) => {
                 if let Err(err) = injector::copy_text(&text) {
                     logger::info(format!("Copy text failed: {err:#}"));
-                    message_box(
-                        hwnd,
-                        &format!("Could not copy text: {err}"),
-                        "Ashe Dictate RS",
-                    );
+                    message_box(hwnd, &format!("Could not copy text: {err}"), "Ashe Worker");
                 }
             }
             Win32Command::PasteText { target_hwnd, text } => {
@@ -385,7 +458,7 @@ unsafe fn register_hotkey(hwnd: HWND) {
         message_box(
             hwnd,
             "Win+Shift+H could not be registered. Another app may already be using it.",
-            "Ashe Dictate RS",
+            "Ashe Worker",
         );
     }
     if let Err(err) = RegisterHotKey(
@@ -398,7 +471,7 @@ unsafe fn register_hotkey(hwnd: HWND) {
         message_box(
             hwnd,
             "Win+Shift+G could not be registered. Another app may already be using it.",
-            "Ashe Dictate RS",
+            "Ashe Worker",
         );
     }
     if let Err(err) = RegisterHotKey(
@@ -411,7 +484,7 @@ unsafe fn register_hotkey(hwnd: HWND) {
         message_box(
             hwnd,
             "Win+Shift+Q could not be registered. Another app may already be using it.",
-            "Ashe Dictate RS",
+            "Ashe Worker",
         );
     }
 }
@@ -621,7 +694,7 @@ unsafe fn load_app_icon(width: i32, height: i32) -> HICON {
 unsafe fn load_app_icon_from_resource(width: i32, height: i32) -> Option<HICON> {
     let module = GetModuleHandleW(None).ok()?;
     let group = FindResourceW(
-        Some(module.into()),
+        Some(module),
         int_resource(APP_ICON_RESOURCE_ID),
         RT_GROUP_ICON,
     );
@@ -629,9 +702,9 @@ unsafe fn load_app_icon_from_resource(width: i32, height: i32) -> Option<HICON> 
         return None;
     }
 
-    let group_data = LoadResource(Some(module.into()), group).ok()?;
+    let group_data = LoadResource(Some(module), group).ok()?;
     let group_ptr = LockResource(group_data) as *const u8;
-    let group_size = SizeofResource(Some(module.into()), group) as usize;
+    let group_size = SizeofResource(Some(module), group) as usize;
     if group_ptr.is_null() || group_size == 0 {
         return None;
     }
@@ -641,14 +714,14 @@ unsafe fn load_app_icon_from_resource(width: i32, height: i32) -> Option<HICON> 
         return None;
     }
 
-    let icon = FindResourceW(Some(module.into()), int_resource(icon_id as u16), RT_ICON);
+    let icon = FindResourceW(Some(module), int_resource(icon_id as u16), RT_ICON);
     if icon.is_invalid() {
         return None;
     }
 
-    let icon_data = LoadResource(Some(module.into()), icon).ok()?;
+    let icon_data = LoadResource(Some(module), icon).ok()?;
     let icon_ptr = LockResource(icon_data) as *const u8;
-    let icon_size = SizeofResource(Some(module.into()), icon) as usize;
+    let icon_size = SizeofResource(Some(module), icon) as usize;
     if icon_ptr.is_null() || icon_size == 0 {
         return None;
     }
@@ -707,10 +780,12 @@ fn remove_tray(hwnd: HWND) {
 }
 
 fn tray_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = 1;
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
+    };
     for (idx, value) in wide(tooltip)
         .iter()
         .copied()
@@ -722,7 +797,7 @@ fn tray_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
     data
 }
 
-fn show_tray_menu(hwnd: HWND, active: bool) {
+fn show_tray_menu(hwnd: HWND, active: bool, journal_running: bool, journal_status: &str) {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
         let label = if active {
@@ -731,6 +806,32 @@ fn show_tray_menu(hwnd: HWND, active: bool) {
             "Start dictation"
         };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, pcwstr(&wide(label)));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let journal_label = if journal_running {
+            "Pause activity journal"
+        } else {
+            "Resume activity journal"
+        };
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_TOGGLE_JOURNAL,
+            pcwstr(&wide(journal_label)),
+        );
+        let status = format!("Journal: {journal_status}");
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&wide(&status)));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_ARTIFACTS,
+            pcwstr(&wide("Open artifacts folder")),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_JOURNAL,
+            pcwstr(&wide("Open today's journal")),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(
             menu,

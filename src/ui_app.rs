@@ -2,6 +2,7 @@ use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::deepgram_client::DeepgramSession;
 use crate::injector;
+use crate::journal::JournalHandle;
 use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
@@ -70,6 +71,8 @@ pub struct UiApp {
     transcript: String,
     polished: Option<String>,
     error: Option<String>,
+    journal: JournalHandle,
+    last_journal_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +92,7 @@ impl UiApp {
         let win32_thread = win32_service::spawn(event_tx, command_rx);
         let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
+        let journal = JournalHandle::spawn(config.clone());
         let app = Self {
             config,
             state: DictationState::Idle,
@@ -112,9 +116,11 @@ impl UiApp {
             transcript: String::new(),
             polished: None,
             error: None,
+            journal,
+            last_journal_status: String::new(),
         };
         app.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Idle - Win+Shift+H".to_string(),
+            "Ashe Worker - Idle - Win+Shift+H".to_string(),
         ));
         (app, window::latest().map(Message::WindowReady))
     }
@@ -163,6 +169,18 @@ impl UiApp {
         }
         if self.state == DictationState::Stopping {
             self.complete_stop_if_ready(&mut tasks);
+        }
+        let journal = self.journal.status();
+        let journal_key = format!(
+            "{}:{}:{}",
+            journal.running, journal.current_frames, journal.summary
+        );
+        if journal_key != self.last_journal_status {
+            self.last_journal_status = journal_key;
+            self.send_win32(Win32Command::SetJournalStatus {
+                running: journal.running,
+                status: journal.summary,
+            });
         }
         Task::batch(tasks)
     }
@@ -213,7 +231,23 @@ impl UiApp {
                     logger::log_path().display().to_string(),
                 ));
                 self.send_win32(Win32Command::SetTooltip(
-                    "Ashe Dictate RS - Log path copied - Win+Shift+H".to_string(),
+                    "Ashe Worker - Log path copied - Win+Shift+H".to_string(),
+                ));
+                Task::none()
+            }
+            Win32Event::ToggleJournalRequested => {
+                self.journal.toggle();
+                Task::none()
+            }
+            Win32Event::OpenArtifactsRequested => {
+                self.send_win32(Win32Command::OpenPath(
+                    self.journal.artifacts_dir().display().to_string(),
+                ));
+                Task::none()
+            }
+            Win32Event::OpenJournalRequested => {
+                self.send_win32(Win32Command::OpenPath(
+                    self.journal.today_journal().display().to_string(),
                 ));
                 Task::none()
             }
@@ -248,7 +282,7 @@ impl UiApp {
             self.status = status.clone();
             if !(self.state == DictationState::Stopping && status == "Idle") {
                 self.send_win32(Win32Command::SetTooltip(format!(
-                    "Ashe Dictate RS - {status} - Win+Shift+H"
+                    "Ashe Worker - {status} - Win+Shift+H"
                 )));
             }
             if (status.starts_with("Listening") || status == "Speech detected")
@@ -299,13 +333,16 @@ impl UiApp {
         self.error = None;
         self.send_win32(Win32Command::SetActive(false));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Cancelled - Win+Shift+H".to_string(),
+            "Ashe Worker - Cancelled - Win+Shift+H".to_string(),
         ));
         self.apply_window_state()
     }
 
     fn revert_last_sentence(&mut self) -> Task<Message> {
-        if !matches!(self.state, DictationState::Starting | DictationState::Listening) {
+        if !matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        ) {
             return Task::none();
         }
         let Some(session) = self.session.as_mut() else {
@@ -321,13 +358,16 @@ impl UiApp {
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Last sentence reverted - Win+Shift+H".to_string(),
+            "Ashe Worker - Last sentence reverted - Win+Shift+H".to_string(),
         ));
         overlay_view::scroll_transcript_to_end()
     }
 
     fn clear_transcript(&mut self) -> Task<Message> {
-        if !matches!(self.state, DictationState::Starting | DictationState::Listening) {
+        if !matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        ) {
             return Task::none();
         }
         let Some(session) = self.session.as_mut() else {
@@ -342,7 +382,7 @@ impl UiApp {
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Transcript cleared - Win+Shift+H".to_string(),
+            "Ashe Worker - Transcript cleared - Win+Shift+H".to_string(),
         ));
         overlay_view::scroll_transcript_to_end()
     }
@@ -351,7 +391,7 @@ impl UiApp {
         if let Err(err) = self.config.validate_for_dictation() {
             logger::info(format!("Config validation failed: {err:#}"));
             self.send_win32(Win32Command::ShowMessageBox {
-                title: "Ashe Dictate RS".to_string(),
+                title: "Ashe Worker".to_string(),
                 text: format!("Cannot start dictation: {err}"),
             });
             return Task::none();
@@ -373,7 +413,7 @@ impl UiApp {
         });
         self.send_win32(Win32Command::SetActive(true));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Connecting... - Win+Shift+H".to_string(),
+            "Ashe Worker - Connecting... - Win+Shift+H".to_string(),
         ));
         let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let audio = match AudioCapture::start(audio_tx, self.config.output_sample_rate) {
@@ -382,7 +422,7 @@ impl UiApp {
                 logger::info(format!("Audio start failed: {err:#}"));
                 let hide_task = self.finish_without_transcript();
                 self.send_win32(Win32Command::ShowMessageBox {
-                    title: "Ashe Dictate RS".to_string(),
+                    title: "Ashe Worker".to_string(),
                     text: format!("Audio capture failed: {err}"),
                 });
                 return hide_task;
@@ -424,7 +464,7 @@ impl UiApp {
         self.state = DictationState::Stopping;
         self.status = "Finalizing transcript...".to_string();
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Stopping... - Win+Shift+H".to_string(),
+            "Ashe Worker - Stopping... - Win+Shift+H".to_string(),
         ));
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
@@ -438,7 +478,7 @@ impl UiApp {
         let deepgram_done = self
             .deepgram
             .as_mut()
-            .map_or(true, DeepgramSession::join_if_finished);
+            .is_none_or(DeepgramSession::join_if_finished);
         if deepgram_done {
             self.deepgram.take();
         }
@@ -460,7 +500,7 @@ impl UiApp {
         self.state = DictationState::Polishing;
         self.status = "Polishing with Gemini...".to_string();
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Polishing... - Win+Shift+H".to_string(),
+            "Ashe Worker - Polishing... - Win+Shift+H".to_string(),
         ));
         let config = self.config.clone();
         let context = session.selected_context.clone();
@@ -508,11 +548,11 @@ impl UiApp {
             logger::info(format!("Text injection failed: {err}"));
             self.error = Some("Paste failed".to_string());
             self.send_win32(Win32Command::SetTooltip(
-                "Ashe Dictate RS - Paste error - Win+Shift+H".to_string(),
+                "Ashe Worker - Paste error - Win+Shift+H".to_string(),
             ));
         } else {
             self.send_win32(Win32Command::SetTooltip(
-                "Ashe Dictate RS - Inserted - Win+Shift+H".to_string(),
+                "Ashe Worker - Inserted - Win+Shift+H".to_string(),
             ));
         }
         self.hide_overlay_after_session()
@@ -520,7 +560,7 @@ impl UiApp {
 
     fn finish_without_transcript(&mut self) -> Task<Message> {
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Idle - Win+Shift+H".to_string(),
+            "Ashe Worker - Idle - Win+Shift+H".to_string(),
         ));
         self.hide_overlay_after_session()
     }
@@ -528,25 +568,29 @@ impl UiApp {
     fn reload_config(&mut self) {
         if self.state != DictationState::Idle {
             self.send_win32(Win32Command::ShowMessageBox {
-                title: "Ashe Dictate RS".to_string(),
+                title: "Ashe Worker".to_string(),
                 text: "Stop dictation before reloading config.".to_string(),
             });
             return;
         }
         self.config = AppConfig::load();
+        self.journal.shutdown();
+        self.journal = JournalHandle::spawn(self.config.clone());
         logger::info(format!("Config reloaded: {}", self.config.log_summary()));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Dictate RS - Config reloaded - Win+Shift+H".to_string(),
+            "Ashe Worker - Config reloaded - Win+Shift+H".to_string(),
         ));
     }
 
     fn show_about(&self) {
         self.send_win32(Win32Command::ShowMessageBox {
-            title: "About Ashe Dictate RS".to_string(),
+            title: "About Ashe Worker".to_string(),
             text: format!(
-                "Ashe Dictate RS\r\nVersion: {}\r\nBuild: {}\r\n\r\nHotkey: Win+Shift+H\r\nConfig: {}\r\nLog: {}",
+                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nActivity journal: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
                 APP_VERSION,
                 BUILD_ID,
+                self.journal.status().summary,
+                self.journal.artifacts_dir().display(),
                 self.config.log_summary(),
                 logger::log_path().display()
             ),
@@ -566,7 +610,7 @@ impl UiApp {
         if let Err(err) = self.config.validate_for_llm() {
             logger::info(format!("LLM config validation failed: {err:#}"));
             self.send_win32(Win32Command::ShowMessageBox {
-                title: "Ashe Dictate RS".to_string(),
+                title: "Ashe Worker".to_string(),
                 text: format!("Cannot run text action: {err}"),
             });
             return Task::none();
@@ -576,14 +620,14 @@ impl UiApp {
             Ok(None) => {
                 logger::info("Text action: no text selected");
                 self.send_win32(Win32Command::SetTooltip(
-                    "Ashe Dictate RS - No text selected - Win+Shift+H".to_string(),
+                    "Ashe Worker - No text selected - Win+Shift+H".to_string(),
                 ));
                 return Task::none();
             }
             Err(err) => {
                 logger::info(format!("Text action selection capture failed: {err:#}"));
                 self.send_win32(Win32Command::ShowMessageBox {
-                    title: "Ashe Dictate RS".to_string(),
+                    title: "Ashe Worker".to_string(),
                     text: format!("Could not capture selected text: {err}"),
                 });
                 return Task::none();
@@ -594,12 +638,12 @@ impl UiApp {
             TextActionKind::FixGrammar => (
                 DictationState::FixingGrammar,
                 "Fixing grammar...",
-                "Ashe Dictate RS - Fixing grammar... - Win+Shift+H",
+                "Ashe Worker - Fixing grammar... - Win+Shift+H",
             ),
             TextActionKind::AnswerQuestion => (
                 DictationState::AnsweringQuestion,
                 "Answering...",
-                "Ashe Dictate RS - Answering... - Win+Shift+H",
+                "Ashe Worker - Answering... - Win+Shift+H",
             ),
         };
         logger::info(format!("Text action started chars={}", selected.len()));
@@ -619,9 +663,7 @@ impl UiApp {
         let llm_task = Task::perform(
             async move {
                 match kind {
-                    TextActionKind::FixGrammar => {
-                        llm_client::fix_grammar(config, selected).await
-                    }
+                    TextActionKind::FixGrammar => llm_client::fix_grammar(config, selected).await,
                     TextActionKind::AnswerQuestion => {
                         llm_client::answer_question(config, selected).await
                     }
@@ -651,7 +693,7 @@ impl UiApp {
                 logger::info(format!("Text action failed: {err}"));
                 self.error = Some("LLM request failed".to_string());
                 self.send_win32(Win32Command::SetTooltip(
-                    "Ashe Dictate RS - LLM error - Win+Shift+H".to_string(),
+                    "Ashe Worker - LLM error - Win+Shift+H".to_string(),
                 ));
                 return self.hide_overlay_after_session();
             }
@@ -659,7 +701,7 @@ impl UiApp {
         if text.trim().is_empty() {
             logger::info("Text action returned empty result");
             self.send_win32(Win32Command::SetTooltip(
-                "Ashe Dictate RS - Empty result - Win+Shift+H".to_string(),
+                "Ashe Worker - Empty result - Win+Shift+H".to_string(),
             ));
             return self.hide_overlay_after_session();
         }
@@ -692,6 +734,7 @@ impl UiApp {
 
     fn quit(&mut self) -> Task<Message> {
         logger::info("Quit requested");
+        self.journal.shutdown();
         self.request_stop();
         self.send_win32(Win32Command::Shutdown);
         if let Some(id) = self.window_id {
@@ -706,12 +749,11 @@ impl UiApp {
             .bridge_thread
             .as_ref()
             .is_some_and(|thread| thread.is_finished())
+            && let Some(thread) = self.bridge_thread.take()
         {
-            if let Some(thread) = self.bridge_thread.take() {
-                match thread.join() {
-                    Ok(()) => logger::info("Audio bridge thread joined"),
-                    Err(_) => logger::info("Audio bridge thread panicked"),
-                }
+            match thread.join() {
+                Ok(()) => logger::info("Audio bridge thread joined"),
+                Err(_) => logger::info("Audio bridge thread panicked"),
             }
         }
     }

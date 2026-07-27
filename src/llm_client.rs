@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
 use serde_json::{Value, json};
 
 const SYSTEM_PROMPT: &str = "Rewrite dictated speech into clear text as fast as possible. Do not reason. Do not explain. Correct grammar, punctuation, casing, and formatting. Remove filler words, false starts, repeated phrases, and disfluencies. Preserve intent and meaning. Do not add facts. Return only the final rewritten text.";
@@ -30,6 +31,189 @@ pub async fn polish_transcript(
 const GRAMMAR_PROMPT: &str = "Fix grammar, spelling, punctuation, and casing in the user's text. Preserve the original meaning, tone, intent, and language. Do not add or remove information. Do not explain. Return only the corrected text.";
 const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's question directly and concisely. Do not restate the question. Reply in the same language as the question. Return only the answer.";
 const QUESTION_TEMPERATURE: f32 = 0.7;
+
+const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity journal keeper. Write a factual account of what the user did during this time block, whether work, reading, entertainment, messaging, shopping, games, or personal admin. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level. Output a short plain-text title on the first line in the form 'Area: what happened', then a blank line, then 120-250 words of concise Markdown prose.";
+const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity. Merge the previous summary with the newly aged block reports. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The supplied aged reports are the only new material. Do not infer later activity. Return Markdown prose only, without a title or preamble.";
+const DAILY_REPORT_PROMPT: &str = "Write a human-readable end-of-day activity report from the complete block reports and measured coverage supplied by Ashe Worker. Use every relevant thread in proportion to its documented time, whether work, entertainment, browsing, communication, errands, or inactivity. Measured totals and coverage are ground truth: never invent activity inside missing intervals or infer durations from prose. Preserve concrete names and progression. Do not mention screenshots, telemetry, prompts, or being an observer. Do not score productivity or moralize. Protect credentials, financial values, medical details, and intimate conversation contents. Return Markdown with exactly these H2 sections: What happened, Loose ends, Time, and Coverage. Begin with a two-sentence overview before the first section. Omit no section; write 'No known loose ends' or 'Complete coverage' where appropriate. Do not add a top-level title.";
+
+pub async fn describe_activity_block(
+    config: AppConfig,
+    context: String,
+    frames: Vec<(String, Vec<u8>)>,
+) -> Result<(String, String)> {
+    let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
+    let mut content = vec![json!({ "type": "input_text", "text": context })];
+    for (label, bytes) in frames {
+        content.push(json!({ "type": "input_text", "text": label }));
+        content.push(json!({
+            "type": "input_image",
+            "image_url": format!(
+                "data:image/webp;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        }));
+    }
+    let body = json!({
+        "model": config.tera_model,
+        "instructions": ACTIVITY_PROMPT,
+        "input": [{ "role": "user", "content": content }]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("failed to build journal HTTP client")?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.tera_api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("activity description request failed")?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .context("activity description returned a non-JSON body")?;
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("detail").and_then(Value::as_str))
+            .unwrap_or("unknown error");
+        return Err(anyhow!("activity description failed ({status}): {message}"));
+    }
+    split_activity_report(&extract_output_text(&payload))
+}
+
+pub async fn refresh_activity_summary(
+    config: AppConfig,
+    previous: String,
+    aged_reports: String,
+    max_chars: usize,
+) -> Result<String> {
+    let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
+    let body = json!({
+        "model": config.tera_model,
+        "instructions": format!("{SUMMARY_PROMPT}\n\nThe complete result must contain at most {max_chars} Unicode characters."),
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!(
+                    "### Previous rolling summary\n{}\n\n### Block reports to fold in\n{}",
+                    if previous.trim().is_empty() { "(none yet)" } else { previous.trim() },
+                    aged_reports,
+                )
+            }]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("failed to build summary HTTP client")?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.tera_api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("rolling-summary request failed")?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .context("rolling-summary response was not JSON")?;
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("detail").and_then(Value::as_str))
+            .unwrap_or("unknown error");
+        return Err(anyhow!(
+            "rolling-summary request failed ({status}): {message}"
+        ));
+    }
+    let summary = extract_output_text(&payload);
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return Err(anyhow!("rolling-summary response was empty"));
+    }
+    Ok(summary.chars().take(max_chars).collect())
+}
+
+pub async fn generate_daily_activity_report(
+    config: AppConfig,
+    day: String,
+    timezone: String,
+    measured_totals: String,
+    coverage: String,
+    complete_reports: String,
+) -> Result<String> {
+    let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
+    let body = json!({
+        "model": config.tera_model,
+        "instructions": DAILY_REPORT_PROMPT,
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!(
+                    "# Daily source for {day}\nTimezone: {timezone}\n\n## Measured daily totals\n{measured_totals}\n\n## Coverage and gaps\n{coverage}\n\n## Complete chronological block reports\n{complete_reports}\n\nWrite the report for {day} only.",
+                )
+            }]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .context("failed to build daily-report HTTP client")?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.tera_api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("daily-report request failed")?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .context("daily-report response was not JSON")?;
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("detail").and_then(Value::as_str))
+            .unwrap_or("unknown error");
+        return Err(anyhow!("daily-report request failed ({status}): {message}"));
+    }
+    let report = extract_output_text(&payload);
+    if report.trim().is_empty() {
+        return Err(anyhow!("daily-report response was empty"));
+    }
+    Ok(report.trim().to_string())
+}
+
+fn split_activity_report(text: &str) -> Result<(String, String)> {
+    let mut lines = text.trim().lines();
+    let title = lines
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_matches(['*', '"'])
+        })
+        .unwrap_or("Activity")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    if title.is_empty() || body.is_empty() {
+        return Err(anyhow!("activity description was empty or malformed"));
+    }
+    Ok((title, body))
+}
 
 /// Correct grammar/spelling/punctuation in selected text and return only the rewrite.
 ///
@@ -121,7 +305,12 @@ fn extract_output_text(payload: &Value) -> String {
         return out;
     };
     for item in items {
-        if item.get("type").and_then(Value::as_str).unwrap_or("message") != "message" {
+        if item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message")
+            != "message"
+        {
             continue;
         }
         match item.get("content") {

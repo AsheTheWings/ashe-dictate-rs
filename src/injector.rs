@@ -105,7 +105,7 @@ pub fn inject_text_to(hwnd: HWND, text: &str, append_after_selection: bool) -> R
         }
     }
     if append_after_selection {
-        send_key(VK_RIGHT.0 as u16).context("failed to collapse selection")?;
+        send_key(VK_RIGHT.0).context("failed to collapse selection")?;
         thread::sleep(Duration::from_millis(30));
     }
     paste_text(text)
@@ -210,14 +210,15 @@ fn wait_for_modifiers_released() {
         }
         thread::sleep(MODIFIER_POLL_INTERVAL);
     }
-}fn send_ctrl_v() -> Result<()> {
+}
+fn send_ctrl_v() -> Result<()> {
     send_ctrl_key('V' as u16)
 }
 
 fn send_key(vk: u16) -> Result<()> {
     unsafe {
-        let mut inputs = [key_input(vk, false), key_input(vk, true)];
-        let sent = SendInput(&mut inputs, size_of::<INPUT>() as i32);
+        let inputs = [key_input(vk, false), key_input(vk, true)];
+        let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
         if sent != inputs.len() as u32 {
             return Err(anyhow!("SendInput sent {sent}/{} events", inputs.len()));
         }
@@ -227,13 +228,13 @@ fn send_key(vk: u16) -> Result<()> {
 
 fn send_ctrl_key(key: u16) -> Result<()> {
     unsafe {
-        let mut inputs = [
-            key_input(VK_CONTROL.0 as u16, false),
+        let inputs = [
+            key_input(VK_CONTROL.0, false),
             key_input(key, false),
             key_input(key, true),
-            key_input(VK_CONTROL.0 as u16, true),
+            key_input(VK_CONTROL.0, true),
         ];
-        let sent = SendInput(&mut inputs, size_of::<INPUT>() as i32);
+        let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
         if sent != inputs.len() as u32 {
             return Err(anyhow!("SendInput sent {sent}/{} events", inputs.len()));
         }

@@ -2,8 +2,8 @@
 
 use crate::logger;
 use crate::util::{pcwstr, wide};
+use iced::widget::{Id, operation};
 use iced::widget::{column, container, scrollable, text};
-use iced::widget::{operation, Id};
 use iced::window;
 use iced::{Background, Color, Element, Length, Point, Shadow, Size, Task, Vector};
 #[cfg(target_os = "windows")]
@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{COLORREF, HWND};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const TITLE: &str = "Ashe Dictate Rs - Iced";
+pub const TITLE: &str = "Ashe Worker";
 pub const WIDTH: f32 = 430.0;
 pub const HEIGHT: f32 = 216.0;
 const CORNER_RADIUS: u32 = 0;

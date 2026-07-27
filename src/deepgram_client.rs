@@ -186,7 +186,7 @@ async fn run(
                 .await
                 .context("failed to send audio chunk to Deepgram")?;
             sent_chunks += 1;
-            if sent_chunks == 1 || sent_chunks % 100 == 0 {
+            if sent_chunks == 1 || sent_chunks.is_multiple_of(100) {
                 logger::info(format!("Deepgram chunks sent={sent_chunks}"));
             }
         }

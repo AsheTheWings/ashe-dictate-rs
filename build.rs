@@ -1,6 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=ASHE_BUILD_ID");
-    println!("cargo:rerun-if-changed=data/ashe-dictate-rs.ico");
+    println!("cargo:rerun-if-changed=assets/ashe-worker.ico");
     let build_id = std::env::var("ASHE_BUILD_ID").unwrap_or_else(|_| "dev".to_string());
     println!("cargo:rustc-env=ASHE_BUILD_ID={build_id}");
 
@@ -18,17 +18,55 @@ fn embed_windows_icon() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
     );
-    let icon_path = manifest_dir.join("data").join("ashe-dictate-rs.ico");
-    let rc_path = out_dir.join("ashe-dictate-rs.rc");
-    let res_path = out_dir.join("ashe-dictate-rs.res");
+    let icon_path = manifest_dir.join("assets").join("ashe-worker.ico");
+    let rc_path = out_dir.join("ashe-worker.rc");
+    let res_path = out_dir.join("ashe-worker.res");
 
     let mut rc_file = std::fs::File::create(&rc_path).expect("create Windows resource script");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+    let mut parts = version
+        .split('.')
+        .take(3)
+        .map(|part| part.parse::<u16>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    parts.resize(3, 0);
     writeln!(
         rc_file,
-        "1 ICON \"{}\"",
-        icon_path.display().to_string().replace('\\', "\\\\")
+        r#"1 ICON "{}"
+1 VERSIONINFO
+FILEVERSION {},{},{},0
+PRODUCTVERSION {},{},{},0
+FILETYPE 1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Ashe Services"
+      VALUE "FileDescription", "Ashe Worker"
+      VALUE "FileVersion", "{}"
+      VALUE "InternalName", "ashe-worker"
+      VALUE "OriginalFilename", "ashe-worker.exe"
+      VALUE "ProductName", "Ashe Worker"
+      VALUE "ProductVersion", "{}"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END"#,
+        icon_path.display().to_string().replace('\\', "\\\\"),
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[0],
+        parts[1],
+        parts[2],
+        version,
+        version,
     )
-    .expect("write Windows icon resource");
+    .expect("write Windows resources");
 
     let windres = std::env::var("WINDRES").unwrap_or_else(|_| {
         if std::env::var("TARGET").is_ok_and(|target| target.contains("windows-gnu")) {
@@ -49,7 +87,7 @@ fn embed_windows_icon() {
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
         println!(
-            "cargo:rustc-link-arg-bin=ashe-dictate-rs={}",
+            "cargo:rustc-link-arg-bin=ashe-worker={}",
             res_path.display()
         );
     }

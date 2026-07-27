@@ -12,7 +12,7 @@ pub fn init() {
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut file| writeln!(file, "\r\n{} === Ashe Dictate RS started ===", timestamp()));
+        .and_then(|mut file| writeln!(file, "\r\n{} === Ashe Worker started ===", timestamp()));
 }
 
 pub fn info(message: impl AsRef<str>) {
@@ -29,8 +29,8 @@ pub fn log_path() -> PathBuf {
         .get_or_init(|| {
             std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|p| p.join("ashe-dictate-rs.log")))
-                .unwrap_or_else(|| PathBuf::from("ashe-dictate-rs.log"))
+                .and_then(|p| p.parent().map(|p| p.join("ashe-worker.log")))
+                .unwrap_or_else(|| PathBuf::from("ashe-worker.log"))
         })
         .clone()
 }

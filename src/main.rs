@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod activity;
 mod audio;
 mod config;
+mod daily_report;
 mod deepgram_client;
 mod injector;
+mod journal;
 mod llm_client;
 mod logger;
 mod overlay_view;
+mod screen_capture;
 mod ui_app;
 mod util;
 mod win32_service;
