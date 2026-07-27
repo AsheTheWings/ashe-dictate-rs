@@ -3,7 +3,7 @@ use crate::util::wide;
 use anyhow::{Context, Result, anyhow};
 use std::mem::size_of;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -14,7 +14,8 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_RIGHT,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+    VK_CONTROL, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
@@ -22,6 +23,8 @@ const CLIPBOARD_RETRIES: usize = 12;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(25);
 const COPY_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(180);
+const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(1000);
+const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub fn copy_text(text: &str) -> Result<()> {
     set_clipboard_text(text).context("failed to set clipboard text")?;
@@ -30,6 +33,11 @@ pub fn copy_text(text: &str) -> Result<()> {
 }
 
 pub fn capture_selected_text() -> Result<Option<String>> {
+    // Selection capture is triggered by a global hotkey (e.g. Win+Shift+G) that fires on
+    // key-down while the user is still physically holding Win+Shift. If we synthesize
+    // Ctrl+C now, the OS sees a polluted chord (Win+Shift+Ctrl+C) that does not copy, so
+    // the capture silently fails. Wait for the modifiers to be released first.
+    wait_for_modifiers_released();
     let previous_text = read_clipboard_text().ok().flatten();
     set_clipboard_text("").context("failed to clear clipboard before selection capture")?;
     send_ctrl_c().context("failed to send Ctrl+C")?;
@@ -67,17 +75,10 @@ pub fn paste_text(text: &str) -> Result<()> {
         return Ok(());
     }
 
-    let previous_text = read_clipboard_text().ok().flatten();
     set_clipboard_text(text).context("failed to set clipboard text")?;
     logger::info(format!("Pasting text: {text}"));
     send_ctrl_v().context("failed to send Ctrl+V")?;
     thread::sleep(PASTE_SETTLE_DELAY);
-
-    if let Some(previous_text) = previous_text {
-        if let Err(err) = set_clipboard_text(&previous_text) {
-            logger::info(format!("Clipboard restore failed: {err:#}"));
-        }
-    }
 
     Ok(())
 }
@@ -190,7 +191,26 @@ fn send_ctrl_c() -> Result<()> {
     send_ctrl_key('C' as u16)
 }
 
-fn send_ctrl_v() -> Result<()> {
+/// Poll the async key state until the hotkey modifier keys (Win/Shift/Ctrl/Alt) are
+/// physically released, or a short timeout elapses. This prevents synthesized keystrokes
+/// from combining with still-held modifiers into an unintended chord.
+fn wait_for_modifiers_released() {
+    let modifiers = [VK_LWIN, VK_RWIN, VK_SHIFT, VK_CONTROL, VK_MENU];
+    let start = Instant::now();
+    loop {
+        let any_down = modifiers
+            .iter()
+            .any(|vk| unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 });
+        if !any_down {
+            return;
+        }
+        if start.elapsed() >= MODIFIER_RELEASE_TIMEOUT {
+            logger::info("Modifier keys still held after timeout; proceeding with capture");
+            return;
+        }
+        thread::sleep(MODIFIER_POLL_INTERVAL);
+    }
+}fn send_ctrl_v() -> Result<()> {
     send_ctrl_key('V' as u16)
 }
 

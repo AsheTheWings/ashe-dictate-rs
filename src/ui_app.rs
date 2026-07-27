@@ -613,6 +613,7 @@ impl UiApp {
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(tooltip.to_string()));
+        self.send_win32(Win32Command::SetFollowCursor(true));
 
         let config = self.config.clone();
         let llm_task = Task::perform(
@@ -722,6 +723,7 @@ impl UiApp {
         self.visible = false;
         self.target_position = self.position;
         self.send_win32(Win32Command::SetActive(false));
+        self.send_win32(Win32Command::SetFollowCursor(false));
         self.apply_window_state()
     }
 

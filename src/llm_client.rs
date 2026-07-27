@@ -78,7 +78,10 @@ async fn request_response(
         "reasoning": { "effort": "none" },
     });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build reqwest client")?;
     let response = client
         .post(&endpoint)
         .bearer_auth(&config.tera_api_key)

@@ -70,6 +70,7 @@ pub enum Win32Event {
 #[derive(Debug, Clone)]
 pub enum Win32Command {
     SetActive(bool),
+    SetFollowCursor(bool),
     SetTooltip(String),
     ShowMessageBox { title: String, text: String },
     OpenLog(String),
@@ -87,6 +88,7 @@ struct ServiceState {
     event_tx: Sender<Win32Event>,
     command_rx: Receiver<Win32Command>,
     active: bool,
+    follow_cursor: bool,
     cancel_hotkey_registered: bool,
     revert_sentence_hotkey_registered: bool,
     clear_transcript_hotkey_registered: bool,
@@ -146,6 +148,7 @@ unsafe fn run_message_loop(
         event_tx,
         command_rx,
         active: false,
+        follow_cursor: false,
         cancel_hotkey_registered: false,
         revert_sentence_hotkey_registered: false,
         clear_transcript_hotkey_registered: false,
@@ -242,7 +245,7 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             if let Some(state) = state {
                 drain_commands(hwnd, state);
-                if state.active {
+                if state.active || state.follow_cursor {
                     let (x, y) = active_input_position();
                     let _ = state.event_tx.send(Win32Event::PositionChanged { x, y });
                 }
@@ -322,6 +325,9 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 set_cancel_hotkey(hwnd, state, active);
                 set_transcript_edit_hotkeys(hwnd, state, active);
                 set_submit_hotkey(hwnd, state, active);
+            }
+            Win32Command::SetFollowCursor(follow) => {
+                state.follow_cursor = follow;
             }
             Win32Command::SetTooltip(tooltip) => set_tray_tooltip(hwnd, &tooltip),
             Win32Command::ShowMessageBox { title, text } => message_box(hwnd, &text, &title),
