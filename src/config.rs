@@ -9,6 +9,7 @@ const DEFAULT_JOURNAL_CAPTURE_INTERVAL: u64 = 20;
 const DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL: u64 = 120;
 const DEFAULT_JOURNAL_BLOCK_MINUTES: u64 = 10;
 const DEFAULT_JOURNAL_DEDUP_THRESHOLD: f32 = 2.0;
+const DEFAULT_JOURNAL_MAX_FRAMES_PER_CALL: usize = 100;
 const DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS: u64 = 30;
 const DEFAULT_CONTEXT_BLOCS: usize = 6;
 const DEFAULT_CONTEXT_SUMMARY_MAX_CHARS: usize = 1_500;
@@ -116,7 +117,11 @@ impl AppConfig {
             )
             .clamp(0.0, 100.0),
             journal_max_frame_gap_s: read_u64("ASHE_MAX_FRAME_GAP_S", 120),
-            journal_max_frames_per_call: read_usize("ASHE_MAX_FRAMES_PER_CALL", 40).max(1),
+            journal_max_frames_per_call: read_usize(
+                "ASHE_MAX_FRAMES_PER_CALL",
+                DEFAULT_JOURNAL_MAX_FRAMES_PER_CALL,
+            )
+            .max(1),
             journal_max_payload_mb: read_f32("ASHE_MAX_PAYLOAD_MB", 48.0).max(1.0),
             journal_idle_threshold_s: read_f32("ASHE_IDLE_THRESHOLD_S", 120.0).max(10.0) as f64,
             journal_min_active_seconds: read_u64(
