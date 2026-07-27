@@ -175,3 +175,24 @@ pub fn changed_percent(previous: &[u8], current: &[u8]) -> f32 {
         .count();
     changed as f32 * 100.0 / current.len() as f32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::changed_percent;
+
+    #[test]
+    fn change_is_reported_in_percentage_points() {
+        let previous = vec![0; 100];
+        let mut current = previous.clone();
+        current[0] = 9;
+        current[1] = 255;
+        current[2] = 8;
+
+        assert_eq!(changed_percent(&previous, &current), 2.0);
+    }
+
+    #[test]
+    fn missing_baseline_is_a_fully_changed_frame() {
+        assert_eq!(changed_percent(&[], &[0; 100]), 100.0);
+    }
+}

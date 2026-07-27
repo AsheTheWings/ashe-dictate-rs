@@ -132,6 +132,32 @@ struct BlockMetrics {
     idle_seconds: u64,
 }
 
+#[derive(Default)]
+struct DedupState {
+    fingerprint: Vec<u8>,
+    retained_ts: Option<i64>,
+}
+
+impl DedupState {
+    fn clear(&mut self) {
+        self.fingerprint.clear();
+        self.retained_ts = None;
+    }
+
+    fn observe(&mut self, fingerprint: Vec<u8>, ts: i64, threshold: f32, max_gap_s: u64) -> f32 {
+        let first = self.fingerprint.is_empty();
+        let delta = screen_capture::changed_percent(&self.fingerprint, &fingerprint);
+        let gap_elapsed = self
+            .retained_ts
+            .is_some_and(|previous| ts - previous >= max_gap_s as i64);
+        if first || delta >= threshold || gap_elapsed {
+            self.fingerprint = fingerprint;
+            self.retained_ts = Some(ts);
+        }
+        delta
+    }
+}
+
 impl Block {
     fn new(start: i64, seconds: i64) -> Self {
         Self {
@@ -172,8 +198,9 @@ fn run(
     let mut running = config.journal_enabled;
     let block_seconds = (config.journal_block_minutes * 60) as i64;
     let mut block: Option<Block> = None;
-    let mut previous_fingerprint = Vec::new();
+    let mut dedup_state = DedupState::default();
     let mut next_capture = now();
+    let mut was_inactive = false;
 
     if running && config.tera_api_key.trim().is_empty() {
         running = false;
@@ -187,9 +214,13 @@ fn run(
     if running {
         block = recover_pending(&config, block_seconds, status)?;
         logger::info(format!(
-            "Activity journal started: capture={}s block={}m artifacts={}",
+            "Activity journal started: capture={}s idle_capture={}s block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
             config.journal_capture_interval,
+            config.journal_idle_capture_interval,
             config.journal_block_minutes,
+            config.journal_dedup_threshold,
+            config.journal_idle_threshold_s,
+            config.journal_min_active_seconds,
             config.journal_artifacts_dir.display()
         ));
     }
@@ -208,6 +239,7 @@ fn run(
                     if let Some(current) = block.as_ref() {
                         save_pending(&config.journal_artifacts_dir, current)?;
                     }
+                    dedup_state.clear();
                     running = false;
                     set_status(status, false, "activity journal paused".to_string(), 0);
                 } else if config.tera_api_key.trim().is_empty() {
@@ -220,7 +252,9 @@ fn run(
                 } else {
                     running = true;
                     block = recover_pending(&config, block_seconds, status)?;
+                    dedup_state.clear();
                     next_capture = now();
+                    was_inactive = false;
                     set_status(status, true, "activity journal resumed".to_string(), 0);
                 }
                 continue;
@@ -240,16 +274,34 @@ fn run(
         {
             let finished = block.take().expect("checked above");
             describe_and_store(&config, finished, status);
-            previous_fingerprint.clear();
+            dedup_state.clear();
         }
         let current = block.get_or_insert_with(|| Block::new(boundary, block_seconds));
         let sample = activity::sample(stamp);
         current.samples.push(sample.clone());
 
-        if stamp >= next_capture {
+        let inactive = sample.locked || sample.idle_s >= config.journal_idle_threshold_s;
+        if was_inactive && !inactive {
+            // Do not make the user wait for a stale idle/locked schedule after input resumes.
+            next_capture = stamp;
+        }
+        was_inactive = inactive;
+
+        let Some(capture_interval) = capture_interval_for_sample(
+            &sample,
+            config.journal_idle_threshold_s,
+            config.journal_capture_interval,
+            config.journal_idle_capture_interval,
+        ) else {
+            // Sampling continues for accurate coverage, but locked desktops are never captured.
             next_capture = stamp + config.journal_capture_interval as i64;
+            continue;
+        };
+
+        if stamp >= next_capture {
+            next_capture = stamp + capture_interval as i64;
             if !denied(&config, &sample) {
-                match capture(&config, current, &mut previous_fingerprint, &sample) {
+                match capture(&config, current, &mut dedup_state, &sample) {
                     Ok(()) => {
                         save_pending(&config.journal_artifacts_dir, current)?;
                         set_status(
@@ -278,19 +330,24 @@ fn run(
 fn capture(
     config: &AppConfig,
     block: &mut Block,
-    previous_fingerprint: &mut Vec<u8>,
+    dedup_state: &mut DedupState,
     sample: &ActivitySample,
 ) -> Result<()> {
     let frame = screen_capture::capture_screen(config.journal_monitor == 0)?;
-    let delta = screen_capture::changed_percent(previous_fingerprint, &frame.fingerprint);
-    *previous_fingerprint = frame.fingerprint;
+    let stamp = now();
+    let delta = dedup_state.observe(
+        frame.fingerprint,
+        stamp,
+        config.journal_dedup_threshold,
+        config.journal_max_frame_gap_s,
+    );
     let directory = day_dir(&config.journal_artifacts_dir, &block.day).join("frames");
     fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{}_m{}.webp", clock(now(), "%H%M%S"), 1));
+    let path = directory.join(format!("{}_m{}.webp", clock(stamp, "%H%M%S"), 1));
     fs::write(&path, frame.webp).context("failed to save journal frame")?;
     block.frames.push(FrameRecord {
         path: path.display().to_string(),
-        ts: now(),
+        ts: stamp,
         monitor: config.journal_monitor,
         width: frame.width,
         height: frame.height,
@@ -313,6 +370,29 @@ fn denied(config: &AppConfig, sample: &ActivitySample) -> bool {
         .any(|term| text.contains(term))
 }
 
+fn capture_interval_for_sample(
+    sample: &ActivitySample,
+    idle_threshold_s: f64,
+    active_interval_s: u64,
+    idle_interval_s: u64,
+) -> Option<u64> {
+    if sample.locked {
+        None
+    } else if sample.idle_s >= idle_threshold_s {
+        Some(idle_interval_s)
+    } else {
+        Some(active_interval_s)
+    }
+}
+
+fn should_suppress_description(
+    active_seconds: u64,
+    distinct_frames: usize,
+    min_active_seconds: u64,
+) -> bool {
+    active_seconds < min_active_seconds && distinct_frames <= 1
+}
+
 fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<JournalStatus>>) {
     let metrics = block_metrics(config, &block);
     if block.frames.is_empty() {
@@ -326,19 +406,16 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
         let _ = clear_pending(&config.journal_artifacts_dir, &block);
         return;
     }
-    let active_samples = block
-        .samples
+    let distinct_frames = block
+        .frames
         .iter()
-        .filter(|sample| !sample.locked && sample.idle_s < config.journal_idle_threshold_s)
+        .filter(|frame| frame.delta >= config.journal_dedup_threshold)
         .count();
-    if active_samples <= 1
-        && block
-            .frames
-            .iter()
-            .filter(|frame| frame.delta >= config.journal_dedup_threshold)
-            .count()
-            <= 1
-    {
+    if should_suppress_description(
+        metrics.active_seconds,
+        distinct_frames,
+        config.journal_min_active_seconds,
+    ) {
         let outcome = terminal_outcome(&block);
         let reason = if outcome == "locked" {
             "workstation locked"
@@ -963,4 +1040,64 @@ fn clock(ts: i64, format: &str) -> String {
         .single()
         .map(|stamp| stamp.format(format).to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActivitySample, DedupState, capture_interval_for_sample, should_suppress_description,
+    };
+
+    #[test]
+    fn capture_stops_while_locked_and_slows_while_idle() {
+        let mut sample = ActivitySample::default();
+        assert_eq!(
+            capture_interval_for_sample(&sample, 120.0, 20, 120),
+            Some(20)
+        );
+
+        sample.idle_s = 120.0;
+        assert_eq!(
+            capture_interval_for_sample(&sample, 120.0, 20, 120),
+            Some(120)
+        );
+
+        sample.locked = true;
+        assert_eq!(capture_interval_for_sample(&sample, 120.0, 20, 120), None);
+    }
+
+    #[test]
+    fn description_is_suppressed_only_for_low_activity_and_static_visuals() {
+        assert!(should_suppress_description(29, 1, 30));
+        assert!(!should_suppress_description(30, 1, 30));
+        assert!(!should_suppress_description(0, 2, 30));
+        assert!(!should_suppress_description(0, 1, 0));
+    }
+
+    #[test]
+    fn dedup_compares_against_the_last_retained_fingerprint() {
+        let mut state = DedupState::default();
+        assert_eq!(state.observe(vec![0; 100], 0, 0.5, 120), 100.0);
+
+        let mut gradual = vec![0; 100];
+        gradual[0] = 5;
+        assert_eq!(state.observe(gradual, 20, 0.5, 120), 0.0);
+
+        let mut accumulated = vec![0; 100];
+        accumulated[0] = 10;
+        assert_eq!(state.observe(accumulated, 40, 0.5, 120), 1.0);
+        assert_eq!(state.retained_ts, Some(40));
+    }
+
+    #[test]
+    fn maximum_gap_advances_the_visual_baseline() {
+        let mut state = DedupState::default();
+        state.observe(vec![0; 100], 0, 2.0, 120);
+
+        let mut low_delta = vec![0; 100];
+        low_delta[0] = 10;
+        assert_eq!(state.observe(low_delta.clone(), 120, 2.0, 120), 1.0);
+        assert_eq!(state.retained_ts, Some(120));
+        assert_eq!(state.observe(low_delta, 140, 2.0, 120), 0.0);
+    }
 }

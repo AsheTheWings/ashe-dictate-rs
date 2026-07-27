@@ -61,14 +61,15 @@ ASHE_LLM_TEMPERATURE=0.2
 ASHE_JOURNAL_ENABLED=true
 ASHE_ARTIFACTS_DIR=C:\path\to\artifacts
 ASHE_CAPTURE_INTERVAL=20
+ASHE_IDLE_CAPTURE_INTERVAL=120
 ASHE_TELEMETRY_INTERVAL=2
 ASHE_BLOCK_MINUTES=10
 ASHE_MONITOR=1
-ASHE_DEDUP_THRESHOLD=0.02
 ASHE_MAX_FRAME_GAP_S=120
 ASHE_MAX_FRAMES_PER_CALL=40
 ASHE_MAX_PAYLOAD_MB=48
 ASHE_IDLE_THRESHOLD_S=120
+ASHE_MIN_ACTIVE_SECONDS=30
 ASHE_DENYLIST=1Password;Bitwarden;Private browsing
 ASHE_FRAME_RETENTION_MINUTES=30
 ASHE_CONTEXT_SUMMARY_HOURS=4
@@ -81,6 +82,12 @@ ASHE_DAILY_REPORT_GRACE_MINUTES=15
 `DEEPGRAM_KEYTERMS` is comma-separated; `ASHE_DENYLIST` is semicolon-separated. The
 journal also accepts `ASHE_API_KEY`, `ASHE_BASE_URL`, and `ASHE_MODEL` as aliases for the
 Tera settings. API keys are never written to the log.
+
+After `ASHE_IDLE_THRESHOLD_S` without keyboard or mouse input, capture slows to
+`ASHE_IDLE_CAPTURE_INTERVAL`. Capture stops while the workstation is locked and resumes
+immediately after unlock. A block is stored without an LLM description only when it has
+less than `ASHE_MIN_ACTIVE_SECONDS` of input activity and no visual change beyond the
+first frame.
 
 The journal context is a non-overlapping chronological sequence. Successful reports
 older than `ASHE_CONTEXT_SUMMARY_HOURS` are folded into the rolling summary. From the

@@ -6,7 +6,10 @@ const DEFAULT_TERA_API_BASE: &str = "https://tera.asheservices.online/v1";
 const DEFAULT_TERA_MODEL: &str = "cloudcode/chat-gemini-3-flash-paid-tier";
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
 const DEFAULT_JOURNAL_CAPTURE_INTERVAL: u64 = 20;
+const DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL: u64 = 120;
 const DEFAULT_JOURNAL_BLOCK_MINUTES: u64 = 10;
+const DEFAULT_JOURNAL_DEDUP_THRESHOLD: f32 = 2.0;
+const DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS: u64 = 30;
 const DEFAULT_CONTEXT_SUMMARY_HOURS: f32 = 4.0;
 const DEFAULT_CONTEXT_BLOCS: usize = 6;
 const DEFAULT_CONTEXT_SUMMARY_MAX_CHARS: usize = 1_500;
@@ -27,6 +30,7 @@ pub struct AppConfig {
     pub journal_enabled: bool,
     pub journal_artifacts_dir: PathBuf,
     pub journal_capture_interval: u64,
+    pub journal_idle_capture_interval: u64,
     pub journal_telemetry_interval_ms: u64,
     pub journal_block_minutes: u64,
     pub journal_monitor: i32,
@@ -35,6 +39,7 @@ pub struct AppConfig {
     pub journal_max_frames_per_call: usize,
     pub journal_max_payload_mb: f32,
     pub journal_idle_threshold_s: f64,
+    pub journal_min_active_seconds: u64,
     pub journal_denylist: Vec<String>,
     pub journal_frame_retention_minutes: u64,
     pub journal_context_summary_hours: f64,
@@ -54,6 +59,8 @@ impl AppConfig {
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_artifacts_dir);
+        let journal_capture_interval =
+            read_u64("ASHE_CAPTURE_INTERVAL", DEFAULT_JOURNAL_CAPTURE_INTERVAL).max(1);
 
         Self {
             deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").unwrap_or_default(),
@@ -84,21 +91,30 @@ impl AppConfig {
                 .filter(|value| !value.is_empty()),
             journal_enabled: read_bool("ASHE_JOURNAL_ENABLED", true),
             journal_artifacts_dir,
-            journal_capture_interval: read_u64(
-                "ASHE_CAPTURE_INTERVAL",
-                DEFAULT_JOURNAL_CAPTURE_INTERVAL,
+            journal_capture_interval,
+            journal_idle_capture_interval: read_u64(
+                "ASHE_IDLE_CAPTURE_INTERVAL",
+                DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL,
             )
-            .max(1),
+            .max(journal_capture_interval),
             journal_telemetry_interval_ms: (read_f32("ASHE_TELEMETRY_INTERVAL", 2.0).max(0.5)
                 * 1000.0) as u64,
             journal_block_minutes: read_u64("ASHE_BLOCK_MINUTES", DEFAULT_JOURNAL_BLOCK_MINUTES)
                 .max(1),
             journal_monitor: read_i32("ASHE_MONITOR", 1),
-            journal_dedup_threshold: read_f32("ASHE_DEDUP_THRESHOLD", 0.02).max(0.0),
+            journal_dedup_threshold: read_f32(
+                "ASHE_DEDUP_THRESHOLD",
+                DEFAULT_JOURNAL_DEDUP_THRESHOLD,
+            )
+            .clamp(0.0, 100.0),
             journal_max_frame_gap_s: read_u64("ASHE_MAX_FRAME_GAP_S", 120),
             journal_max_frames_per_call: read_usize("ASHE_MAX_FRAMES_PER_CALL", 40).max(1),
             journal_max_payload_mb: read_f32("ASHE_MAX_PAYLOAD_MB", 48.0).max(1.0),
             journal_idle_threshold_s: read_f32("ASHE_IDLE_THRESHOLD_S", 120.0).max(10.0) as f64,
+            journal_min_active_seconds: read_u64(
+                "ASHE_MIN_ACTIVE_SECONDS",
+                DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS,
+            ),
             journal_denylist: read_list("ASHE_DENYLIST"),
             journal_frame_retention_minutes: read_u64("ASHE_FRAME_RETENTION_MINUTES", 30),
             journal_context_summary_hours: read_f32(
