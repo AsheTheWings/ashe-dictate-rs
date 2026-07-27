@@ -53,11 +53,12 @@ pub async fn describe_activity_block(
             )
         }));
     }
-    let body = json!({
+    let mut body = json!({
         "model": config.tera_model,
         "instructions": ACTIVITY_PROMPT,
         "input": [{ "role": "user", "content": content }]
     });
+    apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -92,7 +93,7 @@ pub async fn refresh_activity_summary(
     max_chars: usize,
 ) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "model": config.tera_model,
         "instructions": format!("{SUMMARY_PROMPT}\n\nThe complete result must contain at most {max_chars} Unicode characters."),
         "input": [{
@@ -107,6 +108,7 @@ pub async fn refresh_activity_summary(
             }]
         }]
     });
+    apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -150,7 +152,7 @@ pub async fn generate_daily_activity_report(
     complete_reports: String,
 ) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "model": config.tera_model,
         "instructions": DAILY_REPORT_PROMPT,
         "input": [{
@@ -163,6 +165,7 @@ pub async fn generate_daily_activity_report(
             }]
         }]
     });
+    apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -241,14 +244,14 @@ pub async fn answer_question(config: AppConfig, question: String) -> Result<Stri
 
 /// Shared Open Responses (`/v1/responses`) call: sends a single `role: "user"` message
 /// (prompt + tag-wrapped target text) and reads the assistant `output_text` back out.
-/// Reasoning is disabled for low-latency text actions.
+/// The optional reasoning effort is forwarded when configured.
 async fn request_response(
     config: &AppConfig,
     user_content: String,
     temperature: f32,
 ) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "model": config.tera_model,
         "input": [
             {
@@ -259,8 +262,8 @@ async fn request_response(
         ],
         "stream": false,
         "temperature": temperature,
-        "reasoning": { "effort": "none" },
     });
+    apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -295,6 +298,15 @@ async fn request_response(
         return Err(anyhow!("tera returned an empty response"));
     }
     Ok(text.to_string())
+}
+
+fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>) {
+    let Some(effort) = effort else {
+        return;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert("reasoning".to_string(), json!({ "effort": effort }));
+    }
 }
 
 /// Collect the assistant-visible text from a Responses `output` array. Reasoning items
@@ -353,4 +365,27 @@ fn polish_prompt(transcript: &str, context: Option<&str>) -> String {
 /// the model's attention on what to operate on.
 fn tagged(tag: &str, body: &str) -> String {
     format!("<{tag}>\n{body}\n</{tag}>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_reasoning_effort;
+    use serde_json::json;
+
+    #[test]
+    fn reasoning_is_omitted_by_default() {
+        let mut body = json!({ "model": "example" });
+        apply_reasoning_effort(&mut body, None);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn arbitrary_reasoning_effort_is_forwarded_unchanged() {
+        let mut body = json!({ "model": "example" });
+        apply_reasoning_effort(&mut body, Some("upstream-specific-value"));
+        assert_eq!(
+            body.pointer("/reasoning/effort"),
+            Some(&json!("upstream-specific-value"))
+        );
+    }
 }

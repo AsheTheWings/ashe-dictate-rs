@@ -23,6 +23,7 @@ pub struct AppConfig {
     pub tera_api_base: String,
     pub tera_model: String,
     pub llm_temperature: f32,
+    pub llm_reasoning_effort: Option<String>,
     pub journal_enabled: bool,
     pub journal_artifacts_dir: PathBuf,
     pub journal_capture_interval: u64,
@@ -78,6 +79,9 @@ impl AppConfig {
                 .or_else(|_| std::env::var("ASHE_MODEL"))
                 .unwrap_or_else(|_| DEFAULT_TERA_MODEL.to_string()),
             llm_temperature: read_f32("ASHE_LLM_TEMPERATURE", DEFAULT_LLM_TEMPERATURE),
+            llm_reasoning_effort: std::env::var("ASHE_LLM_REASONING_EFFORT")
+                .ok()
+                .filter(|value| !value.is_empty()),
             journal_enabled: read_bool("ASHE_JOURNAL_ENABLED", true),
             journal_artifacts_dir,
             journal_capture_interval: read_u64(
@@ -171,7 +175,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} journal_enabled={} journal_artifacts={} context_summary_hours={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} context_summary_hours={} context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -179,6 +183,7 @@ impl AppConfig {
             !self.deepgram_api_key.trim().is_empty(),
             self.tera_model,
             !self.tera_api_key.trim().is_empty(),
+            self.llm_reasoning_effort.is_some(),
             self.journal_enabled,
             self.journal_artifacts_dir.display(),
             self.journal_context_summary_hours,
