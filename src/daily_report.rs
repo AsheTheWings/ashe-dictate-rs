@@ -1,4 +1,5 @@
 use crate::activity;
+use crate::block_artifact::BlockArtifact;
 use crate::config::AppConfig;
 use crate::llm_client;
 use crate::logger;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAILY_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAILY_PROMPT_VERSION: &str = "ashe-worker-daily-v1";
+const DAILY_PROMPT_VERSION: &str = "ashe-worker-daily-v2";
 
 pub struct DailyReportHandle {
     tx: Option<Sender<()>>,
@@ -157,7 +158,7 @@ fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {
             .iter()
             .map(|report| {
                 format!(
-                    "<!-- BEGIN BLOCK {}: exact stored report -->\n{}\n<!-- END BLOCK {} -->",
+                    "<!-- BEGIN BLOCK {}: exact stored artifact -->\n{}\n<!-- END BLOCK {} -->",
                     report.id,
                     report.content.as_str(),
                     report.id,
@@ -193,13 +194,16 @@ fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<DailyBlock>> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Ok(Vec::new());
     };
-    let mut reports = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&path) else {
+    let paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    let mut reports = BTreeMap::new();
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+    {
+        let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
         let id = frontmatter_value(&content, "block").or_else(|| {
@@ -216,22 +220,51 @@ fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<DailyBlock>> {
                 "unknown".to_string()
             }
         });
-        reports.push(DailyBlock {
-            id,
-            outcome,
-            active_seconds: frontmatter_value(&content, "active_seconds")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
-            idle_seconds: frontmatter_value(&content, "idle_seconds")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
-            app_seconds: frontmatter_value(&content, "app_seconds_json")
-                .and_then(|value| serde_json::from_str(&value).ok())
-                .unwrap_or_default(),
-            content,
-        });
+        reports.insert(
+            id.clone(),
+            DailyBlock {
+                id,
+                outcome,
+                active_seconds: frontmatter_value(&content, "active_seconds")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                idle_seconds: frontmatter_value(&content, "idle_seconds")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                app_seconds: frontmatter_value(&content, "app_seconds_json")
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default(),
+                content,
+            },
+        );
     }
-    Ok(reports)
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+    {
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(artifact) = serde_json::from_slice::<BlockArtifact>(&bytes) else {
+            continue;
+        };
+        if !artifact.is_supported() {
+            continue;
+        }
+        let Ok(content) = serde_json::to_string_pretty(&artifact) else {
+            continue;
+        };
+        reports.insert(
+            artifact.block.clone(),
+            DailyBlock {
+                id: artifact.block,
+                outcome: artifact.outcome,
+                active_seconds: artifact.active_seconds,
+                idle_seconds: artifact.idle_seconds,
+                app_seconds: artifact.app_seconds,
+                content,
+            },
+        );
+    }
+    Ok(reports.into_values().collect())
 }
 
 fn load_pending_ids(root: &Path, day: &str) -> HashSet<String> {

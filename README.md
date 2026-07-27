@@ -104,6 +104,22 @@ gaps, then atomically writes `daily.md`. The source hash makes the operation ide
 and causes a report to be regenerated if a late block changes the day's inputs. Daily
 reports are for human consumption and are never fed back into block context.
 
+Each completed block is stored as canonical JSON containing worker-measured timing,
+application, frame, and timeline data together with the model-generated `title`, Markdown
+`report`, and structured `subjects`. Each subject has one to four ordered, broad-to-specific
+lowercase kebab-case namespaces, one factual subject statement, and an
+`estimated_duration_s`. Subjects may overlap when the user multitasks, so their estimates
+are independent and do not need to sum to measured coverage. These are generation
+instructions, not ingestion checks: parseable model output is preserved for optional later
+analysis or filtering. The provider is prompted to return the JSON object directly. One
+exact outer JSON Markdown fence is tolerated as transport formatting; arbitrary surrounding
+text is not. Output becomes a terminal `invalid_model_output` block only when it cannot be
+parsed into the required JSON fields, without semantic repair or retry.
+
+`journal.md` remains the chronological human-readable block journal and is aggregated from
+the JSON blocks' `report` fields. The rolling `summary.md` and end-of-day `daily.md` remain
+Markdown.
+
 ## Build
 
 ```powershell
@@ -149,9 +165,9 @@ artifacts/
   summary.md                   rolling compressed history (1,500 chars by default)
   pending/                    crash-safe in-progress block manifests
   YYYY-MM-DD/
-    journal.md                append-only human-readable journal
+    journal.md                chronological reports aggregated from block JSON
     daily.md                  full-day human report generated in one LLM call
-    blocks/HHMM-HHMM.md       one detailed report per completed block
+    blocks/HHMM-HHMM.json     canonical metrics, report and subjects for each completed block
     frames/*.webp             temporary lossless captures
     keyframes/*.webp          one retained image per described block
 ```

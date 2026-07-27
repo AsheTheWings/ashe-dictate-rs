@@ -1,4 +1,5 @@
 use crate::activity::{self, ActivitySample};
+use crate::block_artifact::{ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact};
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
 use crate::llm_client;
@@ -10,7 +11,6 @@ use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -472,12 +472,20 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
         .and_then(|runtime| {
             runtime.block_on(async {
                 let earlier_context = build_earlier_context(config, block.start).await?;
+                let nominal_duration_s = (block.end - block.start).max(1) as u64;
+                let duration_budget_s = metrics
+                    .active_seconds
+                    .saturating_add(metrics.idle_seconds)
+                    .clamp(1, nominal_duration_s);
                 let context = format!(
-                    "## Block {} on {}\nCaptured {} screenshots every {} seconds. {} visually distinct images are attached in chronological order.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nWrite the report for this block only.",
+                    "## Block {} on {}\nThis block spans {} seconds with {} seconds of measured coverage. Captured {} screenshots on an adaptive cadence: every {} seconds during input activity and every {} seconds after the idle threshold. {} visually distinct images are attached in chronological order.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nWrite the report for this block only.",
                     block.label(),
                     block.day,
+                    nominal_duration_s,
+                    duration_budget_s,
                     block.captured,
                     config.journal_capture_interval,
+                    config.journal_idle_capture_interval,
                     images.len(),
                     if metrics.totals.is_empty() { "unavailable" } else { &metrics.totals },
                     metrics.timeline
@@ -487,17 +495,51 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
                         .join("\n"),
                     earlier_context,
                 );
-                llm_client::describe_activity_block(config.clone(), context, images).await
+                llm_client::describe_activity_block(
+                    config.clone(),
+                    context,
+                    images,
+                    duration_budget_s,
+                )
+                .await
             })
         });
     match result {
-        Ok((title, body)) => {
-            if let Err(error) = write_report(config, &block, &title, &body, &metrics) {
+        Ok(narrative) => {
+            let title = narrative.title.clone();
+            if let Err(error) = write_report(config, &block, &narrative, &metrics) {
                 logger::info(format!("Writing journal block failed: {error:#}"));
                 return;
             }
             let _ = clear_pending(&config.journal_artifacts_dir, &block);
             set_status(status, true, format!("journaled: {title}"), 0);
+        }
+        Err(error)
+            if error
+                .downcast_ref::<llm_client::InvalidActivityOutput>()
+                .is_some() =>
+        {
+            let reason = error.to_string();
+            if let Err(write_error) =
+                write_terminal_block(config, &block, "invalid_model_output", &reason, &metrics)
+            {
+                logger::info(format!(
+                    "Writing invalid-output block {} failed: {write_error:#}",
+                    block.id()
+                ));
+                return;
+            }
+            let _ = clear_pending(&config.journal_artifacts_dir, &block);
+            logger::info(format!(
+                "Description of {} produced invalid structured output: {reason}",
+                block.id()
+            ));
+            set_status(
+                status,
+                true,
+                "journal block had invalid model output".to_string(),
+                0,
+            );
         }
         Err(error) => {
             block.attempts += 1;
@@ -581,9 +623,13 @@ fn recover_pending(
         };
         if block.start == boundary {
             current = Some(block);
-        } else if !report_path(&config.journal_artifacts_dir, &block).is_file() {
+        } else if !report_path(&config.journal_artifacts_dir, &block).is_file()
+            && !legacy_report_path(&config.journal_artifacts_dir, &block).is_file()
+        {
             describe_and_store(config, block, status);
         } else {
+            let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+            rebuild_journal(&directory)?;
             let _ = fs::remove_file(path);
         }
     }
@@ -605,6 +651,12 @@ fn pending_path(root: &Path, block: &Block) -> PathBuf {
 }
 
 fn report_path(root: &Path, block: &Block) -> PathBuf {
+    day_dir(root, &block.day)
+        .join("blocks")
+        .join(format!("{}.json", block.slug()))
+}
+
+fn legacy_report_path(root: &Path, block: &Block) -> PathBuf {
     day_dir(root, &block.day)
         .join("blocks")
         .join(format!("{}.md", block.slug()))
@@ -644,8 +696,7 @@ fn clear_pending(root: &Path, block: &Block) -> Result<()> {
 fn write_report(
     config: &AppConfig,
     block: &Block,
-    title: &str,
-    body: &str,
+    narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
 ) -> Result<()> {
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
@@ -673,52 +724,109 @@ fn write_report(
     } else {
         String::new()
     };
-    let report = format!(
-        "---\nblock: {}\nwindow: {} - {}\noutcome: described\nactive_seconds: {}\nidle_seconds: {}\nframes_captured: {}\nframes_sent: {}\napps: {}\napp_seconds_json: {}\nkeyframe: {}\nmodel: {}\n---\n\n# {} — {}\n\n{}\n\n## Measured timeline\n\n{}{}\n",
-        block.id(),
-        clock(block.start, "%H:%M:%S"),
-        clock(block.end, "%H:%M:%S"),
-        metrics.active_seconds,
-        metrics.idle_seconds,
-        block.captured,
-        block.frames.iter().filter(|frame| frame.sent).count(),
-        metrics.totals,
-        serde_json::to_string(&metrics.app_seconds)?,
-        if keyframe_relative.is_empty() {
-            "-"
-        } else {
-            &keyframe_relative
-        },
-        config.tera_model,
-        block.label(),
-        title,
-        body.trim(),
-        metrics
-            .timeline
-            .iter()
-            .map(|line| format!("- {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        if keyframe_relative.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n![keyframe](../{keyframe_relative})")
-        },
-    );
-    fs::write(report_path(&config.journal_artifacts_dir, block), report)?;
-    let journal_path = directory.join("journal.md");
-    let mut journal = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(journal_path)?;
-    writeln!(
-        journal,
-        "## {} — {}\n\n{}\n",
-        block.label(),
-        title,
-        body.trim()
+    let artifact = BlockArtifact {
+        schema_version: BLOCK_SCHEMA_VERSION,
+        block: block.id(),
+        window_start: block.start,
+        window_end: block.end,
+        outcome: "described".to_string(),
+        active_seconds: metrics.active_seconds,
+        idle_seconds: metrics.idle_seconds,
+        app_seconds: metrics.app_seconds.clone(),
+        timeline: metrics.timeline.clone(),
+        frames_captured: block.captured,
+        frames_sent: block.frames.iter().filter(|frame| frame.sent).count(),
+        keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
+        model: Some(config.tera_model.clone()),
+        title: Some(narrative.title.clone()),
+        report: Some(narrative.report.clone()),
+        subjects: narrative.subjects.clone(),
+        reason: None,
+        error: None,
+    };
+    write_block_artifact(
+        &report_path(&config.journal_artifacts_dir, block),
+        &artifact,
     )?;
+    rebuild_journal(&directory)?;
     Ok(())
+}
+
+fn rebuild_journal(directory: &Path) -> Result<()> {
+    let mut entries = BTreeMap::new();
+    let paths = fs::read_dir(directory.join("blocks"))?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+    {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some((id, entry)) = legacy_journal_entry(&content) {
+            entries.insert(id, entry);
+        }
+    }
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+    {
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(artifact) = serde_json::from_slice::<BlockArtifact>(&bytes) else {
+            continue;
+        };
+        if let Some((id, entry)) = json_journal_entry(&artifact) {
+            entries.insert(id, entry);
+        }
+    }
+    let path = directory.join("journal.md");
+    let temporary = path.with_extension("md.tmp");
+    let content = entries.into_values().collect::<Vec<_>>().join("\n");
+    fs::write(&temporary, content)?;
+    replace_file(&temporary, &path)
+}
+
+fn json_journal_entry(artifact: &BlockArtifact) -> Option<(String, String)> {
+    if !artifact.is_supported() || artifact.outcome != "described" {
+        return None;
+    }
+    let (Some(title), Some(report)) = (&artifact.title, &artifact.report) else {
+        return None;
+    };
+    Some((
+        artifact.block.clone(),
+        format!(
+            "## {}-{} — {}\n\n{}\n",
+            clock(artifact.window_start, "%H:%M"),
+            clock(artifact.window_end, "%H:%M"),
+            title,
+            report.trim(),
+        ),
+    ))
+}
+
+fn legacy_journal_entry(content: &str) -> Option<(String, String)> {
+    if !content.lines().any(|line| line.starts_with("model: ")) {
+        return None;
+    }
+    let id = content
+        .lines()
+        .find_map(|line| line.strip_prefix("block: "))?
+        .trim();
+    let (_, markdown) = content.split_once("\n---\n\n")?;
+    let (heading, remainder) = markdown.split_once("\n\n")?;
+    let heading = heading.strip_prefix("# ")?.trim();
+    let report = remainder
+        .split_once("\n\n## Measured timeline")
+        .map(|(report, _)| report)
+        .unwrap_or(remainder)
+        .trim();
+    if id.is_empty() || heading.is_empty() || report.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), format!("## {heading}\n\n{report}\n")))
 }
 
 fn write_terminal_block(
@@ -731,29 +839,34 @@ fn write_terminal_block(
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
     fs::create_dir_all(directory.join("blocks"))?;
     let path = report_path(&config.journal_artifacts_dir, block);
-    fs::write(
-        path,
-        format!(
-            "---\nblock: {}\nwindow: {} - {}\noutcome: {}\nactive_seconds: {}\nidle_seconds: {}\napps: {}\napp_seconds_json: {}\n---\n\n# {} — {}\n\nNo block-description LLM report is available for this interval.\n\n## Measured timeline\n\n{}\n",
-            block.id(),
-            clock(block.start, "%H:%M:%S"),
-            clock(block.end, "%H:%M:%S"),
-            outcome,
-            metrics.active_seconds,
-            metrics.idle_seconds,
-            metrics.totals,
-            serde_json::to_string(&metrics.app_seconds)?,
-            block.label(),
-            reason,
-            metrics
-                .timeline
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-    )?;
-    Ok(())
+    let artifact = BlockArtifact {
+        schema_version: BLOCK_SCHEMA_VERSION,
+        block: block.id(),
+        window_start: block.start,
+        window_end: block.end,
+        outcome: outcome.to_string(),
+        active_seconds: metrics.active_seconds,
+        idle_seconds: metrics.idle_seconds,
+        app_seconds: metrics.app_seconds.clone(),
+        timeline: metrics.timeline.clone(),
+        frames_captured: block.captured,
+        frames_sent: block.frames.iter().filter(|frame| frame.sent).count(),
+        keyframe: None,
+        model: None,
+        title: None,
+        report: None,
+        subjects: Vec::new(),
+        reason: Some(reason.to_string()),
+        error: (outcome == "invalid_model_output").then_some(reason.to_string()),
+    };
+    write_block_artifact(&path, &artifact)?;
+    rebuild_journal(&directory)
+}
+
+fn write_block_artifact(path: &Path, artifact: &BlockArtifact) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
+    replace_file(&temporary, path)
 }
 
 fn block_metrics(config: &AppConfig, block: &Block) -> BlockMetrics {
@@ -859,7 +972,7 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
 }
 
 fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>> {
-    let mut reports = Vec::new();
+    let mut reports = BTreeMap::new();
     for day in fs::read_dir(root)? {
         let day = day?;
         if !day.path().is_dir() {
@@ -869,12 +982,15 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
         let Ok(entries) = fs::read_dir(blocks) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("md") {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(&path) else {
+        let paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        for path in paths
+            .iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+        {
+            let Ok(content) = fs::read_to_string(path) else {
                 continue;
             };
             if !content.starts_with("---\n")
@@ -894,16 +1010,46 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
                 continue;
             };
             if start < before {
-                reports.push(StoredReport {
-                    id: id.to_string(),
-                    start,
-                    content,
-                });
+                reports.insert(
+                    id.to_string(),
+                    StoredReport {
+                        id: id.to_string(),
+                        start,
+                        content,
+                    },
+                );
+            }
+        }
+        for path in paths
+            .iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            let Ok(bytes) = fs::read(path) else { continue };
+            let Ok(artifact) = serde_json::from_slice::<BlockArtifact>(&bytes) else {
+                continue;
+            };
+            if !artifact.is_supported()
+                || artifact.outcome != "described"
+                || artifact.report.is_none()
+            {
+                continue;
+            }
+            let Some(start) = block_timestamp(&artifact.block) else {
+                continue;
+            };
+            if start < before {
+                reports.insert(
+                    artifact.block.clone(),
+                    StoredReport {
+                        id: artifact.block.clone(),
+                        start,
+                        content: artifact.context_markdown(),
+                    },
+                );
             }
         }
     }
-    reports.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(reports)
+    Ok(reports.into_values().collect())
 }
 
 fn block_timestamp(id: &str) -> Option<i64> {
@@ -1045,8 +1191,43 @@ fn clock(ts: i64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivitySample, DedupState, capture_interval_for_sample, should_suppress_description,
+        ActivitySample, BlockArtifact, DedupState, capture_interval_for_sample, json_journal_entry,
+        should_suppress_description,
     };
+    use crate::block_artifact::{ActivitySubject, BLOCK_SCHEMA_VERSION};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn journal_entry_is_aggregated_from_the_report_field() {
+        let artifact = BlockArtifact {
+            schema_version: BLOCK_SCHEMA_VERSION,
+            block: "1970-01-01T0000".to_string(),
+            window_start: 0,
+            window_end: 600,
+            outcome: "described".to_string(),
+            active_seconds: 600,
+            idle_seconds: 0,
+            app_seconds: BTreeMap::new(),
+            timeline: Vec::new(),
+            frames_captured: 1,
+            frames_sent: 1,
+            keyframe: None,
+            model: Some("model".to_string()),
+            title: Some("Title".to_string()),
+            report: Some("Report content only.".to_string()),
+            subjects: vec![ActivitySubject {
+                namespaces: vec!["work".to_string()],
+                subject: "Structured subject must not be rendered.".to_string(),
+                estimated_duration_s: 600,
+            }],
+            reason: None,
+            error: None,
+        };
+
+        let (_, entry) = json_journal_entry(&artifact).unwrap();
+        assert!(entry.contains("Report content only."));
+        assert!(!entry.contains("Structured subject must not be rendered."));
+    }
 
     #[test]
     fn capture_stops_while_locked_and_slows_while_idle() {

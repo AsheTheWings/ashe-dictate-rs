@@ -1,3 +1,4 @@
+use crate::block_artifact::ActivityNarrative;
 use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -32,7 +33,7 @@ const GRAMMAR_PROMPT: &str = "Fix grammar, spelling, punctuation, and casing in 
 const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's question directly and concisely. Do not restate the question. Reply in the same language as the question. Return only the answer.";
 const QUESTION_TEMPERATURE: f32 = 0.7;
 
-const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity journal keeper. Write a factual account of what the user did during this time block, whether work, reading, entertainment, messaging, shopping, games, or personal admin. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level. Output a short plain-text title on the first line in the form 'Area: what happened', then a blank line, then 120-250 words of concise Markdown prose.";
+const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity journal keeper. Produce a factual account of what the user did during this time block, whether work, reading, entertainment, messaging, shopping, games, or personal admin. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
 const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity. Merge the previous summary with the newly aged block reports. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The supplied aged reports are the only new material. Do not infer later activity. Return Markdown prose only, without a title or preamble.";
 const DAILY_REPORT_PROMPT: &str = "Write a human-readable end-of-day activity report from the complete block reports and measured coverage supplied by Ashe Worker. Use every relevant thread in proportion to its documented time, whether work, entertainment, browsing, communication, errands, or inactivity. Measured totals and coverage are ground truth: never invent activity inside missing intervals or infer durations from prose. Preserve concrete names and progression. Do not mention screenshots, telemetry, prompts, or being an observer. Do not score productivity or moralize. Protect credentials, financial values, medical details, and intimate conversation contents. Return Markdown with exactly these H2 sections: What happened, Loose ends, Time, and Coverage. Begin with a two-sentence overview before the first section. Omit no section; write 'No known loose ends' or 'Complete coverage' where appropriate. Do not add a top-level title.";
 
@@ -40,7 +41,8 @@ pub async fn describe_activity_block(
     config: AppConfig,
     context: String,
     frames: Vec<(String, Vec<u8>)>,
-) -> Result<(String, String)> {
+    duration_budget_s: u64,
+) -> Result<ActivityNarrative> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let mut content = vec![json!({ "type": "input_text", "text": context })];
     for (label, bytes) in frames {
@@ -53,9 +55,12 @@ pub async fn describe_activity_block(
             )
         }));
     }
+    let instructions = format!(
+        "{ACTIVITY_PROMPT}\n\nReturn exactly one JSON object and nothing else: no Markdown fence, preamble, or trailing commentary. The object must contain exactly title, report, and subjects. title is a short plain-text string in the form 'Area: what happened'. report is 120-250 words of concise Markdown prose. subjects is an array of 1-8 sustained, meaningfully distinct activity subjects; do not split incidental actions into separate entries. Each subject object must contain exactly namespaces, subject, and estimated_duration_s. namespaces is an ordered array of 1-4 unique lowercase kebab-case strings, broadest to most specific: begin with the broad activity domain, then narrow through discipline or context, project/product/topic, and component only when supported by evidence. Do not invent specificity. Put actions and outcomes in subject, not namespaces, and use consistent namespace spelling within the response. subject is one self-contained factual statement. estimated_duration_s is a positive integer estimating time spent on that subject and should remain within the {duration_budget_s} seconds of measured coverage. Judge each subject independently: subjects may overlap when the user multitasks, so their estimated durations do not need to sum to the coverage duration. Uncertain, idle, or unclassified time may remain unallocated; passive activity may receive time even without keyboard or mouse input. Use the measured timeline and visible progression rather than dividing time evenly."
+    );
     let mut body = json!({
         "model": config.tera_model,
-        "instructions": ACTIVITY_PROMPT,
+        "instructions": instructions,
         "input": [{ "role": "user", "content": content }]
     });
     apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
@@ -83,7 +88,8 @@ pub async fn describe_activity_block(
             .unwrap_or("unknown error");
         return Err(anyhow!("activity description failed ({status}): {message}"));
     }
-    split_activity_report(&extract_output_text(&payload))
+    ActivityNarrative::parse(&extract_output_text(&payload))
+        .map_err(|message| anyhow::Error::new(InvalidActivityOutput(message)))
 }
 
 pub async fn refresh_activity_summary(
@@ -197,26 +203,16 @@ pub async fn generate_daily_activity_report(
     Ok(report.trim().to_string())
 }
 
-fn split_activity_report(text: &str) -> Result<(String, String)> {
-    let mut lines = text.trim().lines();
-    let title = lines
-        .find(|line| !line.trim().is_empty())
-        .map(|line| {
-            line.trim()
-                .trim_start_matches('#')
-                .trim()
-                .trim_matches(['*', '"'])
-        })
-        .unwrap_or("Activity")
-        .chars()
-        .take(120)
-        .collect::<String>();
-    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-    if title.is_empty() || body.is_empty() {
-        return Err(anyhow!("activity description was empty or malformed"));
+#[derive(Debug)]
+pub struct InvalidActivityOutput(pub String);
+
+impl std::fmt::Display for InvalidActivityOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid structured activity output: {}", self.0)
     }
-    Ok((title, body))
 }
+
+impl std::error::Error for InvalidActivityOutput {}
 
 /// Correct grammar/spelling/punctuation in selected text and return only the rewrite.
 ///
