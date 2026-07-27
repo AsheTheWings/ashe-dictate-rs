@@ -1,19 +1,19 @@
-use crate::activity;
-use crate::block_artifact::BlockArtifact;
+use crate::block_artifact::{BlockArtifact, BlockDocumentInput};
 use crate::config::AppConfig;
 use crate::llm_client;
 use crate::logger;
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate, TimeZone};
 use crossbeam_channel::{Receiver, Sender};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAILY_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAILY_PROMPT_VERSION: &str = "ashe-worker-daily-v2";
+const DAILY_PROMPT_VERSION: &str = "ashe-worker-daily-v3";
 
 pub struct DailyReportHandle {
     tx: Option<Sender<()>>,
@@ -38,24 +38,50 @@ impl Drop for DailyReportHandle {
     }
 }
 
-#[derive(Clone)]
-struct DailyBlock {
-    id: String,
-    outcome: String,
+#[derive(Serialize)]
+struct DailyTotals {
     active_seconds: u64,
     idle_seconds: u64,
     app_seconds: BTreeMap<String, u64>,
-    content: String,
+    outcomes: BTreeMap<String, usize>,
+}
+
+#[derive(Serialize)]
+struct CoverageGap {
+    start: String,
+    end: String,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct DailyCoverage {
+    complete: bool,
+    gaps: Vec<CoverageGap>,
 }
 
 struct DailySource {
-    reports: Vec<DailyBlock>,
+    blocks: Vec<BlockDocumentInput>,
     pending_ids: HashSet<String>,
-    totals: String,
-    coverage: String,
-    coverage_complete: bool,
-    full_reports: String,
+    totals: DailyTotals,
+    coverage: DailyCoverage,
     hash: String,
+}
+
+impl DailySource {
+    fn document_input(&self, day: &str, timezone: &str) -> Value {
+        let mut pending_block_ids = self.pending_ids.iter().cloned().collect::<Vec<_>>();
+        pending_block_ids.sort();
+        json!({
+            "day": day,
+            "timezone": timezone,
+            "aggregate": {
+                "measured_totals": &self.totals,
+                "coverage": &self.coverage,
+                "pending_block_ids": pending_block_ids,
+                "blocks": &self.blocks,
+            },
+        })
+    }
 }
 
 fn run(config: AppConfig, stop: Receiver<()>) {
@@ -120,20 +146,16 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
         .context("failed to build daily-report runtime")?;
     let report = runtime.block_on(llm_client::generate_daily_activity_report(
         config.clone(),
-        day.to_string(),
-        timezone.clone(),
-        source.totals.clone(),
-        source.coverage.clone(),
-        source.full_reports.clone(),
+        source.document_input(day, &timezone),
     ))?;
     let document = format!(
         "---\ndate: {day}\ntimezone: {timezone}\ngenerated_at: {}\nsource_hash: {}\nprompt_version: {}\nsource_blocks: {}\npending_blocks: {}\ncoverage_complete: {}\nmodel: {}\n---\n\n# Activity report — {day}\n\n{}\n",
         Local::now().to_rfc3339(),
         source.hash,
         DAILY_PROMPT_VERSION,
-        source.reports.len(),
+        source.blocks.len(),
         source.pending_ids.len(),
-        source.coverage_complete,
+        source.coverage.complete,
         config.tera_model,
         report.trim(),
     );
@@ -149,8 +171,8 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
     logger::info(format!(
         "Daily report written: {} ({} blocks, complete={})",
         output.display(),
-        source.reports.len(),
-        source.coverage_complete
+        source.blocks.len(),
+        source.coverage.complete
     ));
     Ok(())
 }
@@ -163,105 +185,45 @@ pub(crate) fn report_is_current(config: &AppConfig, day: &str) -> bool {
 }
 
 fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {
-    let mut reports = load_day_reports(config, day)?;
-    reports.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut blocks = load_day_reports(config, day)?;
+    blocks.sort_by(|left, right| left.block.cmp(&right.block));
     let pending_ids = load_pending_ids(&config.journal_artifacts_dir, day);
-    let report_ids = reports
+    let report_ids = blocks
         .iter()
-        .map(|report| report.id.clone())
+        .map(|block| block.block.clone())
         .collect::<HashSet<_>>();
-    let (coverage, coverage_complete) =
-        coverage_text(day, config.journal_block_minutes, &report_ids, &pending_ids);
-    let totals = measured_totals(&reports);
-    let full_reports = if reports.is_empty() {
-        "(no completed block reports)".to_string()
-    } else {
-        reports
-            .iter()
-            .map(|report| {
-                format!(
-                    "<!-- BEGIN BLOCK {}: exact stored artifact -->\n{}\n<!-- END BLOCK {} -->",
-                    report.id,
-                    report.content.as_str(),
-                    report.id,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
+    let coverage = coverage_input(day, config.journal_block_minutes, &report_ids, &pending_ids);
+    let totals = measured_totals(&blocks);
     let mut pending_for_hash = pending_ids.iter().cloned().collect::<Vec<_>>();
     pending_for_hash.sort();
-    let hash_material = format!(
-        "prompt={DAILY_PROMPT_VERSION}\nday={day}\nmodel={}\nblock_minutes={}\npending={}\n{}\n{}\n{}",
-        config.tera_model,
-        config.journal_block_minutes,
-        pending_for_hash.join(","),
-        totals,
-        coverage,
-        full_reports,
-    );
+    let hash_source = json!({
+        "prompt_version": DAILY_PROMPT_VERSION,
+        "day": day,
+        "model": config.tera_model,
+        "block_minutes": config.journal_block_minutes,
+        "pending_block_ids": pending_for_hash,
+        "measured_totals": &totals,
+        "coverage": &coverage,
+        "blocks": &blocks,
+    });
     Ok(DailySource {
-        reports,
+        blocks,
         pending_ids,
         totals,
         coverage,
-        coverage_complete,
-        full_reports,
-        hash: stable_hash(hash_material.as_bytes()),
+        hash: stable_hash(&serde_json::to_vec(&hash_source)?),
     })
 }
 
-fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<DailyBlock>> {
+fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<BlockDocumentInput>> {
     let directory = config.journal_artifacts_dir.join(day).join("blocks");
     let Ok(entries) = fs::read_dir(directory) else {
         return Ok(Vec::new());
     };
-    let paths = entries
+    let mut reports = BTreeMap::new();
+    for path in entries
         .flatten()
         .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    let mut reports = BTreeMap::new();
-    for path in paths
-        .iter()
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
-    {
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        let id = frontmatter_value(&content, "block").or_else(|| {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .and_then(|stem| stem.split('-').next())
-                .map(|clock| format!("{day}T{clock}"))
-        });
-        let Some(id) = id else { continue };
-        let outcome = frontmatter_value(&content, "outcome").unwrap_or_else(|| {
-            if frontmatter_value(&content, "model").is_some() {
-                "described".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        });
-        reports.insert(
-            id.clone(),
-            DailyBlock {
-                id,
-                outcome,
-                active_seconds: frontmatter_value(&content, "active_seconds")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0),
-                idle_seconds: frontmatter_value(&content, "idle_seconds")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0),
-                app_seconds: frontmatter_value(&content, "app_seconds_json")
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default(),
-                content,
-            },
-        );
-    }
-    for path in paths
-        .iter()
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
     {
         let Ok(bytes) = fs::read(path) else { continue };
@@ -271,20 +233,7 @@ fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<DailyBlock>> {
         if !artifact.is_supported() {
             continue;
         }
-        let Ok(content) = serde_json::to_string_pretty(&artifact) else {
-            continue;
-        };
-        reports.insert(
-            artifact.block.clone(),
-            DailyBlock {
-                id: artifact.block,
-                outcome: artifact.outcome,
-                active_seconds: artifact.active_seconds,
-                idle_seconds: artifact.idle_seconds,
-                app_seconds: artifact.app_seconds,
-                content,
-            },
-        );
+        reports.insert(artifact.block.clone(), artifact.document_input());
     }
     Ok(reports.into_values().collect())
 }
@@ -303,17 +252,21 @@ fn load_pending_ids(root: &Path, day: &str) -> HashSet<String> {
         .collect()
 }
 
-fn coverage_text(
+fn coverage_input(
     day: &str,
     block_minutes: u64,
     reports: &HashSet<String>,
     pending: &HashSet<String>,
-) -> (String, bool) {
+) -> DailyCoverage {
     let Some((start, end)) = day_bounds(day) else {
-        return (
-            "Coverage unavailable: invalid local date.".to_string(),
-            false,
-        );
+        return DailyCoverage {
+            complete: false,
+            gaps: vec![CoverageGap {
+                start: day.to_string(),
+                end: day.to_string(),
+                status: "invalid local date",
+            }],
+        };
     };
     let span = (block_minutes * 60) as i64;
     let mut cursor = start;
@@ -347,62 +300,37 @@ fn coverage_text(
         }
         cursor += span;
     }
-    if gaps.is_empty() {
-        return (
-            "Complete coverage: every expected block has a terminal report.".to_string(),
-            true,
-        );
-    }
-    let text = gaps
-        .iter()
-        .map(|(start, end, status)| {
-            format!(
-                "- {}–{}: {}",
-                local_clock(*start, "%H:%M"),
-                local_clock(*end, "%H:%M"),
-                status,
-            )
+    let gaps = gaps
+        .into_iter()
+        .map(|(start, end, status)| CoverageGap {
+            start: local_clock(start, "%H:%M"),
+            end: local_clock(end, "%H:%M"),
+            status,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (text, false)
+        .collect::<Vec<_>>();
+    DailyCoverage {
+        complete: gaps.is_empty(),
+        gaps,
+    }
 }
 
-fn measured_totals(reports: &[DailyBlock]) -> String {
-    let active: u64 = reports.iter().map(|report| report.active_seconds).sum();
-    let idle: u64 = reports.iter().map(|report| report.idle_seconds).sum();
-    let mut apps: HashMap<String, u64> = HashMap::new();
-    let mut outcomes: HashMap<String, usize> = HashMap::new();
-    for report in reports {
-        *outcomes.entry(report.outcome.clone()).or_default() += 1;
-        for (app, seconds) in &report.app_seconds {
-            *apps.entry(app.clone()).or_default() += seconds;
+fn measured_totals(blocks: &[BlockDocumentInput]) -> DailyTotals {
+    let active_seconds = blocks.iter().map(|block| block.active_seconds).sum();
+    let idle_seconds = blocks.iter().map(|block| block.idle_seconds).sum();
+    let mut app_seconds = BTreeMap::new();
+    let mut outcomes = BTreeMap::new();
+    for block in blocks {
+        *outcomes.entry(block.outcome.clone()).or_default() += 1;
+        for (app, seconds) in &block.app_seconds {
+            *app_seconds.entry(app.clone()).or_default() += seconds;
         }
     }
-    let mut apps = apps.into_iter().collect::<Vec<_>>();
-    apps.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let app_text = apps
-        .into_iter()
-        .map(|(app, seconds)| format!("{app} {}", activity::human_duration(seconds as f64)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut outcomes = outcomes.into_iter().collect::<Vec<_>>();
-    outcomes.sort();
-    format!(
-        "Active: {}\nIdle/locked: {}\nOutcomes: {}\nForeground apps: {}",
-        activity::human_duration(active as f64),
-        activity::human_duration(idle as f64),
-        outcomes
-            .into_iter()
-            .map(|(name, count)| format!("{name}={count}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        if app_text.is_empty() {
-            "unavailable"
-        } else {
-            &app_text
-        },
-    )
+    DailyTotals {
+        active_seconds,
+        idle_seconds,
+        app_seconds,
+        outcomes,
+    }
 }
 
 fn frontmatter_value(content: &str, name: &str) -> Option<String> {

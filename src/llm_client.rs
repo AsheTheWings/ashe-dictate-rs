@@ -34,8 +34,8 @@ const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's qu
 const QUESTION_TEMPERATURE: f32 = 0.7;
 
 const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity journal keeper. Produce a factual account of what the user did during this time block, whether work, reading, entertainment, messaging, shopping, games, or personal admin. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
-const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity. Merge the previous summary with the newly aged block reports. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The supplied aged reports are the only new material. Do not infer later activity. Return Markdown prose only, without a title or preamble.";
-const DAILY_REPORT_PROMPT: &str = "Write a human-readable end-of-day activity report from the complete block reports and measured coverage supplied by Ashe Worker. Use every relevant thread in proportion to its documented time, whether work, entertainment, browsing, communication, errands, or inactivity. Measured totals and coverage are ground truth: never invent activity inside missing intervals or infer durations from prose. Preserve concrete names and progression. Do not mention screenshots, telemetry, prompts, or being an observer. Do not score productivity or moralize. Protect credentials, financial values, medical details, and intimate conversation contents. Return Markdown with exactly these H2 sections: What happened, Loose ends, Time, and Coverage. Begin with a two-sentence overview before the first section. Omit no section; write 'No known loose ends' or 'Complete coverage' where appropriate. Do not add a top-level title.";
+const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity from the structured JSON input. Merge previous_summary with blocks. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The blocks array is the only new material. Treat measured fields as ground truth and do not infer later activity. Return Markdown prose only, without a title or preamble.";
+const DAILY_REPORT_PROMPT: &str = "Write a human-readable end-of-day activity report from the structured JSON aggregate supplied by Ashe Worker. Use every relevant thread in proportion to its documented time, whether work, entertainment, browsing, communication, errands, or inactivity. measured_totals and coverage are ground truth: never invent activity inside missing intervals or infer durations from prose. Preserve concrete names and progression. Do not mention screenshots, telemetry, prompts, JSON, or being an observer. Do not score productivity or moralize. Protect credentials, financial values, medical details, and intimate conversation contents. Return Markdown with exactly these H2 sections: What happened, Loose ends, Time, and Coverage. Begin with a two-sentence overview before the first section. Omit no section; write 'No known loose ends' or 'Complete coverage' where appropriate. Do not add a top-level title.";
 
 pub async fn describe_activity_block(
     config: AppConfig,
@@ -94,11 +94,12 @@ pub async fn describe_activity_block(
 
 pub async fn refresh_activity_summary(
     config: AppConfig,
-    previous: String,
-    aged_reports: String,
+    source: Value,
     max_chars: usize,
 ) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
+    let input = serde_json::to_string_pretty(&source)
+        .context("failed to serialize rolling-summary source")?;
     let mut body = json!({
         "model": config.tera_model,
         "instructions": format!("{SUMMARY_PROMPT}\n\nThe complete result must contain at most {max_chars} Unicode characters."),
@@ -106,11 +107,7 @@ pub async fn refresh_activity_summary(
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": format!(
-                    "### Previous rolling summary\n{}\n\n### Block reports to fold in\n{}",
-                    if previous.trim().is_empty() { "(none yet)" } else { previous.trim() },
-                    aged_reports,
-                )
+                "text": input,
             }]
         }]
     });
@@ -149,15 +146,10 @@ pub async fn refresh_activity_summary(
     Ok(summary.chars().take(max_chars).collect())
 }
 
-pub async fn generate_daily_activity_report(
-    config: AppConfig,
-    day: String,
-    timezone: String,
-    measured_totals: String,
-    coverage: String,
-    complete_reports: String,
-) -> Result<String> {
+pub async fn generate_daily_activity_report(config: AppConfig, source: Value) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
+    let input =
+        serde_json::to_string_pretty(&source).context("failed to serialize daily-report source")?;
     let mut body = json!({
         "model": config.tera_model,
         "instructions": DAILY_REPORT_PROMPT,
@@ -165,9 +157,7 @@ pub async fn generate_daily_activity_report(
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": format!(
-                    "# Daily source for {day}\nTimezone: {timezone}\n\n## Measured daily totals\n{measured_totals}\n\n## Coverage and gaps\n{coverage}\n\n## Complete chronological block reports\n{complete_reports}\n\nWrite the report for {day} only.",
-                )
+                "text": input,
             }]
         }]
     });

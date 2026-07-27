@@ -1,4 +1,3 @@
-use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -71,61 +70,49 @@ pub struct BlockArtifact {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct BlockDocumentInput {
+    pub block: String,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub outcome: String,
+    pub active_seconds: u64,
+    pub idle_seconds: u64,
+    pub app_seconds: BTreeMap<String, u64>,
+    pub timeline: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    pub subjects: Vec<ActivitySubject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl BlockArtifact {
     pub fn is_supported(&self) -> bool {
         self.schema_version == BLOCK_SCHEMA_VERSION
     }
 
-    pub fn context_markdown(&self) -> String {
-        let heading = match &self.title {
-            Some(title) => format!("# {} — {title}", self.block),
-            None => format!("# {} — {}", self.block, self.outcome),
-        };
-        let report = self
-            .report
-            .as_deref()
-            .unwrap_or("No block-description LLM report is available for this interval.");
-        let window = format!(
-            "Window: {} to {}",
-            local_timestamp(self.window_start),
-            local_timestamp(self.window_end),
-        );
-        let mut sections = vec![heading, window, report.to_string()];
-        if !self.subjects.is_empty() {
-            sections.push(format!(
-                "## Subjects\n\n{}",
-                self.subjects
-                    .iter()
-                    .map(|entry| format!(
-                        "- [{}] {} (approximately {}s)",
-                        entry.namespaces.join(" > "),
-                        entry.subject,
-                        entry.estimated_duration_s,
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
+    pub fn document_input(&self) -> BlockDocumentInput {
+        BlockDocumentInput {
+            block: self.block.clone(),
+            window_start: self.window_start,
+            window_end: self.window_end,
+            outcome: self.outcome.clone(),
+            active_seconds: self.active_seconds,
+            idle_seconds: self.idle_seconds,
+            app_seconds: self.app_seconds.clone(),
+            timeline: self.timeline.clone(),
+            title: self.title.clone(),
+            report: self.report.clone(),
+            subjects: self.subjects.clone(),
+            reason: self.reason.clone(),
+            error: self.error.clone(),
         }
-        if !self.timeline.is_empty() {
-            sections.push(format!(
-                "## Measured timeline\n\n{}",
-                self.timeline
-                    .iter()
-                    .map(|line| format!("- {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
-        }
-        sections.join("\n\n")
     }
-}
-
-fn local_timestamp(ts: i64) -> String {
-    Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .map(|stamp| stamp.format("%Y-%m-%d %H:%M:%S %:z").to_string())
-        .unwrap_or_else(|| ts.to_string())
 }
 
 #[cfg(test)]

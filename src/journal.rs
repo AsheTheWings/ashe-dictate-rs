@@ -1,6 +1,8 @@
 use crate::activity::{self, ActivitySample};
 use crate::archive::ArchiveHandle;
-use crate::block_artifact::{ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact};
+use crate::block_artifact::{
+    ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput,
+};
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
 use crate::llm_client;
@@ -121,7 +123,7 @@ struct ContextState {
 #[derive(Clone, Debug)]
 struct StoredReport {
     id: String,
-    content: String,
+    block: BlockDocumentInput,
 }
 
 struct BlockMetrics {
@@ -624,9 +626,7 @@ fn recover_pending(
         };
         if block.start == boundary {
             current = Some(block);
-        } else if !report_path(&config.journal_artifacts_dir, &block).is_file()
-            && !legacy_report_path(&config.journal_artifacts_dir, &block).is_file()
-        {
+        } else if !report_path(&config.journal_artifacts_dir, &block).is_file() {
             describe_and_store(config, block, status);
         } else {
             let directory = day_dir(&config.journal_artifacts_dir, &block.day);
@@ -655,12 +655,6 @@ fn report_path(root: &Path, block: &Block) -> PathBuf {
     day_dir(root, &block.day)
         .join("blocks")
         .join(format!("{}.json", block.slug()))
-}
-
-fn legacy_report_path(root: &Path, block: &Block) -> PathBuf {
-    day_dir(root, &block.day)
-        .join("blocks")
-        .join(format!("{}.md", block.slug()))
 }
 
 fn save_pending(root: &Path, block: &Block) -> Result<()> {
@@ -770,17 +764,6 @@ fn rebuild_journal(directory: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     for path in paths
         .iter()
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
-    {
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        if let Some((id, entry)) = legacy_journal_entry(&content) {
-            entries.insert(id, entry);
-        }
-    }
-    for path in paths
-        .iter()
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
     {
         let Ok(bytes) = fs::read(path) else { continue };
@@ -815,28 +798,6 @@ fn json_journal_entry(artifact: &BlockArtifact) -> Option<(String, String)> {
             report.trim(),
         ),
     ))
-}
-
-fn legacy_journal_entry(content: &str) -> Option<(String, String)> {
-    if !content.lines().any(|line| line.starts_with("model: ")) {
-        return None;
-    }
-    let id = content
-        .lines()
-        .find_map(|line| line.strip_prefix("block: "))?
-        .trim();
-    let (_, markdown) = content.split_once("\n---\n\n")?;
-    let (heading, remainder) = markdown.split_once("\n\n")?;
-    let heading = heading.strip_prefix("# ")?.trim();
-    let report = remainder
-        .split_once("\n\n## Measured timeline")
-        .map(|(report, _)| report)
-        .unwrap_or(remainder)
-        .trim();
-    if id.is_empty() || heading.is_empty() || report.is_empty() {
-        return None;
-    }
-    Some((id.to_string(), format!("## {heading}\n\n{report}\n")))
 }
 
 fn write_terminal_block(
@@ -938,14 +899,19 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
         write_rolling_summary(root, &summary, &state.summary_through)?;
     }
     for batch in aged.chunks(SUMMARY_BATCH_SIZE) {
-        let input = batch
-            .iter()
-            .map(|report| report.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
+        let input = serde_json::json!({
+            "previous_summary": if summary.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(summary.trim().to_string())
+            },
+            "blocks": batch
+                .iter()
+                .map(|report| &report.block)
+                .collect::<Vec<_>>(),
+        });
         summary = llm_client::refresh_activity_summary(
             config.clone(),
-            summary,
             input,
             config.journal_context_summary_max_chars,
         )
@@ -958,30 +924,26 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
         write_context_state(root, &state)?;
     }
 
-    let mut sections = Vec::new();
-    if !summary.trim().is_empty() {
-        sections.push(format!(
-            "### Earlier history (compressed)\nThis continuous summary ends at block {} and does not overlap the complete reports below.\n\n{}",
-            state.summary_through,
-            summary.trim(),
-        ));
-    }
-    if !detailed.is_empty() {
-        sections.push(format!(
-            "### {} most recent blocks (complete, oldest first)\nThese reports are passed in full and are not covered by the summary above.\n\n{}",
-            detailed.len(),
-            detailed
-                .iter()
-                .map(|report| report.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n"),
-        ));
-    }
-    if sections.is_empty() {
-        Ok("### Earlier context\n(none yet)".to_string())
-    } else {
-        Ok(sections.join("\n\n"))
-    }
+    let context = serde_json::json!({
+        "rolling_summary": if summary.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(summary.trim().to_string())
+        },
+        "rolling_summary_through": if state.summary_through.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(state.summary_through.clone())
+        },
+        "recent_blocks": detailed
+            .iter()
+            .map(|report| &report.block)
+            .collect::<Vec<_>>(),
+    });
+    Ok(format!(
+        "### Earlier context (structured JSON)\n{}",
+        serde_json::to_string_pretty(&context)?,
+    ))
 }
 
 fn context_detailed_offset(report_count: usize, context_blocs: usize) -> usize {
@@ -999,45 +961,9 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
         let Ok(entries) = fs::read_dir(blocks) else {
             continue;
         };
-        let paths = entries
+        for path in entries
             .flatten()
             .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        for path in paths
-            .iter()
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
-        {
-            let Ok(content) = fs::read_to_string(path) else {
-                continue;
-            };
-            if !content.starts_with("---\n")
-                || !content.lines().any(|line| line.starts_with("model: "))
-            {
-                continue;
-            }
-            let Some(id) = content
-                .lines()
-                .find_map(|line| line.strip_prefix("block: "))
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-            else {
-                continue;
-            };
-            let Some(start) = block_timestamp(id) else {
-                continue;
-            };
-            if start < before {
-                reports.insert(
-                    id.to_string(),
-                    StoredReport {
-                        id: id.to_string(),
-                        content,
-                    },
-                );
-            }
-        }
-        for path in paths
-            .iter()
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         {
             let Ok(bytes) = fs::read(path) else { continue };
@@ -1058,7 +984,7 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
                     artifact.block.clone(),
                     StoredReport {
                         id: artifact.block.clone(),
-                        content: artifact.context_markdown(),
+                        block: artifact.document_input(),
                     },
                 );
             }
@@ -1249,9 +1175,6 @@ mod tests {
         let (_, entry) = json_journal_entry(&artifact).unwrap();
         assert!(entry.contains("Report content only."));
         assert!(!entry.contains("Structured subject must not be rendered."));
-        let context = artifact.context_markdown();
-        assert!(context.contains("Window: "));
-        assert!(context.contains(" to "));
     }
 
     #[test]

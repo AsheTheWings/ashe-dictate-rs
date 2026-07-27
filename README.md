@@ -51,10 +51,11 @@ overlapping estimates remain valid during multitasking. Parseable generated data
 without semantic filtering. The chronological `journal.md` is rebuilt from the report
 fields in the JSON block artifacts.
 
-Recent completed blocks remain available in full. Older blocks are folded once into the
-bounded plaintext `summary.md`, which serves as convenient long-term context. At the end of
-each day, all block reports are also assembled into a full daily report with measured totals
-and explicit coverage gaps.
+Recent completed blocks remain available in full. Older canonical JSON blocks are projected
+into a structured aggregate and folded once into the bounded plaintext `summary.md`, which
+serves as convenient long-term context. At the end of each day, canonical blocks, measured
+totals, and explicit coverage gaps are likewise supplied as one structured aggregate for the
+full daily report. Markdown is used only for the generated human-readable output documents.
 
 ## Encrypted archives
 
