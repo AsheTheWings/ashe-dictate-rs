@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const BLOCK_SCHEMA_VERSION: u32 = 2;
-pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -215,7 +215,6 @@ struct GeneratedLearningSubject {
     namespaces: Vec<String>,
     subject: String,
     estimated_duration_s: u64,
-    unattended: bool,
     learning: LearningRecord,
 }
 
@@ -225,7 +224,6 @@ pub struct LearningSubject {
     pub namespaces: Vec<String>,
     pub subject: String,
     pub estimated_duration_s: u64,
-    pub unattended: bool,
     pub learning: LearningRecord,
 }
 
@@ -243,7 +241,6 @@ impl From<GeneratedLearningSubject> for LearningSubject {
             namespaces: subject.namespaces,
             subject: subject.subject,
             estimated_duration_s: subject.estimated_duration_s,
-            unattended: subject.unattended,
             learning: subject.learning,
         }
     }
@@ -430,7 +427,6 @@ mod tests {
                 "namespaces": ["learning", "lookup", "rust", "serde-attributes"],
                 "subject": "Looked up how a Serde container attribute behaves.",
                 "estimated_duration_s": 180,
-                "unattended": false,
                 "learning": {
                     "search_queries": ["serde deny_unknown_fields"],
                     "sources": [{"kind":"documentation","title":"Container attributes"}],
@@ -445,6 +441,12 @@ mod tests {
         assert!(LearningNarrative::parse(&text.replace("learning\",", "education\",")).is_err());
         assert!(LearningNarrative::parse(&text.replace("documentation", "webpage")).is_err());
         assert!(LearningNarrative::parse(&text.replace("focused-explanation", "deep")).is_err());
+        assert!(
+            LearningNarrative::parse(
+                &text.replace("\"learning\": {", "\"unattended\": false, \"learning\": {")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -476,8 +478,8 @@ mod tests {
         .unwrap();
         let enriched = LearningNarrative::parse(
             r#"{"learning_subjects":[
-                {"namespaces":["learning","lookup","rust","ownership"],"subject":"Looked up ownership.","estimated_duration_s":60,"unattended":false,"learning":{"search_queries":[],"sources":[],"depth":"lookup"}},
-                {"namespaces":["learning","applied","rust","borrowing"],"subject":"Applied a borrowing rule.","estimated_duration_s":60,"unattended":false,"learning":{"search_queries":[],"sources":[{"kind":"code"}],"depth":"applied"}}
+                {"namespaces":["learning","lookup","rust","ownership"],"subject":"Looked up ownership.","estimated_duration_s":60,"learning":{"search_queries":[],"sources":[],"depth":"lookup"}},
+                {"namespaces":["learning","applied","rust","borrowing"],"subject":"Applied a borrowing rule.","estimated_duration_s":60,"learning":{"search_queries":[],"sources":[{"kind":"code"}],"depth":"applied"}}
             ]}"#,
         )
         .unwrap();

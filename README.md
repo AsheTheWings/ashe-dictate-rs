@@ -61,6 +61,8 @@ atomic learning units, visible search queries, source material, and one evidence
 `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or `synthesis`.
 Depth describes observable exposure and engagement, not comprehension or retention. Passive
 activity is not considered unattended merely because keyboard and mouse input stopped.
+`unattended` remains exclusively on the base activity subject and is not duplicated or
+reclassified by the learning request.
 
 The ordinary block request and learning request have independent frame selection and
 payload accounting. Learning enrichment captures temporary frames every 10 seconds by

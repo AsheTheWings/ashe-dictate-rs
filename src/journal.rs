@@ -1788,7 +1788,6 @@ mod tests {
                 ],
                 subject: "Reviewed Rust ownership rules.".to_string(),
                 estimated_duration_s: 240,
-                unattended: false,
                 learning: LearningRecord {
                     search_queries: Vec::new(),
                     sources: Vec::new(),
