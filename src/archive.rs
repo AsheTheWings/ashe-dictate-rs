@@ -87,7 +87,7 @@ fn scan_and_seal(config: &AppConfig, recipient: &RecipientMaterial) -> Result<()
     let oldest_plaintext = today
         .checked_sub_days(Days::new(config.archive_plaintext_days - 1))
         .context("archive plaintext-day threshold overflow")?;
-    let mut days = dated_directories(&config.journal_artifacts_dir)?;
+    let mut days = dated_directories(&config.activity_artifacts_dir)?;
     days.sort_by_key(|(day, _)| *day);
     for (day, directory) in days {
         if day >= oldest_plaintext {
@@ -100,7 +100,7 @@ fn scan_and_seal(config: &AppConfig, recipient: &RecipientMaterial) -> Result<()
             continue;
         }
         let day_text = day.format("%Y-%m-%d").to_string();
-        if has_pending_block(&config.journal_artifacts_dir, &day_text) {
+        if has_pending_block(&config.activity_artifacts_dir, &day_text) {
             logger::info(format!(
                 "Archive sealing deferred for {day_text}: pending block"
             ));
@@ -164,7 +164,7 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
         parsed_upload_url.scheme() == "https",
         "ASHE_ARCHIVE_UPLOAD_URL must use HTTPS"
     );
-    let mut state = read_upload_state(&config.journal_artifacts_dir);
+    let mut state = read_upload_state(&config.activity_artifacts_dir);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -174,7 +174,7 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
         .build()
         .context("failed to build archive-upload client")?;
     let mut changed = false;
-    for (_, directory) in dated_directories(&config.journal_artifacts_dir)? {
+    for (_, directory) in dated_directories(&config.activity_artifacts_dir)? {
         let path = directory.join(ARCHIVE_FILENAME);
         if !path.is_file() {
             continue;
@@ -215,7 +215,7 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
         ));
     }
     if changed {
-        write_upload_state(&config.journal_artifacts_dir, &state)?;
+        write_upload_state(&config.activity_artifacts_dir, &state)?;
     }
     Ok(())
 }

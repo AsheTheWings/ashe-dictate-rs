@@ -1,7 +1,7 @@
 # Ashe Worker
 
 Ashe Worker is a native Windows productivity companion for dictation, selected-text
-actions, and an automatic computer-activity journal. It runs in the system tray and uses
+actions, and automatic computer-activity tracking. It runs in the system tray and uses
 small overlays to show live state and results.
 
 ## Capabilities
@@ -14,7 +14,7 @@ small overlays to show live state and results.
   sensitive apps.
 - Maintain recent detailed context, a bounded rolling summary, and a complete daily report.
 - Store each completed activity block as canonical JSON while aggregating its report into
-  the human-readable journal.
+  the human-readable `journal.md` projection.
 - Enrich learning blocks with atomic topics, visible searches and sources, and an
   evidence-backed treatment depth.
 - Seal older day artifacts into authenticated, self-contained encrypted archives and
@@ -38,10 +38,10 @@ local environment file beside the executable or at the project root, then provid
 credentials and settings needed for the features you enable. Secret values are not logged.
 
 The app starts in the tray. Left-click the tray icon to open the artifact collection.
-Right-click it to control dictation and journaling, reload configuration, open logs, or
+Right-click it to control dictation and activity tracking, reload configuration, open logs, or
 quit.
 
-## Activity journal
+## Activity tracking
 
 Each block combines measured foreground-window and idle-time telemetry with selected
 lossless screenshots. Visually redundant frames are omitted from model requests, request

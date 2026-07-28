@@ -1,8 +1,8 @@
+use crate::activity_pipeline::ActivityHandle;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::deepgram_client::DeepgramSession;
 use crate::injector;
-use crate::journal::JournalHandle;
 use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
@@ -71,8 +71,8 @@ pub struct UiApp {
     transcript: String,
     polished: Option<String>,
     error: Option<String>,
-    journal: JournalHandle,
-    last_journal_status: String,
+    activity: ActivityHandle,
+    last_activity_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ impl UiApp {
         let win32_thread = win32_service::spawn(event_tx, command_rx);
         let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
         let (status_tx, status_rx) = crossbeam_channel::unbounded();
-        let journal = JournalHandle::spawn(config.clone());
+        let activity = ActivityHandle::spawn(config.clone());
         let app = Self {
             config,
             state: DictationState::Idle,
@@ -116,8 +116,8 @@ impl UiApp {
             transcript: String::new(),
             polished: None,
             error: None,
-            journal,
-            last_journal_status: String::new(),
+            activity,
+            last_activity_status: String::new(),
         };
         app.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Idle - Win+Shift+H".to_string(),
@@ -170,16 +170,16 @@ impl UiApp {
         if self.state == DictationState::Stopping {
             self.complete_stop_if_ready(&mut tasks);
         }
-        let journal = self.journal.status();
-        let journal_key = format!(
+        let activity = self.activity.status();
+        let activity_key = format!(
             "{}:{}:{}",
-            journal.running, journal.current_frames, journal.summary
+            activity.running, activity.current_frames, activity.summary
         );
-        if journal_key != self.last_journal_status {
-            self.last_journal_status = journal_key;
-            self.send_win32(Win32Command::SetJournalStatus {
-                running: journal.running,
-                status: journal.summary,
+        if activity_key != self.last_activity_status {
+            self.last_activity_status = activity_key;
+            self.send_win32(Win32Command::SetActivityStatus {
+                running: activity.running,
+                status: activity.summary,
             });
         }
         Task::batch(tasks)
@@ -235,19 +235,19 @@ impl UiApp {
                 ));
                 Task::none()
             }
-            Win32Event::ToggleJournalRequested => {
-                self.journal.toggle();
+            Win32Event::ToggleActivityRequested => {
+                self.activity.toggle();
                 Task::none()
             }
             Win32Event::OpenArtifactsRequested => {
                 self.send_win32(Win32Command::OpenPath(
-                    self.journal.artifacts_dir().display().to_string(),
+                    self.activity.artifacts_dir().display().to_string(),
                 ));
                 Task::none()
             }
             Win32Event::OpenJournalRequested => {
                 self.send_win32(Win32Command::OpenPath(
-                    self.journal.today_journal().display().to_string(),
+                    self.activity.today_journal().display().to_string(),
                 ));
                 Task::none()
             }
@@ -574,8 +574,8 @@ impl UiApp {
             return;
         }
         self.config = AppConfig::load();
-        self.journal.shutdown();
-        self.journal = JournalHandle::spawn(self.config.clone());
+        self.activity.shutdown();
+        self.activity = ActivityHandle::spawn(self.config.clone());
         logger::info(format!("Config reloaded: {}", self.config.log_summary()));
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Config reloaded - Win+Shift+H".to_string(),
@@ -586,11 +586,11 @@ impl UiApp {
         self.send_win32(Win32Command::ShowMessageBox {
             title: "About Ashe Worker".to_string(),
             text: format!(
-                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nActivity journal: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
+                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nActivity tracking: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
                 APP_VERSION,
                 BUILD_ID,
-                self.journal.status().summary,
-                self.journal.artifacts_dir().display(),
+                self.activity.status().summary,
+                self.activity.artifacts_dir().display(),
                 self.config.log_summary(),
                 logger::log_path().display()
             ),
@@ -734,7 +734,7 @@ impl UiApp {
 
     fn quit(&mut self) -> Task<Message> {
         logger::info("Quit requested");
-        self.journal.shutdown();
+        self.activity.shutdown();
         self.request_stop();
         self.send_win32(Win32Command::Shutdown);
         if let Some(id) = self.window_id {

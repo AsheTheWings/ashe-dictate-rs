@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod activity;
+mod activity_pipeline;
+mod activity_telemetry;
 mod archive;
 mod artifact_store;
 mod audio;
@@ -8,7 +9,6 @@ mod config;
 mod daily_report;
 mod deepgram_client;
 mod injector;
-mod journal;
 mod llm_client;
 mod logger;
 #[cfg(all(target_os = "windows", target_env = "gnu"))]

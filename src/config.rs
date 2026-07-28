@@ -5,15 +5,15 @@ const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_TERA_API_BASE: &str = "https://tera.asheservices.online/v1";
 const DEFAULT_TERA_MODEL: &str = "cloudcode/chat-gemini-3-flash-paid-tier";
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
-const DEFAULT_JOURNAL_CAPTURE_INTERVAL: u64 = 20;
-const DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL: u64 = 120;
+const DEFAULT_ACTIVITY_CAPTURE_INTERVAL: u64 = 20;
+const DEFAULT_ACTIVITY_IDLE_CAPTURE_INTERVAL: u64 = 120;
 const DEFAULT_LEARNING_CAPTURE_INTERVAL: u64 = 10;
 const DEFAULT_LEARNING_MAX_FRAME_GAP_S: u64 = 30;
-const DEFAULT_JOURNAL_BLOCK_MINUTES: u64 = 10;
-const DEFAULT_JOURNAL_DEDUP_THRESHOLD: f32 = 2.0;
-const DEFAULT_JOURNAL_MAX_FRAMES_PER_CALL: usize = 100;
-const DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS: u64 = 30;
-const DEFAULT_CONTEXT_BLOCS: usize = 6;
+const DEFAULT_ACTIVITY_BLOCK_MINUTES: u64 = 10;
+const DEFAULT_ACTIVITY_DEDUP_THRESHOLD: f32 = 2.0;
+const DEFAULT_ACTIVITY_MAX_FRAMES_PER_CALL: usize = 100;
+const DEFAULT_ACTIVITY_MIN_ACTIVE_SECONDS: u64 = 30;
+const DEFAULT_CONTEXT_BLOCKS: usize = 6;
 const DEFAULT_CONTEXT_SUMMARY_MAX_CHARS: usize = 1_500;
 const DEFAULT_DAILY_REPORT_GRACE_MINUTES: u64 = 15;
 const DEFAULT_ARCHIVE_PLAINTEXT_DAYS: u64 = 2;
@@ -35,26 +35,26 @@ pub struct AppConfig {
     pub tera_model: String,
     pub llm_temperature: f32,
     pub llm_reasoning_effort: Option<String>,
-    pub journal_enabled: bool,
-    pub journal_artifacts_dir: PathBuf,
-    pub journal_capture_interval: u64,
-    pub journal_idle_capture_interval: u64,
+    pub activity_enabled: bool,
+    pub activity_artifacts_dir: PathBuf,
+    pub activity_capture_interval: u64,
+    pub activity_idle_capture_interval: u64,
     pub learning_enrichment_enabled: bool,
     pub learning_capture_interval: u64,
     pub learning_max_frame_gap_s: u64,
-    pub journal_telemetry_interval_ms: u64,
-    pub journal_block_minutes: u64,
-    pub journal_monitor: i32,
-    pub journal_dedup_threshold: f32,
-    pub journal_max_frame_gap_s: u64,
-    pub journal_max_frames_per_call: usize,
-    pub journal_max_payload_mb: f32,
-    pub journal_idle_threshold_s: f64,
-    pub journal_min_active_seconds: u64,
-    pub journal_denylist: Vec<String>,
-    pub journal_frame_retention_minutes: u64,
-    pub journal_context_blocs: usize,
-    pub journal_context_summary_max_chars: usize,
+    pub activity_telemetry_interval_ms: u64,
+    pub activity_block_minutes: u64,
+    pub activity_monitor: i32,
+    pub activity_dedup_threshold: f32,
+    pub activity_max_frame_gap_s: u64,
+    pub activity_max_frames_per_call: usize,
+    pub activity_max_payload_mb: f32,
+    pub activity_idle_threshold_s: f64,
+    pub activity_min_active_seconds: u64,
+    pub activity_denylist: Vec<String>,
+    pub activity_frame_retention_minutes: u64,
+    pub activity_context_blocks: usize,
+    pub activity_context_summary_max_chars: usize,
     pub daily_report_enabled: bool,
     pub daily_report_grace_minutes: u64,
     pub archive_recipient_json: String,
@@ -68,13 +68,13 @@ impl AppConfig {
     pub fn load() -> Self {
         load_env_file_near_exe();
 
-        let journal_artifacts_dir = std::env::var("ASHE_ARTIFACTS_DIR")
+        let activity_artifacts_dir = std::env::var("ASHE_ARTIFACTS_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_artifacts_dir);
-        let journal_capture_interval =
-            read_u64("ASHE_CAPTURE_INTERVAL", DEFAULT_JOURNAL_CAPTURE_INTERVAL).max(1);
+        let activity_capture_interval =
+            read_u64("ASHE_CAPTURE_INTERVAL", DEFAULT_ACTIVITY_CAPTURE_INTERVAL).max(1);
 
         let learning_capture_interval = read_u64(
             "ASHE_LEARNING_CAPTURE_INTERVAL",
@@ -109,14 +109,14 @@ impl AppConfig {
             llm_reasoning_effort: std::env::var("ASHE_LLM_REASONING_EFFORT")
                 .ok()
                 .filter(|value| !value.is_empty()),
-            journal_enabled: read_bool("ASHE_JOURNAL_ENABLED", true),
-            journal_artifacts_dir,
-            journal_capture_interval,
-            journal_idle_capture_interval: read_u64(
+            activity_enabled: read_bool("ASHE_ACTIVITY_ENABLED", true),
+            activity_artifacts_dir,
+            activity_capture_interval,
+            activity_idle_capture_interval: read_u64(
                 "ASHE_IDLE_CAPTURE_INTERVAL",
-                DEFAULT_JOURNAL_IDLE_CAPTURE_INTERVAL,
+                DEFAULT_ACTIVITY_IDLE_CAPTURE_INTERVAL,
             )
-            .max(journal_capture_interval),
+            .max(activity_capture_interval),
             learning_enrichment_enabled: read_bool("ASHE_LEARNING_ENRICHMENT_ENABLED", true),
             learning_capture_interval,
             learning_max_frame_gap_s: read_u64(
@@ -124,32 +124,32 @@ impl AppConfig {
                 DEFAULT_LEARNING_MAX_FRAME_GAP_S,
             )
             .max(learning_capture_interval),
-            journal_telemetry_interval_ms: (read_f32("ASHE_TELEMETRY_INTERVAL", 2.0).max(0.5)
+            activity_telemetry_interval_ms: (read_f32("ASHE_TELEMETRY_INTERVAL", 2.0).max(0.5)
                 * 1000.0) as u64,
-            journal_block_minutes: read_u64("ASHE_BLOCK_MINUTES", DEFAULT_JOURNAL_BLOCK_MINUTES)
+            activity_block_minutes: read_u64("ASHE_BLOCK_MINUTES", DEFAULT_ACTIVITY_BLOCK_MINUTES)
                 .max(1),
-            journal_monitor: read_i32("ASHE_MONITOR", 1),
-            journal_dedup_threshold: read_f32(
+            activity_monitor: read_i32("ASHE_MONITOR", 1),
+            activity_dedup_threshold: read_f32(
                 "ASHE_DEDUP_THRESHOLD",
-                DEFAULT_JOURNAL_DEDUP_THRESHOLD,
+                DEFAULT_ACTIVITY_DEDUP_THRESHOLD,
             )
             .clamp(0.0, 100.0),
-            journal_max_frame_gap_s: read_u64("ASHE_MAX_FRAME_GAP_S", 120),
-            journal_max_frames_per_call: read_usize(
+            activity_max_frame_gap_s: read_u64("ASHE_MAX_FRAME_GAP_S", 120),
+            activity_max_frames_per_call: read_usize(
                 "ASHE_MAX_FRAMES_PER_CALL",
-                DEFAULT_JOURNAL_MAX_FRAMES_PER_CALL,
+                DEFAULT_ACTIVITY_MAX_FRAMES_PER_CALL,
             )
             .max(2),
-            journal_max_payload_mb: read_f32("ASHE_MAX_PAYLOAD_MB", 48.0).max(1.0),
-            journal_idle_threshold_s: read_f32("ASHE_IDLE_THRESHOLD_S", 120.0).max(10.0) as f64,
-            journal_min_active_seconds: read_u64(
+            activity_max_payload_mb: read_f32("ASHE_MAX_PAYLOAD_MB", 48.0).max(1.0),
+            activity_idle_threshold_s: read_f32("ASHE_IDLE_THRESHOLD_S", 120.0).max(10.0) as f64,
+            activity_min_active_seconds: read_u64(
                 "ASHE_MIN_ACTIVE_SECONDS",
-                DEFAULT_JOURNAL_MIN_ACTIVE_SECONDS,
+                DEFAULT_ACTIVITY_MIN_ACTIVE_SECONDS,
             ),
-            journal_denylist: read_list("ASHE_DENYLIST"),
-            journal_frame_retention_minutes: read_u64("ASHE_FRAME_RETENTION_MINUTES", 30),
-            journal_context_blocs: read_usize("ASHE_CONTEXT_BLOCS", DEFAULT_CONTEXT_BLOCS),
-            journal_context_summary_max_chars: read_usize(
+            activity_denylist: read_list("ASHE_DENYLIST"),
+            activity_frame_retention_minutes: read_u64("ASHE_FRAME_RETENTION_MINUTES", 30),
+            activity_context_blocks: read_usize("ASHE_CONTEXT_BLOCKS", DEFAULT_CONTEXT_BLOCKS),
+            activity_context_summary_max_chars: read_usize(
                 "ASHE_MAX_SUMMARY_CHARS",
                 DEFAULT_CONTEXT_SUMMARY_MAX_CHARS,
             )
@@ -233,7 +233,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} journal_enabled={} journal_artifacts={} learning_enrichment_enabled={} learning_capture_interval={}s learning_max_frame_gap={}s context_blocs={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} learning_enrichment_enabled={} learning_capture_interval={}s learning_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -242,13 +242,13 @@ impl AppConfig {
             self.tera_model,
             !self.tera_api_key.trim().is_empty(),
             self.llm_reasoning_effort.is_some(),
-            self.journal_enabled,
-            self.journal_artifacts_dir.display(),
+            self.activity_enabled,
+            self.activity_artifacts_dir.display(),
             self.learning_enrichment_enabled,
             self.learning_capture_interval,
             self.learning_max_frame_gap_s,
-            self.journal_context_blocs,
-            self.journal_context_summary_max_chars,
+            self.activity_context_blocks,
+            self.activity_context_summary_max_chars,
             self.daily_report_enabled,
             self.daily_report_grace_minutes,
             !self.archive_recipient_json.trim().is_empty(),

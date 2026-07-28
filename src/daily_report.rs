@@ -87,7 +87,7 @@ fn run(config: AppConfig, stop: Receiver<()>) {
 }
 
 fn scan_closed_days(config: &AppConfig) -> Result<()> {
-    let root = &config.journal_artifacts_dir;
+    let root = &config.activity_artifacts_dir;
     let today = Local::now().format("%Y-%m-%d").to_string();
     let mut days = fs::read_dir(root)?
         .flatten()
@@ -122,7 +122,7 @@ fn grace_period_elapsed(day: &str, grace_minutes: u64) -> bool {
 
 fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
     let source = build_daily_source(config, day)?;
-    let output = config.journal_artifacts_dir.join(day).join("daily.md");
+    let output = config.activity_artifacts_dir.join(day).join("daily.md");
     if read_frontmatter_value(&output, "source_hash").as_deref() == Some(&source.hash) {
         return Ok(());
     }
@@ -158,7 +158,7 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
 }
 
 pub(crate) fn report_is_current(config: &AppConfig, day: &str) -> bool {
-    let output = config.journal_artifacts_dir.join(day).join("daily.md");
+    let output = config.activity_artifacts_dir.join(day).join("daily.md");
     build_daily_source(config, day).is_ok_and(|source| {
         read_frontmatter_value(&output, "source_hash").as_deref() == Some(&source.hash)
     })
@@ -167,12 +167,17 @@ pub(crate) fn report_is_current(config: &AppConfig, day: &str) -> bool {
 fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {
     let mut blocks = load_day_reports(config, day)?;
     blocks.sort_by(|left, right| left.block.cmp(&right.block));
-    let pending_ids = load_pending_ids(&config.journal_artifacts_dir, day);
+    let pending_ids = load_pending_ids(&config.activity_artifacts_dir, day);
     let report_ids = blocks
         .iter()
         .map(|block| block.block.clone())
         .collect::<HashSet<_>>();
-    let coverage = coverage_input(day, config.journal_block_minutes, &report_ids, &pending_ids);
+    let coverage = coverage_input(
+        day,
+        config.activity_block_minutes,
+        &report_ids,
+        &pending_ids,
+    );
     let totals = measured_totals(&blocks);
     let namespace_stats = namespace_totals(&blocks);
     let mut pending_for_hash = pending_ids.iter().cloned().collect::<Vec<_>>();
@@ -197,7 +202,7 @@ fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {
     let hash_source = json!({
         "generator_version": DAILY_GENERATOR_VERSION,
         "day": day,
-        "block_minutes": config.journal_block_minutes,
+        "block_minutes": config.activity_block_minutes,
         "pending_block_ids": pending_for_hash,
         "measured_totals": &totals,
         "namespace_stats": &namespace_stats,
@@ -337,7 +342,7 @@ fn render_daily_report(source: &DailySource) -> String {
 }
 
 fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<BlockDocumentInput>> {
-    let directory = config.journal_artifacts_dir.join(day).join("blocks");
+    let directory = config.activity_artifacts_dir.join(day).join("blocks");
     let Ok(entries) = fs::read_dir(directory) else {
         return Ok(Vec::new());
     };

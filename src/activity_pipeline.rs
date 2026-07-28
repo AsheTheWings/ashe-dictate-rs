@@ -1,4 +1,4 @@
-use crate::activity::{self, ActivitySample};
+use crate::activity_telemetry::{self, ActivitySample};
 use crate::archive::ArchiveHandle;
 use crate::block_artifact::{
     ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput,
@@ -22,20 +22,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PENDING_BLOCK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
-pub struct JournalStatus {
+pub struct ActivityStatus {
     pub running: bool,
     pub summary: String,
     pub current_frames: usize,
 }
 
 #[derive(Clone)]
-pub struct JournalHandle {
-    tx: Sender<JournalCommand>,
-    status: Arc<Mutex<JournalStatus>>,
+pub struct ActivityHandle {
+    tx: Sender<ActivityCommand>,
+    status: Arc<Mutex<ActivityStatus>>,
     artifacts: PathBuf,
 }
 
-enum JournalCommand {
+enum ActivityCommand {
     Toggle,
     Shutdown,
 }
@@ -46,7 +46,7 @@ struct DescriptionQueue {
 }
 
 impl DescriptionQueue {
-    fn spawn(config: AppConfig, status: Arc<Mutex<JournalStatus>>) -> Self {
+    fn spawn(config: AppConfig, status: Arc<Mutex<ActivityStatus>>) -> Self {
         Self::spawn_with_processor(move |block| describe_and_store(&config, block, &status))
     }
 
@@ -86,30 +86,30 @@ impl DescriptionQueue {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&id);
-            return Err(anyhow!("journal description worker stopped"));
+            return Err(anyhow!("activity description worker stopped"));
         }
         Ok(())
     }
 }
 
-impl JournalHandle {
+impl ActivityHandle {
     pub fn spawn(config: AppConfig) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let status = Arc::new(Mutex::new(JournalStatus {
-            running: config.journal_enabled,
-            summary: if config.journal_enabled {
-                "activity journal starting".to_string()
+        let status = Arc::new(Mutex::new(ActivityStatus {
+            running: config.activity_enabled,
+            summary: if config.activity_enabled {
+                "activity tracking starting".to_string()
             } else {
-                "activity journal paused".to_string()
+                "activity tracking paused".to_string()
             },
             current_frames: 0,
         }));
         let worker_status = Arc::clone(&status);
-        let artifacts = config.journal_artifacts_dir.clone();
+        let artifacts = config.activity_artifacts_dir.clone();
         std::thread::spawn(move || {
             if let Err(error) = run(config, rx, &worker_status) {
-                logger::info(format!("Activity journal stopped with error: {error:#}"));
-                set_status(&worker_status, false, format!("journal error: {error}"), 0);
+                logger::info(format!("Activity tracking stopped with error: {error:#}"));
+                set_status(&worker_status, false, format!("activity error: {error}"), 0);
             }
         });
         Self {
@@ -120,14 +120,14 @@ impl JournalHandle {
     }
 
     pub fn toggle(&self) {
-        let _ = self.tx.send(JournalCommand::Toggle);
+        let _ = self.tx.send(ActivityCommand::Toggle);
     }
 
     pub fn shutdown(&self) {
-        let _ = self.tx.send(JournalCommand::Shutdown);
+        let _ = self.tx.send(ActivityCommand::Shutdown);
     }
 
-    pub fn status(&self) -> JournalStatus {
+    pub fn status(&self) -> ActivityStatus {
         self.status
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -256,15 +256,15 @@ impl Block {
 
 fn run(
     config: AppConfig,
-    commands: Receiver<JournalCommand>,
-    status: &Arc<Mutex<JournalStatus>>,
+    commands: Receiver<ActivityCommand>,
+    status: &Arc<Mutex<ActivityStatus>>,
 ) -> Result<()> {
-    prepare_store(&config.journal_artifacts_dir)?;
+    prepare_store(&config.activity_artifacts_dir)?;
     let _daily_reports = DailyReportHandle::spawn(config.clone());
     let _archives = ArchiveHandle::spawn(config.clone());
     let descriptions = DescriptionQueue::spawn(config.clone(), Arc::clone(status));
-    let mut running = config.journal_enabled;
-    let block_seconds = (config.journal_block_minutes * 60) as i64;
+    let mut running = config.activity_enabled;
+    let block_seconds = (config.activity_block_minutes * 60) as i64;
     let mut block: Option<Block> = None;
     let mut dedup_state = DedupState::default();
     let mut next_capture = now();
@@ -275,48 +275,48 @@ fn run(
         set_status(
             status,
             false,
-            "journal paused: TERA_API_KEY/ASHE_API_KEY is missing".to_string(),
+            "activity tracking paused: TERA_API_KEY/ASHE_API_KEY is missing".to_string(),
             0,
         );
     }
     if running {
         block = recover_pending(&config, block_seconds, &descriptions)?;
         logger::info(format!(
-            "Activity journal started: capture={}s idle_capture={}s learning_capture={}s learning_enrichment={} block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
-            config.journal_capture_interval,
-            config.journal_idle_capture_interval,
+            "Activity tracking started: capture={}s idle_capture={}s learning_capture={}s learning_enrichment={} block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
+            config.activity_capture_interval,
+            config.activity_idle_capture_interval,
             config.learning_capture_interval,
             config.learning_enrichment_enabled,
-            config.journal_block_minutes,
-            config.journal_dedup_threshold,
-            config.journal_idle_threshold_s,
-            config.journal_min_active_seconds,
-            config.journal_artifacts_dir.display()
+            config.activity_block_minutes,
+            config.activity_dedup_threshold,
+            config.activity_idle_threshold_s,
+            config.activity_min_active_seconds,
+            config.activity_artifacts_dir.display()
         ));
     }
 
     loop {
-        match commands.recv_timeout(Duration::from_millis(config.journal_telemetry_interval_ms)) {
-            Ok(JournalCommand::Shutdown) => {
+        match commands.recv_timeout(Duration::from_millis(config.activity_telemetry_interval_ms)) {
+            Ok(ActivityCommand::Shutdown) => {
                 if let Some(current) = block.as_ref() {
-                    save_pending(&config.journal_artifacts_dir, current)?;
+                    save_pending(&config.activity_artifacts_dir, current)?;
                 }
-                set_status(status, false, "activity journal stopped".to_string(), 0);
+                set_status(status, false, "activity tracking stopped".to_string(), 0);
                 return Ok(());
             }
-            Ok(JournalCommand::Toggle) => {
+            Ok(ActivityCommand::Toggle) => {
                 if running {
                     if let Some(current) = block.as_ref() {
-                        save_pending(&config.journal_artifacts_dir, current)?;
+                        save_pending(&config.activity_artifacts_dir, current)?;
                     }
                     dedup_state.clear();
                     running = false;
-                    set_status(status, false, "activity journal paused".to_string(), 0);
+                    set_status(status, false, "activity tracking paused".to_string(), 0);
                 } else if config.tera_api_key.trim().is_empty() {
                     set_status(
                         status,
                         false,
-                        "journal needs TERA_API_KEY/ASHE_API_KEY".to_string(),
+                        "activity tracking needs TERA_API_KEY/ASHE_API_KEY".to_string(),
                         0,
                     );
                 } else {
@@ -325,7 +325,7 @@ fn run(
                     dedup_state.clear();
                     next_capture = now();
                     was_inactive = false;
-                    set_status(status, true, "activity journal resumed".to_string(), 0);
+                    set_status(status, true, "activity tracking resumed".to_string(), 0);
                 }
                 continue;
             }
@@ -343,15 +343,15 @@ fn run(
             .is_some_and(|current| boundary >= current.end)
         {
             let finished = block.take().expect("checked above");
-            save_pending(&config.journal_artifacts_dir, &finished)?;
+            save_pending(&config.activity_artifacts_dir, &finished)?;
             descriptions.enqueue(finished)?;
             dedup_state.clear();
         }
         let current = block.get_or_insert_with(|| Block::new(boundary, block_seconds));
-        let sample = activity::sample(stamp);
+        let sample = activity_telemetry::sample(stamp);
         current.samples.push(sample.clone());
 
-        let inactive = sample.locked || sample.idle_s >= config.journal_idle_threshold_s;
+        let inactive = sample.locked || sample.idle_s >= config.activity_idle_threshold_s;
         if was_inactive && !inactive {
             // Do not make the user wait for a stale idle/locked schedule after input resumes.
             next_capture = stamp;
@@ -360,9 +360,9 @@ fn run(
 
         let Some(capture_interval) = capture_interval_for_sample(
             &sample,
-            config.journal_idle_threshold_s,
-            config.journal_capture_interval,
-            config.journal_idle_capture_interval,
+            config.activity_idle_threshold_s,
+            config.activity_capture_interval,
+            config.activity_idle_capture_interval,
             config.learning_enrichment_enabled,
             config.learning_capture_interval,
         ) else {
@@ -371,7 +371,7 @@ fn run(
                 + (if config.learning_enrichment_enabled {
                     config.learning_capture_interval
                 } else {
-                    config.journal_capture_interval
+                    config.activity_capture_interval
                 }) as i64;
             continue;
         };
@@ -381,7 +381,7 @@ fn run(
             if !denied(&config, &sample) {
                 match capture(&config, current, &mut dedup_state, &sample) {
                     Ok(()) => {
-                        save_pending(&config.journal_artifacts_dir, current)?;
+                        save_pending(&config.activity_artifacts_dir, current)?;
                         set_status(
                             status,
                             true,
@@ -390,7 +390,7 @@ fn run(
                         );
                     }
                     Err(error) => {
-                        logger::info(format!("Journal capture failed: {error:#}"));
+                        logger::info(format!("Activity capture failed: {error:#}"));
                         set_status(
                             status,
                             true,
@@ -411,36 +411,36 @@ fn capture(
     dedup_state: &mut DedupState,
     sample: &ActivitySample,
 ) -> Result<()> {
-    let frame = screen_capture::capture_screen(config.journal_monitor == 0)?;
+    let frame = screen_capture::capture_screen(config.activity_monitor == 0)?;
     let stamp = now();
     let delta = dedup_state.observe(
         frame.fingerprint,
         stamp,
-        config.journal_dedup_threshold,
-        config.journal_max_frame_gap_s,
+        config.activity_dedup_threshold,
+        config.activity_max_frame_gap_s,
     );
-    let directory = day_dir(&config.journal_artifacts_dir, &block.day).join("frames");
+    let directory = day_dir(&config.activity_artifacts_dir, &block.day).join("frames");
     fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}_m{}.webp", clock(stamp, "%H%M%S"), 1));
-    fs::write(&path, frame.webp).context("failed to save journal frame")?;
+    fs::write(&path, frame.webp).context("failed to save activity frame")?;
     block.frames.push(FrameRecord {
         path: path.display().to_string(),
         ts: stamp,
-        monitor: config.journal_monitor,
+        monitor: config.activity_monitor,
         width: frame.width,
         height: frame.height,
         delta,
         window: sample.label(),
         sent_to_base: false,
         sent_to_learning: false,
-        input_idle: sample.idle_s >= config.journal_idle_threshold_s,
+        input_idle: sample.idle_s >= config.activity_idle_threshold_s,
     });
     block.captured += 1;
     Ok(())
 }
 
 fn denied(config: &AppConfig, sample: &ActivitySample) -> bool {
-    matches_denylist(&config.journal_denylist, sample)
+    matches_denylist(&config.activity_denylist, sample)
 }
 
 fn matches_denylist(denylist: &[String], sample: &ActivitySample) -> bool {
@@ -478,7 +478,7 @@ fn should_suppress_description(
     active_seconds < min_active_seconds && distinct_frames <= 1
 }
 
-fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<JournalStatus>>) {
+fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<ActivityStatus>>) {
     let metrics = block_metrics(config, &block);
     if block.base_narrative.is_none() && block.frames.is_empty() {
         let outcome = terminal_outcome(&block);
@@ -488,19 +488,19 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
             "no captured activity"
         };
         let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
-        let _ = clear_pending(&config.journal_artifacts_dir, &block);
+        let _ = clear_pending(&config.activity_artifacts_dir, &block);
         return;
     }
     if block.base_narrative.is_none() {
         let distinct_frames = block
             .frames
             .iter()
-            .filter(|frame| frame.delta >= config.journal_dedup_threshold)
+            .filter(|frame| frame.delta >= config.activity_dedup_threshold)
             .count();
         if should_suppress_description(
             metrics.active_seconds,
             distinct_frames,
-            config.journal_min_active_seconds,
+            config.activity_min_active_seconds,
         ) {
             let outcome = terminal_outcome(&block);
             let reason = if outcome == "locked" {
@@ -509,7 +509,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
                 "idle or unchanged"
             };
             let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
-            let _ = clear_pending(&config.journal_artifacts_dir, &block);
+            let _ = clear_pending(&config.activity_artifacts_dir, &block);
             return;
         }
     }
@@ -522,7 +522,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("failed to build journal runtime")
+        .context("failed to build activity runtime")
     {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -544,7 +544,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
         let (paths, images) = selected_paths;
         if images.is_empty() {
             logger::info(format!(
-                "No readable base frames for journal block {}",
+                "No readable base frames for activity block {}",
                 block.id()
             ));
             return;
@@ -570,7 +570,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
             Ok(narrative) => {
                 block.base_frames_sent = paths.len();
                 block.base_narrative = Some(narrative);
-                if let Err(error) = save_pending(&config.journal_artifacts_dir, &block) {
+                if let Err(error) = save_pending(&config.activity_artifacts_dir, &block) {
                     logger::info(format!(
                         "Persisting base description of {} failed: {error:#}",
                         block.id()
@@ -593,14 +593,14 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
                     ));
                     return;
                 }
-                let _ = clear_pending(&config.journal_artifacts_dir, &block);
+                let _ = clear_pending(&config.activity_artifacts_dir, &block);
                 logger::info(format!(
                     "Base description of {} produced invalid structured output",
                     block.id()
                 ));
                 set_work_status(
                     status,
-                    "journal block had invalid model output".to_string(),
+                    "activity block had invalid model output".to_string(),
                     0,
                 );
                 return;
@@ -725,7 +725,7 @@ fn finish_description(
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
     learning_artifact: Option<LearningArtifact>,
-    status: &Arc<Mutex<JournalStatus>>,
+    status: &Arc<Mutex<ActivityStatus>>,
 ) {
     let title = narrative.title.clone();
     if let Err(error) = write_report(
@@ -735,24 +735,24 @@ fn finish_description(
         metrics,
         learning_artifact.as_ref(),
     ) {
-        logger::info(format!("Writing journal block failed: {error:#}"));
+        logger::info(format!("Writing activity block failed: {error:#}"));
         return;
     }
-    let _ = clear_pending(&config.journal_artifacts_dir, block);
-    set_work_status(status, format!("journaled: {title}"), 0);
+    let _ = clear_pending(&config.activity_artifacts_dir, block);
+    set_work_status(status, format!("recorded: {title}"), 0);
 }
 
 fn retry_description(
     config: &AppConfig,
     block: &mut Block,
-    status: &Arc<Mutex<JournalStatus>>,
+    status: &Arc<Mutex<ActivityStatus>>,
     stage: &str,
     _error: &anyhow::Error,
 ) {
     block.attempts += 1;
-    let _ = save_pending(&config.journal_artifacts_dir, block);
+    let _ = save_pending(&config.activity_artifacts_dir, block);
     logger::info(format!(
-        "Journal description stage={stage} block={} attempt={} failed; retained for retry",
+        "Activity description stage={stage} block={} attempt={} failed; retained for retry",
         block.id(),
         block.attempts
     ));
@@ -780,8 +780,8 @@ fn base_description_context(
         duration_budget_s,
         block.captured,
         image_count,
-        config.journal_capture_interval,
-        config.journal_idle_capture_interval,
+        config.activity_capture_interval,
+        config.activity_idle_capture_interval,
         if metrics.totals.is_empty() {
             "unavailable"
         } else {
@@ -861,15 +861,15 @@ fn readable_images(frames: Vec<&FrameRecord>) -> (HashSet<String>, Vec<(String, 
 fn select_base_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a FrameRecord> {
     let candidates = ordinary_cadence_candidates(
         frames,
-        config.journal_capture_interval,
-        config.journal_idle_capture_interval,
+        config.activity_capture_interval,
+        config.activity_idle_capture_interval,
     );
     select_frame_candidates(
         candidates,
-        config.journal_max_frame_gap_s,
-        config.journal_dedup_threshold,
-        config.journal_max_frames_per_call,
-        config.journal_max_payload_mb,
+        config.activity_max_frame_gap_s,
+        config.activity_dedup_threshold,
+        config.activity_max_frames_per_call,
+        config.activity_max_payload_mb,
     )
 }
 
@@ -911,9 +911,9 @@ fn select_learning_frames<'a>(
     select_frame_candidates(
         frames.iter().collect(),
         config.learning_max_frame_gap_s,
-        config.journal_dedup_threshold,
-        config.journal_max_frames_per_call,
-        config.journal_max_payload_mb,
+        config.activity_dedup_threshold,
+        config.activity_max_frames_per_call,
+        config.activity_max_payload_mb,
     )
 }
 
@@ -990,7 +990,7 @@ fn recover_pending(
     block_seconds: i64,
     descriptions: &DescriptionQueue,
 ) -> Result<Option<Block>> {
-    let pending = config.journal_artifacts_dir.join("pending");
+    let pending = config.activity_artifacts_dir.join("pending");
     let stamp = now();
     let boundary = stamp - stamp.rem_euclid(block_seconds);
     let mut current = None;
@@ -1011,10 +1011,10 @@ fn recover_pending(
     for (path, block) in recovered {
         if block.start == boundary {
             current = Some(block);
-        } else if !report_path(&config.journal_artifacts_dir, &block).is_file() {
+        } else if !report_path(&config.activity_artifacts_dir, &block).is_file() {
             descriptions.enqueue(block)?;
         } else {
-            let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+            let directory = day_dir(&config.activity_artifacts_dir, &block.day);
             rebuild_journal(&directory)?;
             let _ = fs::remove_file(path);
         }
@@ -1089,7 +1089,7 @@ fn write_report(
     learning_artifact: Option<&LearningArtifact>,
 ) -> Result<()> {
     let _write_guard = crate::artifact_store::lock();
-    let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+    let directory = day_dir(&config.activity_artifacts_dir, &block.day);
     anyhow::ensure!(
         !directory
             .join(ashe_archive_crypto::ARCHIVE_FILENAME)
@@ -1145,12 +1145,12 @@ fn write_report(
     };
     if let Some(learning) = learning_artifact {
         write_learning_artifact(
-            &learning_report_path(&config.journal_artifacts_dir, block),
+            &learning_report_path(&config.activity_artifacts_dir, block),
             learning,
         )?;
     }
     write_block_artifact(
-        &report_path(&config.journal_artifacts_dir, block),
+        &report_path(&config.activity_artifacts_dir, block),
         &artifact,
     )?;
     rebuild_journal(&directory)?;
@@ -1209,7 +1209,7 @@ fn write_terminal_block(
     metrics: &BlockMetrics,
 ) -> Result<()> {
     let _write_guard = crate::artifact_store::lock();
-    let directory = day_dir(&config.journal_artifacts_dir, &block.day);
+    let directory = day_dir(&config.activity_artifacts_dir, &block.day);
     anyhow::ensure!(
         !directory
             .join(ashe_archive_crypto::ARCHIVE_FILENAME)
@@ -1217,7 +1217,7 @@ fn write_terminal_block(
         "refusing to write a terminal block into a sealed day"
     );
     fs::create_dir_all(directory.join("blocks"))?;
-    let path = report_path(&config.journal_artifacts_dir, block);
+    let path = report_path(&config.activity_artifacts_dir, block);
     let artifact = BlockArtifact {
         schema_version: BLOCK_SCHEMA_VERSION,
         block: block.id(),
@@ -1255,17 +1255,18 @@ fn write_learning_artifact(path: &Path, artifact: &LearningArtifact) -> Result<(
 }
 
 fn block_metrics(config: &AppConfig, block: &Block) -> BlockMetrics {
-    let interval = config.journal_telemetry_interval_ms as f64 / 1000.0;
-    let timeline = activity::timeline(&block.samples, interval, config.journal_idle_threshold_s);
-    let totals = activity::app_totals(&block.samples, interval);
-    let app_seconds = activity::app_total_values(&block.samples, interval)
+    let interval = config.activity_telemetry_interval_ms as f64 / 1000.0;
+    let timeline =
+        activity_telemetry::timeline(&block.samples, interval, config.activity_idle_threshold_s);
+    let totals = activity_telemetry::app_totals(&block.samples, interval);
+    let app_seconds = activity_telemetry::app_total_values(&block.samples, interval)
         .into_iter()
         .map(|(name, seconds)| (name, seconds.round().max(0.0) as u64))
         .collect();
     let active_samples = block
         .samples
         .iter()
-        .filter(|sample| !sample.locked && sample.idle_s < config.journal_idle_threshold_s)
+        .filter(|sample| !sample.locked && sample.idle_s < config.activity_idle_threshold_s)
         .count() as f64;
     let total_seconds = block.samples.len() as f64 * interval;
     let active_seconds = (active_samples * interval).round().max(0.0) as u64;
@@ -1289,19 +1290,20 @@ fn terminal_outcome(block: &Block) -> &'static str {
 async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String> {
     const SUMMARY_BATCH_SIZE: usize = 24;
 
-    let root = &config.journal_artifacts_dir;
+    let root = &config.activity_artifacts_dir;
     let reports = load_successful_reports(root, before)?;
     let mut state = read_context_state(root);
     let unsummarized = reports
         .iter()
         .filter(|report| report.id.as_str() > state.summary_through.as_str())
         .collect::<Vec<_>>();
-    let detailed_offset = context_detailed_offset(unsummarized.len(), config.journal_context_blocs);
+    let detailed_offset =
+        context_detailed_offset(unsummarized.len(), config.activity_context_blocks);
     let aged = &unsummarized[..detailed_offset];
     let detailed = &unsummarized[detailed_offset..];
 
     let stored_summary = read_rolling_summary(root);
-    let mut summary = truncate_chars(&stored_summary, config.journal_context_summary_max_chars);
+    let mut summary = truncate_chars(&stored_summary, config.activity_context_summary_max_chars);
     if summary != stored_summary {
         write_rolling_summary(root, &summary, &state.summary_through)?;
     }
@@ -1320,7 +1322,7 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
         summary = llm_client::refresh_activity_summary(
             config.clone(),
             input,
-            config.journal_context_summary_max_chars,
+            config.activity_context_summary_max_chars,
         )
         .await?;
         state.summary_through = batch
@@ -1353,8 +1355,8 @@ async fn build_earlier_context(config: &AppConfig, before: i64) -> Result<String
     ))
 }
 
-fn context_detailed_offset(report_count: usize, context_blocs: usize) -> usize {
-    report_count.saturating_sub(context_blocs)
+fn context_detailed_offset(report_count: usize, context_blocks: usize) -> usize {
+    report_count.saturating_sub(context_blocks)
 }
 
 fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>> {
@@ -1471,14 +1473,14 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 fn purge_expired_frames(config: &AppConfig) -> Result<()> {
-    let pending_paths = fs::read_dir(config.journal_artifacts_dir.join("pending"))?
+    let pending_paths = fs::read_dir(config.activity_artifacts_dir.join("pending"))?
         .flatten()
         .filter_map(|entry| fs::read(entry.path()).ok())
         .filter_map(|bytes| serde_json::from_slice::<Block>(&bytes).ok())
         .flat_map(|block| block.frames.into_iter().map(|frame| frame.path))
         .collect::<HashSet<_>>();
-    let retention = Duration::from_secs(config.journal_frame_retention_minutes * 60);
-    for day in fs::read_dir(&config.journal_artifacts_dir)?.flatten() {
+    let retention = Duration::from_secs(config.activity_frame_retention_minutes * 60);
+    for day in fs::read_dir(&config.activity_artifacts_dir)?.flatten() {
         let frames = day.path().join("frames");
         let Ok(entries) = fs::read_dir(frames) else {
             continue;
@@ -1505,19 +1507,19 @@ fn purge_expired_frames(config: &AppConfig) -> Result<()> {
 }
 
 fn set_status(
-    status: &Arc<Mutex<JournalStatus>>,
+    status: &Arc<Mutex<ActivityStatus>>,
     running: bool,
     summary: String,
     current_frames: usize,
 ) {
-    *status.lock().unwrap_or_else(|error| error.into_inner()) = JournalStatus {
+    *status.lock().unwrap_or_else(|error| error.into_inner()) = ActivityStatus {
         running,
         summary,
         current_frames,
     };
 }
 
-fn set_work_status(status: &Arc<Mutex<JournalStatus>>, summary: String, current_frames: usize) {
+fn set_work_status(status: &Arc<Mutex<ActivityStatus>>, summary: String, current_frames: usize) {
     let mut current = status.lock().unwrap_or_else(|error| error.into_inner());
     current.summary = summary;
     current.current_frames = current_frames;
@@ -1758,7 +1760,7 @@ mod tests {
     fn activity_and_learning_are_written_to_separate_artifact_directories() {
         let root = tempfile_directory("separate-learning");
         let mut config = AppConfig::load();
-        config.journal_artifacts_dir = root.clone();
+        config.activity_artifacts_dir = root.clone();
         config.tera_model = "test-model".to_string();
         let block = Block::new(0, 600);
         let base = ActivityNarrative {

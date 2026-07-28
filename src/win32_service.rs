@@ -45,7 +45,7 @@ const MENU_OPEN_LOG: usize = 3003;
 const MENU_COPY_LOG_PATH: usize = 3004;
 const MENU_ABOUT: usize = 3005;
 const MENU_QUIT: usize = 3006;
-const MENU_TOGGLE_JOURNAL: usize = 3007;
+const MENU_TOGGLE_ACTIVITY: usize = 3007;
 const MENU_OPEN_ARTIFACTS: usize = 3008;
 const MENU_OPEN_JOURNAL: usize = 3009;
 const ICON_FILE_NAME: &str = "ashe-worker.ico";
@@ -65,7 +65,7 @@ pub enum Win32Event {
     ReloadConfigRequested,
     OpenLogRequested,
     CopyLogPathRequested,
-    ToggleJournalRequested,
+    ToggleActivityRequested,
     OpenArtifactsRequested,
     OpenJournalRequested,
     AboutRequested,
@@ -79,7 +79,7 @@ pub enum Win32Command {
     SetActive(bool),
     SetFollowCursor(bool),
     SetTooltip(String),
-    SetJournalStatus {
+    SetActivityStatus {
         running: bool,
         status: String,
     },
@@ -111,8 +111,8 @@ struct ServiceState {
     revert_sentence_hotkey_registered: bool,
     clear_transcript_hotkey_registered: bool,
     submit_hotkey_registered: bool,
-    journal_running: bool,
-    journal_status: String,
+    activity_running: bool,
+    activity_status: String,
     last_artifacts_open: Option<Instant>,
 }
 
@@ -174,8 +174,8 @@ unsafe fn run_message_loop(
         revert_sentence_hotkey_registered: false,
         clear_transcript_hotkey_registered: false,
         submit_hotkey_registered: false,
-        journal_running: false,
-        journal_status: "activity journal starting".to_string(),
+        activity_running: false,
+        activity_status: "activity tracking starting".to_string(),
         last_artifacts_open: None,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -298,8 +298,8 @@ unsafe extern "system" fn window_proc(
                     show_tray_menu(
                         hwnd,
                         state.active,
-                        state.journal_running,
-                        &state.journal_status,
+                        state.activity_running,
+                        &state.activity_status,
                     );
                 }
                 return LRESULT(0);
@@ -329,8 +329,8 @@ unsafe extern "system" fn window_proc(
                         let _ = state.event_tx.send(Win32Event::CopyLogPathRequested);
                         return LRESULT(0);
                     }
-                    MENU_TOGGLE_JOURNAL => {
-                        let _ = state.event_tx.send(Win32Event::ToggleJournalRequested);
+                    MENU_TOGGLE_ACTIVITY => {
+                        let _ = state.event_tx.send(Win32Event::ToggleActivityRequested);
                         return LRESULT(0);
                     }
                     MENU_OPEN_ARTIFACTS => {
@@ -387,9 +387,9 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 state.follow_cursor = follow;
             }
             Win32Command::SetTooltip(tooltip) => set_tray_tooltip(hwnd, &tooltip),
-            Win32Command::SetJournalStatus { running, status } => {
-                state.journal_running = running;
-                state.journal_status = status;
+            Win32Command::SetActivityStatus { running, status } => {
+                state.activity_running = running;
+                state.activity_status = status;
             }
             Win32Command::ShowMessageBox { title, text } => message_box(hwnd, &text, &title),
             Win32Command::OpenLog(path) => {
@@ -797,7 +797,7 @@ fn tray_data(hwnd: HWND, tooltip: &str) -> NOTIFYICONDATAW {
     data
 }
 
-fn show_tray_menu(hwnd: HWND, active: bool, journal_running: bool, journal_status: &str) {
+fn show_tray_menu(hwnd: HWND, active: bool, activity_running: bool, activity_status: &str) {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
         let label = if active {
@@ -807,18 +807,18 @@ fn show_tray_menu(hwnd: HWND, active: bool, journal_running: bool, journal_statu
         };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, pcwstr(&wide(label)));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let journal_label = if journal_running {
-            "Pause activity journal"
+        let activity_label = if activity_running {
+            "Pause activity tracking"
         } else {
-            "Resume activity journal"
+            "Resume activity tracking"
         };
         let _ = AppendMenuW(
             menu,
             MF_STRING,
-            MENU_TOGGLE_JOURNAL,
-            pcwstr(&wide(journal_label)),
+            MENU_TOGGLE_ACTIVITY,
+            pcwstr(&wide(activity_label)),
         );
-        let status = format!("Journal: {journal_status}");
+        let status = format!("Activity: {activity_status}");
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&wide(&status)));
         let _ = AppendMenuW(
             menu,
