@@ -50,7 +50,6 @@ struct NamespaceStats {
     estimated_duration_s: u64,
     subjects: usize,
     unattended_subjects: usize,
-    attention_unknown_subjects: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -243,23 +242,17 @@ fn render_daily_report(source: &DailySource) -> String {
                 output.push_str("- Subjects:\n");
                 for subject in &block.subjects {
                     let namespace = namespace_path(&subject.namespaces);
-                    let attention = match subject.unattended {
-                        Some(true) => ", unattended",
-                        Some(false) => "",
-                        None => ", attention unknown",
+                    let attention = if subject.unattended {
+                        ", unattended"
+                    } else {
+                        ""
                     };
-                    let depth = subject
-                        .learning
-                        .as_ref()
-                        .map(|learning| format!(", depth `{}`", enum_kebab(&learning.depth)))
-                        .unwrap_or_default();
                     output.push_str(&format!(
-                        "  - `{}` — {} ({}{}{})\n",
+                        "  - `{}` — {} ({}{})\n",
                         markdown_code(&namespace),
                         markdown_inline(&subject.subject),
                         human_duration(subject.estimated_duration_s),
                         attention,
-                        depth,
                     ));
                 }
             }
@@ -314,16 +307,15 @@ fn render_daily_report(source: &DailySource) -> String {
         output.push_str("No subject namespaces.\n");
     } else {
         output.push_str(
-            "| Namespace | Estimated time | Subjects | Unattended | Attention unknown |\n| --- | ---: | ---: | ---: | ---: |\n",
+            "| Namespace | Estimated time | Subjects | Unattended |\n| --- | ---: | ---: | ---: |\n",
         );
         for (namespace, stats) in &source.namespace_stats {
             output.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} |\n",
+                "| `{}` | {} | {} | {} |\n",
                 markdown_code(namespace),
                 human_duration(stats.estimated_duration_s),
                 stats.subjects,
                 stats.unattended_subjects,
-                stats.attention_unknown_subjects,
             ));
         }
     }
@@ -359,7 +351,7 @@ fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<BlockDocumentIn
         let Ok(artifact) = serde_json::from_slice::<BlockArtifact>(&bytes) else {
             continue;
         };
-        if !artifact.is_supported() {
+        if !artifact.has_current_schema() {
             continue;
         }
         reports.insert(artifact.block.clone(), artifact.document_input());
@@ -488,16 +480,13 @@ fn add_namespace_stat(
             estimated_duration_s: 0,
             subjects: 0,
             unattended_subjects: 0,
-            attention_unknown_subjects: 0,
         });
     stats.estimated_duration_s = stats
         .estimated_duration_s
         .saturating_add(subject.estimated_duration_s);
     stats.subjects += 1;
-    match subject.unattended {
-        Some(true) => stats.unattended_subjects += 1,
-        Some(false) => {}
-        None => stats.attention_unknown_subjects += 1,
+    if subject.unattended {
+        stats.unattended_subjects += 1;
     }
 }
 
@@ -507,13 +496,6 @@ fn namespace_path(namespaces: &[String]) -> String {
     } else {
         namespaces.join(" / ")
     }
-}
-
-fn enum_kebab<T: Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn human_duration(seconds: u64) -> String {
@@ -640,7 +622,6 @@ mod tests {
             title: Some("Software development: implemented learning records".to_string()),
             report: Some("This prose must not drive the daily report.".to_string()),
             subjects,
-            learning_enrichment: None,
             reason: None,
             error: None,
         }
@@ -656,8 +637,7 @@ mod tests {
             ],
             subject: "Implemented the change.".to_string(),
             estimated_duration_s: 300,
-            unattended: Some(true),
-            learning: None,
+            unattended: true,
         }])];
         let stats = namespace_totals(&blocks);
         assert_eq!(stats.len(), 3);
@@ -670,19 +650,6 @@ mod tests {
             stats["software-development / agentic-coding / ashe-worker"].subjects,
             1
         );
-    }
-
-    #[test]
-    fn legacy_subjects_are_counted_with_unknown_attention() {
-        let blocks = vec![block(vec![ActivitySubject {
-            namespaces: vec!["learning".to_string()],
-            subject: "Read material.".to_string(),
-            estimated_duration_s: 90,
-            unattended: None,
-            learning: None,
-        }])];
-        let stats = namespace_totals(&blocks);
-        assert_eq!(stats["learning"].attention_unknown_subjects, 1);
     }
 
     #[test]
@@ -717,8 +684,7 @@ mod tests {
             namespaces: vec!["learning".to_string(), "lookup".to_string()],
             subject: "Looked up a Rust term.".to_string(),
             estimated_duration_s: 120,
-            unattended: Some(false),
-            learning: None,
+            unattended: false,
         }]);
         let mut earlier = block(vec![]);
         earlier.block = "2026-07-28T1100".to_string();
@@ -739,7 +705,6 @@ mod tests {
                     estimated_duration_s: 120,
                     subjects: 1,
                     unattended_subjects: 0,
-                    attention_unknown_subjects: 0,
                 },
             )]),
             coverage: DailyCoverage {

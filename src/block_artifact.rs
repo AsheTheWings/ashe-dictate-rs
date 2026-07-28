@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const LEGACY_BLOCK_SCHEMA_VERSION: u32 = 1;
 pub const BLOCK_SCHEMA_VERSION: u32 = 2;
 pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
@@ -58,10 +57,7 @@ pub struct ActivitySubject {
     pub namespaces: Vec<String>,
     pub subject: String,
     pub estimated_duration_s: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unattended: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub learning: Option<LearningRecord>,
+    pub unattended: bool,
 }
 
 impl ActivitySubject {
@@ -73,6 +69,7 @@ impl ActivitySubject {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivityNarrative {
     pub title: String,
     pub report: String,
@@ -126,9 +123,6 @@ impl ActivityNarrative {
         }
         for subject in &self.subjects {
             validate_common_subject(subject)?;
-            if subject.learning.is_some() {
-                return Err("base subjects must not contain learning metadata".to_string());
-            }
         }
         Ok(())
     }
@@ -157,15 +151,14 @@ impl From<GeneratedActivitySubject> for ActivitySubject {
             namespaces: subject.namespaces,
             subject: subject.subject,
             estimated_duration_s: subject.estimated_duration_s,
-            unattended: Some(subject.unattended),
-            learning: None,
+            unattended: subject.unattended,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct LearningNarrative {
-    pub learning_subjects: Vec<ActivitySubject>,
+    pub learning_subjects: Vec<LearningSubject>,
 }
 
 impl LearningNarrative {
@@ -180,15 +173,16 @@ impl LearningNarrative {
         let learning_subjects = generated
             .learning_subjects
             .into_iter()
-            .map(ActivitySubject::from)
+            .map(LearningSubject::from)
             .collect::<Vec<_>>();
         for subject in &learning_subjects {
-            validate_common_subject(subject)?;
+            validate_subject_fields(
+                &subject.namespaces,
+                &subject.subject,
+                subject.estimated_duration_s,
+            )?;
             if !subject.is_learning() {
                 return Err("learning subject is not rooted at learning".to_string());
-            }
-            if subject.learning.is_none() {
-                return Err("learning subject is missing learning metadata".to_string());
             }
         }
         Ok(Self { learning_subjects })
@@ -225,30 +219,57 @@ struct GeneratedLearningSubject {
     learning: LearningRecord,
 }
 
-impl From<GeneratedLearningSubject> for ActivitySubject {
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningSubject {
+    pub namespaces: Vec<String>,
+    pub subject: String,
+    pub estimated_duration_s: u64,
+    pub unattended: bool,
+    pub learning: LearningRecord,
+}
+
+impl LearningSubject {
+    pub fn is_learning(&self) -> bool {
+        self.namespaces
+            .first()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("learning"))
+    }
+}
+
+impl From<GeneratedLearningSubject> for LearningSubject {
     fn from(subject: GeneratedLearningSubject) -> Self {
         Self {
             namespaces: subject.namespaces,
             subject: subject.subject,
             estimated_duration_s: subject.estimated_duration_s,
-            unattended: Some(subject.unattended),
-            learning: Some(subject.learning),
+            unattended: subject.unattended,
+            learning: subject.learning,
         }
     }
 }
 
 fn validate_common_subject(subject: &ActivitySubject) -> Result<(), String> {
-    if !(1..=4).contains(&subject.namespaces.len()) {
+    validate_subject_fields(
+        &subject.namespaces,
+        &subject.subject,
+        subject.estimated_duration_s,
+    )
+}
+
+fn validate_subject_fields(
+    namespaces: &[String],
+    subject: &str,
+    estimated_duration_s: u64,
+) -> Result<(), String> {
+    if !(1..=4).contains(&namespaces.len()) {
         return Err("subject namespaces must contain between 1 and 4 entries".to_string());
     }
-    if subject.subject.trim().is_empty() {
+    if subject.trim().is_empty() {
         return Err("subject statement is empty".to_string());
     }
-    if subject.estimated_duration_s == 0 {
+    if estimated_duration_s == 0 {
         return Err("subject estimated_duration_s must be positive".to_string());
-    }
-    if subject.unattended.is_none() {
-        return Err("subject unattended judgment is missing".to_string());
     }
     Ok(())
 }
@@ -279,15 +300,6 @@ pub enum LearningEnrichmentStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LearningEnrichment {
-    pub status: LearningEnrichmentStatus,
-    pub frames_sent: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct LearningArtifact {
     pub schema_version: u32,
     pub block: String,
@@ -297,7 +309,7 @@ pub struct LearningArtifact {
     pub frames_sent: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    pub subjects: Vec<ActivitySubject>,
+    pub subjects: Vec<LearningSubject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -315,12 +327,7 @@ pub struct BlockArtifact {
     pub app_seconds: BTreeMap<String, u64>,
     pub timeline: Vec<String>,
     pub frames_captured: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frames_sent: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_frames_sent: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub learning_frames_sent: Option<usize>,
+    pub base_frames_sent: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,10 +336,7 @@ pub struct BlockArtifact {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
-    #[serde(default)]
     pub subjects: Vec<ActivitySubject>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub learning_enrichment: Option<LearningEnrichment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,19 +359,14 @@ pub struct BlockDocumentInput {
     pub report: Option<String>,
     pub subjects: Vec<ActivitySubject>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub learning_enrichment: Option<LearningEnrichment>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl BlockArtifact {
-    pub fn is_supported(&self) -> bool {
-        matches!(
-            self.schema_version,
-            LEGACY_BLOCK_SCHEMA_VERSION | BLOCK_SCHEMA_VERSION
-        )
+    pub fn has_current_schema(&self) -> bool {
+        self.schema_version == BLOCK_SCHEMA_VERSION
     }
 
     pub fn document_input(&self) -> BlockDocumentInput {
@@ -383,7 +382,6 @@ impl BlockArtifact {
             title: self.title.clone(),
             report: self.report.clone(),
             subjects: self.subjects.clone(),
-            learning_enrichment: self.learning_enrichment.clone(),
             reason: self.reason.clone(),
             error: self.error.clone(),
         }
@@ -441,7 +439,7 @@ mod tests {
             }]
         }"#;
         let narrative = LearningNarrative::parse(text).unwrap();
-        let learning = narrative.learning_subjects[0].learning.as_ref().unwrap();
+        let learning = &narrative.learning_subjects[0].learning;
         assert_eq!(learning.depth, LearningDepth::FocusedExplanation);
         assert_eq!(learning.sources[0].kind, LearningSourceKind::Documentation);
         assert!(LearningNarrative::parse(&text.replace("learning\",", "education\",")).is_err());
@@ -455,8 +453,7 @@ mod tests {
             namespaces: vec![" Learning ".to_string(), "lookup".to_string()],
             subject: "Looked up a term.".to_string(),
             estimated_duration_s: 60,
-            unattended: Some(false),
-            learning: None,
+            unattended: false,
         };
         assert!(subject.is_learning());
         assert_eq!(subject.namespaces[0], " Learning ");
@@ -499,48 +496,49 @@ mod tests {
         assert_eq!(base.title, "Mixed block");
         assert_eq!(base.report, "Worked and learned.");
         assert_eq!(base.subjects.len(), 2);
-        assert!(
-            base.subjects
-                .iter()
-                .all(|subject| subject.learning.is_none())
-        );
         assert_eq!(artifact.subjects.len(), 2);
         assert!(
             artifact
                 .subjects
                 .iter()
-                .all(|subject| subject.is_learning() && subject.learning.is_some())
+                .all(super::LearningSubject::is_learning)
         );
     }
 
     #[test]
-    fn stored_version_one_and_two_artifacts_are_supported() {
-        let version_one = r#"{
-            "schema_version":1,"block":"2026-07-28T1200","window_start":1,"window_end":2,
-            "outcome":"described","active_seconds":1,"idle_seconds":0,"app_seconds":{},
-            "timeline":[],"frames_captured":1,"frames_sent":1,"subjects":[
-                {"namespaces":["work"],"subject":"Worked.","estimated_duration_s":1}
-            ]
-        }"#;
-        let old: BlockArtifact = serde_json::from_str(version_one).unwrap();
-        assert!(old.is_supported());
-        assert_eq!(old.frames_sent, Some(1));
-        assert_eq!(old.subjects[0].unattended, None);
+    fn only_the_current_strict_block_schema_is_accepted() {
+        let current = format!(
+            r#"{{
+                "schema_version":{BLOCK_SCHEMA_VERSION},"block":"2026-07-28T1200",
+                "window_start":1,"window_end":2,"outcome":"described",
+                "active_seconds":1,"idle_seconds":0,"app_seconds":{{}},"timeline":[],
+                "frames_captured":1,"base_frames_sent":1,"subjects":[
+                    {{"namespaces":["software-development"],"subject":"Worked.",
+                    "estimated_duration_s":1,"unattended":false}}
+                ]
+            }}"#
+        );
+        let artifact: BlockArtifact = serde_json::from_str(&current).unwrap();
+        assert!(artifact.has_current_schema());
+        assert_eq!(artifact.base_frames_sent, 1);
 
-        let version_two = version_one
-            .replace(
-                "\"schema_version\":1",
+        assert!(
+            serde_json::from_str::<BlockArtifact>(&current.replace(
                 &format!("\"schema_version\":{BLOCK_SCHEMA_VERSION}"),
+                "\"schema_version\":1"
+            ))
+            .is_ok_and(|artifact| !artifact.has_current_schema())
+        );
+        assert!(
+            serde_json::from_str::<BlockArtifact>(
+                &current.replace("\"base_frames_sent\":1", "\"frames_sent\":1")
             )
-            .replace("\"frames_sent\":1,", "\"base_frames_sent\":1,")
-            .replace(
-                "\"estimated_duration_s\":1}",
-                "\"estimated_duration_s\":1,\"unattended\":false}",
-            );
-        let new: BlockArtifact = serde_json::from_str(&version_two).unwrap();
-        assert!(new.is_supported());
-        assert_eq!(new.base_frames_sent, Some(1));
-        assert_eq!(new.subjects[0].unattended, Some(false));
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<BlockArtifact>(&current.replace(",\"unattended\":false", ""))
+                .is_err()
+        );
     }
 
     #[test]

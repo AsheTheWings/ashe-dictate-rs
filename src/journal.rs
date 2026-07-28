@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const PENDING_BLOCK_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug)]
 pub struct JournalStatus {
     pub running: bool,
@@ -144,6 +146,7 @@ impl JournalHandle {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct FrameRecord {
     path: String,
     ts: i64,
@@ -152,29 +155,23 @@ struct FrameRecord {
     height: u32,
     delta: f32,
     window: String,
-    #[serde(default)]
-    sent: bool,
-    #[serde(default)]
     sent_to_base: bool,
-    #[serde(default)]
     sent_to_learning: bool,
-    #[serde(default)]
     input_idle: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Block {
+    schema_version: u32,
     start: i64,
     end: i64,
     day: String,
     frames: Vec<FrameRecord>,
     samples: Vec<ActivitySample>,
     captured: usize,
-    #[serde(default)]
     attempts: usize,
-    #[serde(default)]
     base_narrative: Option<ActivityNarrative>,
-    #[serde(default)]
     base_frames_sent: usize,
 }
 
@@ -227,6 +224,7 @@ impl DedupState {
 impl Block {
     fn new(start: i64, seconds: i64) -> Self {
         Self {
+            schema_version: PENDING_BLOCK_SCHEMA_VERSION,
             start,
             end: start + seconds,
             day: day_key(start),
@@ -433,7 +431,6 @@ fn capture(
         height: frame.height,
         delta,
         window: sample.label(),
-        sent: false,
         sent_to_base: false,
         sent_to_learning: false,
         input_idle: sample.idle_s >= config.journal_idle_threshold_s,
@@ -1004,6 +1001,9 @@ fn recover_pending(
         .filter_map(|path| {
             let bytes = fs::read(&path).ok()?;
             let block = serde_json::from_slice::<Block>(&bytes).ok()?;
+            if block.schema_version != PENDING_BLOCK_SCHEMA_VERSION {
+                return None;
+            }
             Some((path, block))
         })
         .collect::<Vec<_>>();
@@ -1104,7 +1104,7 @@ fn write_report(
     let keyframe = block
         .frames
         .iter()
-        .find(|frame| frame.sent_to_base || frame.sent)
+        .find(|frame| frame.sent_to_base)
         .or_else(|| block.frames.first());
     let keyframe_relative = if let Some(frame) = keyframe {
         let target = directory.join("keyframes").join(format!(
@@ -1134,15 +1134,12 @@ fn write_report(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        frames_sent: None,
-        base_frames_sent: Some(block.base_frames_sent),
-        learning_frames_sent: None,
+        base_frames_sent: block.base_frames_sent,
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
         model: Some(config.tera_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
-        learning_enrichment: None,
         reason: None,
         error: None,
     };
@@ -1186,7 +1183,7 @@ fn rebuild_journal(directory: &Path) -> Result<()> {
 }
 
 fn json_journal_entry(artifact: &BlockArtifact) -> Option<(String, String)> {
-    if !artifact.is_supported() || artifact.outcome != "described" {
+    if !artifact.has_current_schema() || artifact.outcome != "described" {
         return None;
     }
     let (Some(title), Some(report)) = (&artifact.title, &artifact.report) else {
@@ -1232,15 +1229,12 @@ fn write_terminal_block(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        frames_sent: None,
-        base_frames_sent: None,
-        learning_frames_sent: None,
+        base_frames_sent: 0,
         keyframe: None,
         model: None,
         title: None,
         report: None,
         subjects: Vec::new(),
-        learning_enrichment: None,
         reason: Some(reason.to_string()),
         error: (outcome == "invalid_model_output").then_some(reason.to_string()),
     };
@@ -1383,7 +1377,7 @@ fn load_successful_reports(root: &Path, before: i64) -> Result<Vec<StoredReport>
             let Ok(artifact) = serde_json::from_slice::<BlockArtifact>(&bytes) else {
                 continue;
             };
-            if !artifact.is_supported()
+            if !artifact.has_current_schema()
                 || artifact.outcome != "described"
                 || artifact.report.is_none()
             {
@@ -1558,7 +1552,7 @@ mod tests {
     };
     use crate::block_artifact::{
         ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LEARNING_ARTIFACT_SCHEMA_VERSION,
-        LearningArtifact, LearningDepth, LearningEnrichmentStatus, LearningRecord,
+        LearningArtifact, LearningDepth, LearningEnrichmentStatus, LearningRecord, LearningSubject,
     };
     use crate::config::AppConfig;
     use std::collections::BTreeMap;
@@ -1586,9 +1580,7 @@ mod tests {
             app_seconds: BTreeMap::new(),
             timeline: Vec::new(),
             frames_captured: 1,
-            frames_sent: None,
-            base_frames_sent: Some(1),
-            learning_frames_sent: Some(0),
+            base_frames_sent: 1,
             keyframe: None,
             model: Some("model".to_string()),
             title: Some("Title".to_string()),
@@ -1597,10 +1589,8 @@ mod tests {
                 namespaces: vec!["work".to_string()],
                 subject: "Structured subject must not be rendered.".to_string(),
                 estimated_duration_s: 600,
-                unattended: Some(false),
-                learning: None,
+                unattended: false,
             }],
-            learning_enrichment: None,
             reason: None,
             error: None,
         };
@@ -1608,24 +1598,6 @@ mod tests {
         let (_, entry) = json_journal_entry(&artifact).unwrap();
         assert!(entry.contains("Report content only."));
         assert!(!entry.contains("Structured subject must not be rendered."));
-    }
-
-    #[test]
-    fn legacy_version_one_report_remains_a_journal_input() {
-        let artifact: BlockArtifact = serde_json::from_str(
-            r#"{
-                "schema_version":1,"block":"1970-01-01T0000","window_start":0,"window_end":600,
-                "outcome":"described","active_seconds":600,"idle_seconds":0,"app_seconds":{},
-                "timeline":[],"frames_captured":1,"frames_sent":1,"title":"Legacy title",
-                "report":"Legacy report.","subjects":[
-                    {"namespaces":["work"],"subject":"Worked.","estimated_duration_s":600}
-                ]
-            }"#,
-        )
-        .unwrap();
-        let (_, entry) = json_journal_entry(&artifact).unwrap();
-        assert!(entry.contains("Legacy title"));
-        assert!(entry.contains("Legacy report."));
     }
 
     #[test]
@@ -1689,7 +1661,6 @@ mod tests {
                 height: 100,
                 delta: 0.0,
                 window: "document".to_string(),
-                sent: false,
                 sent_to_base: false,
                 sent_to_learning: false,
                 input_idle: false,
@@ -1724,7 +1695,6 @@ mod tests {
                 height: 100,
                 delta: index as f32 + 1.0,
                 window: "document".to_string(),
-                sent: false,
                 sent_to_base: false,
                 sent_to_learning: false,
                 input_idle: false,
@@ -1775,8 +1745,7 @@ mod tests {
                 namespaces: vec!["learning".to_string(), "lookup".to_string()],
                 subject: "Looked up a term.".to_string(),
                 estimated_duration_s: 60,
-                unattended: Some(false),
-                learning: None,
+                unattended: false,
             }],
         });
         let recovered: Block =
@@ -1799,8 +1768,7 @@ mod tests {
                 namespaces: vec!["learning".to_string(), "reading".to_string()],
                 subject: "Reviewed ownership material.".to_string(),
                 estimated_duration_s: 300,
-                unattended: Some(false),
-                learning: None,
+                unattended: false,
             }],
         };
         let learning = LearningArtifact {
@@ -1811,7 +1779,7 @@ mod tests {
             status: LearningEnrichmentStatus::Complete,
             frames_sent: 4,
             model: Some("test-model".to_string()),
-            subjects: vec![ActivitySubject {
+            subjects: vec![LearningSubject {
                 namespaces: vec![
                     "learning".to_string(),
                     "reading".to_string(),
@@ -1820,12 +1788,12 @@ mod tests {
                 ],
                 subject: "Reviewed Rust ownership rules.".to_string(),
                 estimated_duration_s: 240,
-                unattended: Some(false),
-                learning: Some(LearningRecord {
+                unattended: false,
+                learning: LearningRecord {
                     search_queries: Vec::new(),
                     sources: Vec::new(),
                     depth: LearningDepth::FocusedExplanation,
-                }),
+                },
             }],
             error: None,
         };
@@ -1845,9 +1813,6 @@ mod tests {
             serde_json::from_slice(&fs::read(super::learning_report_path(&root, &block)).unwrap())
                 .unwrap();
         assert_eq!(activity.subjects, base.subjects);
-        assert!(activity.subjects[0].learning.is_none());
-        assert!(activity.learning_enrichment.is_none());
-        assert!(activity.learning_frames_sent.is_none());
         assert_eq!(stored_learning.subjects, learning.subjects);
         assert_eq!(
             super::load_successful_reports(&root, i64::MAX)

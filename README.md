@@ -71,11 +71,10 @@ rebuilt from the base report fields in the JSON block artifacts; structured subj
 canonical in JSON.
 
 Block schema version 2 stores the base activity description and attention judgments.
-Learning artifacts have their own schema and request frame count. Version-1 block artifacts
-remain readable and keep their missing attention judgment as unknown. Recent activity blocks
-remain available in full. Older activity blocks are projected into a structured aggregate and
-folded once into the bounded plaintext `summary.md`; learning artifacts are never included in
-that rollup.
+Learning artifacts have their own schema and request frame count. Both formats are strict;
+older block or pending-manifest shapes are not accepted. Recent activity blocks remain available
+in full. Older activity blocks are projected into a structured aggregate and folded once into
+the bounded plaintext `summary.md`; learning artifacts are never included in that rollup.
 
 At the end of each day, the worker generates `daily.md` deterministically without a daily
 model request. It projects block titles, subject namespaces, subject estimates, and measured
