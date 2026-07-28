@@ -1,14 +1,15 @@
 use crate::activity::{self, ActivitySample};
 use crate::archive::ArchiveHandle;
 use crate::block_artifact::{
-    ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput,
+    ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput, LearningEnrichment,
+    LearningEnrichmentStatus,
 };
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
 use crate::llm_client;
 use crate::logger;
 use crate::screen_capture;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,58 @@ pub struct JournalHandle {
 enum JournalCommand {
     Toggle,
     Shutdown,
+}
+
+struct DescriptionQueue {
+    tx: Sender<Block>,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl DescriptionQueue {
+    fn spawn(config: AppConfig, status: Arc<Mutex<JournalStatus>>) -> Self {
+        Self::spawn_with_processor(move |block| describe_and_store(&config, block, &status))
+    }
+
+    fn spawn_with_processor<F>(process: F) -> Self
+    where
+        F: Fn(Block) + Send + 'static,
+    {
+        let (tx, rx) = crossbeam_channel::unbounded::<Block>();
+        let active = Arc::new(Mutex::new(HashSet::new()));
+        let worker_active = Arc::clone(&active);
+        std::thread::spawn(move || {
+            while let Ok(block) = rx.recv() {
+                let id = block.id();
+                process(block);
+                worker_active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&id);
+            }
+        });
+        Self { tx, active }
+    }
+
+    fn enqueue(&self, block: Block) -> Result<()> {
+        let id = block.id();
+        {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !active.insert(id.clone()) {
+                return Ok(());
+            }
+        }
+        if self.tx.send(block).is_err() {
+            self.active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&id);
+            return Err(anyhow!("journal description worker stopped"));
+        }
+        Ok(())
+    }
 }
 
 impl JournalHandle {
@@ -101,6 +154,12 @@ struct FrameRecord {
     window: String,
     #[serde(default)]
     sent: bool,
+    #[serde(default)]
+    sent_to_base: bool,
+    #[serde(default)]
+    sent_to_learning: bool,
+    #[serde(default)]
+    input_idle: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,7 +170,12 @@ struct Block {
     frames: Vec<FrameRecord>,
     samples: Vec<ActivitySample>,
     captured: usize,
+    #[serde(default)]
     attempts: usize,
+    #[serde(default)]
+    base_narrative: Option<ActivityNarrative>,
+    #[serde(default)]
+    base_frames_sent: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -170,6 +234,8 @@ impl Block {
             samples: Vec::new(),
             captured: 0,
             attempts: 0,
+            base_narrative: None,
+            base_frames_sent: 0,
         }
     }
 
@@ -198,6 +264,7 @@ fn run(
     prepare_store(&config.journal_artifacts_dir)?;
     let _daily_reports = DailyReportHandle::spawn(config.clone());
     let _archives = ArchiveHandle::spawn(config.clone());
+    let descriptions = DescriptionQueue::spawn(config.clone(), Arc::clone(status));
     let mut running = config.journal_enabled;
     let block_seconds = (config.journal_block_minutes * 60) as i64;
     let mut block: Option<Block> = None;
@@ -215,11 +282,13 @@ fn run(
         );
     }
     if running {
-        block = recover_pending(&config, block_seconds, status)?;
+        block = recover_pending(&config, block_seconds, &descriptions)?;
         logger::info(format!(
-            "Activity journal started: capture={}s idle_capture={}s block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
+            "Activity journal started: capture={}s idle_capture={}s learning_capture={}s learning_enrichment={} block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
             config.journal_capture_interval,
             config.journal_idle_capture_interval,
+            config.learning_capture_interval,
+            config.learning_enrichment_enabled,
             config.journal_block_minutes,
             config.journal_dedup_threshold,
             config.journal_idle_threshold_s,
@@ -254,7 +323,7 @@ fn run(
                     );
                 } else {
                     running = true;
-                    block = recover_pending(&config, block_seconds, status)?;
+                    block = recover_pending(&config, block_seconds, &descriptions)?;
                     dedup_state.clear();
                     next_capture = now();
                     was_inactive = false;
@@ -276,7 +345,8 @@ fn run(
             .is_some_and(|current| boundary >= current.end)
         {
             let finished = block.take().expect("checked above");
-            describe_and_store(&config, finished, status);
+            save_pending(&config.journal_artifacts_dir, &finished)?;
+            descriptions.enqueue(finished)?;
             dedup_state.clear();
         }
         let current = block.get_or_insert_with(|| Block::new(boundary, block_seconds));
@@ -295,9 +365,16 @@ fn run(
             config.journal_idle_threshold_s,
             config.journal_capture_interval,
             config.journal_idle_capture_interval,
+            config.learning_enrichment_enabled,
+            config.learning_capture_interval,
         ) else {
             // Sampling continues for accurate coverage, but locked desktops are never captured.
-            next_capture = stamp + config.journal_capture_interval as i64;
+            next_capture = stamp
+                + (if config.learning_enrichment_enabled {
+                    config.learning_capture_interval
+                } else {
+                    config.journal_capture_interval
+                }) as i64;
             continue;
         };
 
@@ -357,20 +434,24 @@ fn capture(
         delta,
         window: sample.label(),
         sent: false,
+        sent_to_base: false,
+        sent_to_learning: false,
+        input_idle: sample.idle_s >= config.journal_idle_threshold_s,
     });
     block.captured += 1;
     Ok(())
 }
 
 fn denied(config: &AppConfig, sample: &ActivitySample) -> bool {
-    if config.journal_denylist.is_empty() {
+    matches_denylist(&config.journal_denylist, sample)
+}
+
+fn matches_denylist(denylist: &[String], sample: &ActivitySample) -> bool {
+    if denylist.is_empty() {
         return false;
     }
     let text = format!("{} {}", sample.exe, sample.title).to_ascii_lowercase();
-    config
-        .journal_denylist
-        .iter()
-        .any(|term| text.contains(term))
+    denylist.iter().any(|term| text.contains(term))
 }
 
 fn capture_interval_for_sample(
@@ -378,9 +459,13 @@ fn capture_interval_for_sample(
     idle_threshold_s: f64,
     active_interval_s: u64,
     idle_interval_s: u64,
+    learning_enrichment_enabled: bool,
+    learning_interval_s: u64,
 ) -> Option<u64> {
     if sample.locked {
         None
+    } else if learning_enrichment_enabled {
+        Some(learning_interval_s)
     } else if sample.idle_s >= idle_threshold_s {
         Some(idle_interval_s)
     } else {
@@ -398,7 +483,7 @@ fn should_suppress_description(
 
 fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<JournalStatus>>) {
     let metrics = block_metrics(config, &block);
-    if block.frames.is_empty() {
+    if block.base_narrative.is_none() && block.frames.is_empty() {
         let outcome = terminal_outcome(&block);
         let reason = if outcome == "locked" {
             "workstation locked"
@@ -409,175 +494,462 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
         let _ = clear_pending(&config.journal_artifacts_dir, &block);
         return;
     }
-    let distinct_frames = block
-        .frames
-        .iter()
-        .filter(|frame| frame.delta >= config.journal_dedup_threshold)
-        .count();
-    if should_suppress_description(
-        metrics.active_seconds,
-        distinct_frames,
-        config.journal_min_active_seconds,
-    ) {
-        let outcome = terminal_outcome(&block);
-        let reason = if outcome == "locked" {
-            "workstation locked"
-        } else {
-            "idle or unchanged"
-        };
-        let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
-        let _ = clear_pending(&config.journal_artifacts_dir, &block);
-        return;
+    if block.base_narrative.is_none() {
+        let distinct_frames = block
+            .frames
+            .iter()
+            .filter(|frame| frame.delta >= config.journal_dedup_threshold)
+            .count();
+        if should_suppress_description(
+            metrics.active_seconds,
+            distinct_frames,
+            config.journal_min_active_seconds,
+        ) {
+            let outcome = terminal_outcome(&block);
+            let reason = if outcome == "locked" {
+                "workstation locked"
+            } else {
+                "idle or unchanged"
+            };
+            let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
+            let _ = clear_pending(&config.journal_artifacts_dir, &block);
+            return;
+        }
     }
 
-    set_status(
+    set_work_status(
         status,
-        true,
         format!("describing {}", block.label()),
         block.frames.len(),
     );
-    let selected = select_frames(&block.frames, config);
-    let selected_paths: HashSet<String> = selected.iter().map(|frame| frame.path.clone()).collect();
-    for frame in &mut block.frames {
-        frame.sent = selected_paths.contains(&frame.path);
-    }
-    let images = block
-        .frames
-        .iter()
-        .filter(|frame| frame.sent)
-        .filter_map(|frame| {
-            fs::read(&frame.path).ok().map(|bytes| {
-                (
-                    format!(
-                        "{} · monitor {} · {}x{} · foreground: {}",
-                        clock(frame.ts, "%H:%M:%S"),
-                        frame.monitor,
-                        frame.width,
-                        frame.height,
-                        frame.window
-                    ),
-                    bytes,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    if images.is_empty() {
-        logger::info(format!(
-            "No readable frames for journal block {}",
-            block.id()
-        ));
-        return;
-    }
-    let result = tokio::runtime::Builder::new_current_thread()
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build journal runtime")
-        .and_then(|runtime| {
-            runtime.block_on(async {
-                let earlier_context = build_earlier_context(config, block.start).await?;
-                let nominal_duration_s = (block.end - block.start).max(1) as u64;
-                let duration_budget_s = metrics
-                    .active_seconds
-                    .saturating_add(metrics.idle_seconds)
-                    .clamp(1, nominal_duration_s);
-                let context = format!(
-                    "## Block {} on {}\nThis block spans {} seconds with {} seconds of measured coverage. Captured {} screenshots on an adaptive cadence: every {} seconds during input activity and every {} seconds after the idle threshold. {} visually distinct images are attached in chronological order.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nWrite the report for this block only.",
-                    block.label(),
-                    block.day,
-                    nominal_duration_s,
-                    duration_budget_s,
-                    block.captured,
-                    config.journal_capture_interval,
-                    config.journal_idle_capture_interval,
-                    images.len(),
-                    if metrics.totals.is_empty() { "unavailable" } else { &metrics.totals },
-                    metrics.timeline
-                        .iter()
-                        .map(|line| format!("- {line}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    earlier_context,
-                );
-                llm_client::describe_activity_block(
-                    config.clone(),
-                    context,
-                    images,
-                    duration_budget_s,
-                )
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            retry_description(config, &mut block, status, "base", &error);
+            return;
+        }
+    };
+    let nominal_duration_s = (block.end - block.start).max(1) as u64;
+    let duration_budget_s = metrics
+        .active_seconds
+        .saturating_add(metrics.idle_seconds)
+        .clamp(1, nominal_duration_s);
+
+    if block.base_narrative.is_none() {
+        let selected_paths = {
+            let selected = select_base_frames(&block.frames, config);
+            readable_images(selected)
+        };
+        let (paths, images) = selected_paths;
+        if images.is_empty() {
+            logger::info(format!(
+                "No readable base frames for journal block {}",
+                block.id()
+            ));
+            return;
+        }
+        for frame in &mut block.frames {
+            frame.sent_to_base = paths.contains(&frame.path);
+        }
+        let result = runtime.block_on(async {
+            let earlier_context = build_earlier_context(config, block.start).await?;
+            let context = base_description_context(
+                config,
+                &block,
+                &metrics,
+                nominal_duration_s,
+                duration_budget_s,
+                images.len(),
+                &earlier_context,
+            );
+            llm_client::describe_activity_block(config.clone(), context, images, duration_budget_s)
                 .await
-            })
         });
-    match result {
-        Ok(narrative) => {
-            let title = narrative.title.clone();
-            if let Err(error) = write_report(config, &block, &narrative, &metrics) {
-                logger::info(format!("Writing journal block failed: {error:#}"));
+        match result {
+            Ok(narrative) => {
+                block.base_frames_sent = paths.len();
+                block.base_narrative = Some(narrative);
+                if let Err(error) = save_pending(&config.journal_artifacts_dir, &block) {
+                    logger::info(format!(
+                        "Persisting base description of {} failed: {error:#}",
+                        block.id()
+                    ));
+                    return;
+                }
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<llm_client::InvalidActivityOutput>()
+                    .is_some() =>
+            {
+                let reason = sanitized_error(&error);
+                if let Err(write_error) =
+                    write_terminal_block(config, &block, "invalid_model_output", &reason, &metrics)
+                {
+                    logger::info(format!(
+                        "Writing invalid-output block {} failed: {write_error:#}",
+                        block.id()
+                    ));
+                    return;
+                }
+                let _ = clear_pending(&config.journal_artifacts_dir, &block);
+                logger::info(format!(
+                    "Base description of {} produced invalid structured output",
+                    block.id()
+                ));
+                set_work_status(
+                    status,
+                    "journal block had invalid model output".to_string(),
+                    0,
+                );
                 return;
             }
-            let _ = clear_pending(&config.journal_artifacts_dir, &block);
-            set_status(status, true, format!("journaled: {title}"), 0);
+            Err(error) => {
+                retry_description(config, &mut block, status, "base", &error);
+                return;
+            }
+        }
+    }
+
+    let base = block
+        .base_narrative
+        .clone()
+        .expect("base narrative set or recovered");
+    if !config.learning_enrichment_enabled || !base.has_learning() {
+        finish_description(config, &block, &base, &metrics, None, status);
+        return;
+    }
+
+    set_work_status(
+        status,
+        format!("enriching learning in {}", block.label()),
+        block.frames.len(),
+    );
+    let (learning_paths, learning_images) = {
+        let selected = select_learning_frames(&block.frames, config);
+        readable_images(selected)
+    };
+    for frame in &mut block.frames {
+        frame.sent_to_learning = learning_paths.contains(&frame.path);
+    }
+    if learning_images.is_empty() {
+        finish_description(
+            config,
+            &block,
+            &base,
+            &metrics,
+            Some(LearningEnrichment {
+                status: LearningEnrichmentStatus::InsufficientEvidence,
+                frames_sent: 0,
+                error: Some("no selected learning frame remained readable".to_string()),
+            }),
+            status,
+        );
+        return;
+    }
+    let learning_context = learning_description_context(
+        &block,
+        &metrics,
+        duration_budget_s,
+        &base,
+        learning_images.len(),
+    );
+    match runtime.block_on(llm_client::describe_learning_block(
+        config.clone(),
+        learning_context,
+        learning_images,
+        duration_budget_s,
+    )) {
+        Ok(learning) => {
+            let narrative = base.with_learning_subjects(learning.learning_subjects);
+            finish_description(
+                config,
+                &block,
+                &narrative,
+                &metrics,
+                Some(LearningEnrichment {
+                    status: LearningEnrichmentStatus::Complete,
+                    frames_sent: learning_paths.len(),
+                    error: None,
+                }),
+                status,
+            );
         }
         Err(error)
             if error
-                .downcast_ref::<llm_client::InvalidActivityOutput>()
+                .downcast_ref::<llm_client::InvalidLearningOutput>()
                 .is_some() =>
         {
-            let reason = error.to_string();
-            if let Err(write_error) =
-                write_terminal_block(config, &block, "invalid_model_output", &reason, &metrics)
-            {
-                logger::info(format!(
-                    "Writing invalid-output block {} failed: {write_error:#}",
-                    block.id()
-                ));
-                return;
-            }
-            let _ = clear_pending(&config.journal_artifacts_dir, &block);
             logger::info(format!(
-                "Description of {} produced invalid structured output: {reason}",
+                "Learning enrichment of {} produced invalid structured output",
                 block.id()
             ));
-            set_status(
+            finish_description(
+                config,
+                &block,
+                &base,
+                &metrics,
+                Some(LearningEnrichment {
+                    status: LearningEnrichmentStatus::InvalidModelOutput,
+                    frames_sent: learning_paths.len(),
+                    error: Some(sanitized_error(&error)),
+                }),
                 status,
-                true,
-                "journal block had invalid model output".to_string(),
-                0,
             );
         }
-        Err(error) => {
-            block.attempts += 1;
-            let _ = save_pending(&config.journal_artifacts_dir, &block);
-            logger::info(format!(
-                "Description of {} failed (attempt {}): {error:#}",
-                block.id(),
-                block.attempts
-            ));
-            set_status(
-                status,
-                true,
-                format!("description pending: {error}"),
-                block.frames.len(),
-            );
-        }
+        Err(error) => retry_description(config, &mut block, status, "learning", &error),
     }
 }
 
-fn select_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a FrameRecord> {
-    let mut kept = Vec::new();
-    for (index, frame) in frames.iter().enumerate() {
-        let keep_for_gap = kept.last().is_some_and(|previous: &&FrameRecord| {
-            frame.ts - previous.ts >= config.journal_max_frame_gap_s as i64
-        });
-        if index == 0 || frame.delta >= config.journal_dedup_threshold || keep_for_gap {
-            kept.push(frame);
+fn finish_description(
+    config: &AppConfig,
+    block: &Block,
+    narrative: &ActivityNarrative,
+    metrics: &BlockMetrics,
+    learning_enrichment: Option<LearningEnrichment>,
+    status: &Arc<Mutex<JournalStatus>>,
+) {
+    let title = narrative.title.clone();
+    if let Err(error) = write_report(
+        config,
+        block,
+        narrative,
+        metrics,
+        learning_enrichment.as_ref(),
+    ) {
+        logger::info(format!("Writing journal block failed: {error:#}"));
+        return;
+    }
+    let _ = clear_pending(&config.journal_artifacts_dir, block);
+    set_work_status(status, format!("journaled: {title}"), 0);
+}
+
+fn retry_description(
+    config: &AppConfig,
+    block: &mut Block,
+    status: &Arc<Mutex<JournalStatus>>,
+    stage: &str,
+    _error: &anyhow::Error,
+) {
+    block.attempts += 1;
+    let _ = save_pending(&config.journal_artifacts_dir, block);
+    logger::info(format!(
+        "Journal description stage={stage} block={} attempt={} failed; retained for retry",
+        block.id(),
+        block.attempts
+    ));
+    set_work_status(
+        status,
+        format!("{stage} description pending: request failed"),
+        block.frames.len(),
+    );
+}
+
+fn base_description_context(
+    config: &AppConfig,
+    block: &Block,
+    metrics: &BlockMetrics,
+    nominal_duration_s: u64,
+    duration_budget_s: u64,
+    image_count: usize,
+    earlier_context: &str,
+) -> String {
+    format!(
+        "## Block {} on {}\nThis block spans {} seconds with {} seconds of measured coverage. Captured {} temporary screenshots; {} ordinary-policy images are attached in chronological order. The ordinary evidence policy targets every {} seconds during input activity and every {} seconds after the idle threshold.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nWrite the report for this block only.",
+        block.label(),
+        block.day,
+        nominal_duration_s,
+        duration_budget_s,
+        block.captured,
+        image_count,
+        config.journal_capture_interval,
+        config.journal_idle_capture_interval,
+        if metrics.totals.is_empty() {
+            "unavailable"
+        } else {
+            &metrics.totals
+        },
+        metrics
+            .timeline
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        earlier_context,
+    )
+}
+
+fn learning_description_context(
+    block: &Block,
+    metrics: &BlockMetrics,
+    duration_budget_s: u64,
+    base: &ActivityNarrative,
+    image_count: usize,
+) -> String {
+    let base_json = serde_json::to_string_pretty(base).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "## Learning enrichment for block {} on {}\nMeasured coverage is {} seconds and {} dense chronological images are attached.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n### Provisional base narrative (structured JSON)\n{}\n\nReturn the final atomic learning subjects for this block only.",
+        block.label(),
+        block.day,
+        duration_budget_s,
+        image_count,
+        if metrics.totals.is_empty() {
+            "unavailable"
+        } else {
+            &metrics.totals
+        },
+        metrics
+            .timeline
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        base_json,
+    )
+}
+
+fn sanitized_error(error: &anyhow::Error) -> String {
+    error
+        .to_string()
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn readable_images(frames: Vec<&FrameRecord>) -> (HashSet<String>, Vec<(String, Vec<u8>)>) {
+    let mut paths = HashSet::new();
+    let mut images = Vec::new();
+    for frame in frames {
+        let Ok(bytes) = fs::read(&frame.path) else {
+            continue;
+        };
+        paths.insert(frame.path.clone());
+        images.push((
+            format!(
+                "{} · monitor {} · {}x{} · foreground: {}",
+                clock(frame.ts, "%H:%M:%S"),
+                frame.monitor,
+                frame.width,
+                frame.height,
+                frame.window
+            ),
+            bytes,
+        ));
+    }
+    (paths, images)
+}
+
+fn select_base_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a FrameRecord> {
+    let candidates = ordinary_cadence_candidates(
+        frames,
+        config.journal_capture_interval,
+        config.journal_idle_capture_interval,
+    );
+    select_frame_candidates(
+        candidates,
+        config.journal_max_frame_gap_s,
+        config.journal_dedup_threshold,
+        config.journal_max_frames_per_call,
+        config.journal_max_payload_mb,
+    )
+}
+
+fn ordinary_cadence_candidates(
+    frames: &[FrameRecord],
+    active_interval_s: u64,
+    idle_interval_s: u64,
+) -> Vec<&FrameRecord> {
+    let mut candidates = Vec::new();
+    let mut next_due = None;
+    let mut was_idle = false;
+    for frame in frames {
+        let resumed = was_idle && !frame.input_idle;
+        if next_due.is_none_or(|due| frame.ts >= due) || resumed {
+            candidates.push(frame);
+            let interval = if frame.input_idle {
+                idle_interval_s
+            } else {
+                active_interval_s
+            };
+            next_due = Some(frame.ts + interval as i64);
         }
+        was_idle = frame.input_idle;
     }
     if let Some(last) = frames.last()
+        && candidates
+            .last()
+            .is_none_or(|frame| frame.path != last.path)
+    {
+        candidates.push(last);
+    }
+    candidates
+}
+
+fn select_learning_frames<'a>(
+    frames: &'a [FrameRecord],
+    config: &AppConfig,
+) -> Vec<&'a FrameRecord> {
+    select_frame_candidates(
+        frames.iter().collect(),
+        config.learning_max_frame_gap_s,
+        config.journal_dedup_threshold,
+        config.journal_max_frames_per_call,
+        config.journal_max_payload_mb,
+    )
+}
+
+fn select_frame_candidates(
+    candidates: Vec<&FrameRecord>,
+    max_gap_s: u64,
+    dedup_threshold: f32,
+    max_frames_per_call: usize,
+    max_payload_mb: f32,
+) -> Vec<&FrameRecord> {
+    select_frame_candidates_with_size(
+        candidates,
+        max_gap_s,
+        dedup_threshold,
+        max_frames_per_call,
+        max_payload_mb,
+        |frame| {
+            fs::metadata(&frame.path)
+                .ok()
+                .map(|metadata| metadata.len())
+        },
+    )
+}
+
+fn select_frame_candidates_with_size<F>(
+    candidates: Vec<&FrameRecord>,
+    max_gap_s: u64,
+    dedup_threshold: f32,
+    max_frames_per_call: usize,
+    max_payload_mb: f32,
+    size_of: F,
+) -> Vec<&FrameRecord>
+where
+    F: Fn(&FrameRecord) -> Option<u64>,
+{
+    let mut kept = Vec::new();
+    for (index, frame) in candidates.iter().enumerate() {
+        let keep_for_gap = kept
+            .last()
+            .is_some_and(|previous: &&FrameRecord| frame.ts - previous.ts >= max_gap_s as i64);
+        if index == 0 || frame.delta >= dedup_threshold || keep_for_gap {
+            kept.push(*frame);
+        }
+    }
+    if let Some(last) = candidates.last()
         && kept.last().is_none_or(|frame| frame.path != last.path)
     {
-        kept.push(last);
+        kept.push(*last);
     }
-    while kept.len() > config.journal_max_frames_per_call {
+    while kept.len() > max_frames_per_call {
         let index = kept[1..kept.len() - 1]
             .iter()
             .enumerate()
@@ -586,15 +958,8 @@ fn select_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a F
             .unwrap_or(kept.len() - 1);
         kept.remove(index);
     }
-    let budget = (config.journal_max_payload_mb * 1_000_000.0 * 0.72) as u64;
-    while kept.len() > 2
-        && kept
-            .iter()
-            .filter_map(|frame| fs::metadata(&frame.path).ok())
-            .map(|meta| meta.len())
-            .sum::<u64>()
-            > budget
-    {
+    let budget = (max_payload_mb * 1_000_000.0 * 0.72) as u64;
+    while kept.len() > 2 && kept.iter().filter_map(|frame| size_of(frame)).sum::<u64>() > budget {
         let index = kept[1..kept.len() - 1]
             .iter()
             .enumerate()
@@ -609,25 +974,28 @@ fn select_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a F
 fn recover_pending(
     config: &AppConfig,
     block_seconds: i64,
-    status: &Arc<Mutex<JournalStatus>>,
+    descriptions: &DescriptionQueue,
 ) -> Result<Option<Block>> {
     let pending = config.journal_artifacts_dir.join("pending");
     let stamp = now();
     let boundary = stamp - stamp.rem_euclid(block_seconds);
     let mut current = None;
-    for entry in fs::read_dir(pending)? {
-        let path = entry?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else { continue };
-        let Ok(block) = serde_json::from_slice::<Block>(&bytes) else {
-            continue;
-        };
+    let mut recovered = fs::read_dir(pending)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .filter_map(|path| {
+            let bytes = fs::read(&path).ok()?;
+            let block = serde_json::from_slice::<Block>(&bytes).ok()?;
+            Some((path, block))
+        })
+        .collect::<Vec<_>>();
+    recovered.sort_by_key(|(_, block)| block.start);
+    for (path, block) in recovered {
         if block.start == boundary {
             current = Some(block);
         } else if !report_path(&config.journal_artifacts_dir, &block).is_file() {
-            describe_and_store(config, block, status);
+            descriptions.enqueue(block)?;
         } else {
             let directory = day_dir(&config.journal_artifacts_dir, &block.day);
             rebuild_journal(&directory)?;
@@ -695,6 +1063,7 @@ fn write_report(
     block: &Block,
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
+    learning_enrichment: Option<&LearningEnrichment>,
 ) -> Result<()> {
     let _write_guard = crate::artifact_store::lock();
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
@@ -709,7 +1078,7 @@ fn write_report(
     let keyframe = block
         .frames
         .iter()
-        .find(|frame| frame.sent)
+        .find(|frame| frame.sent_to_base || frame.sent)
         .or_else(|| block.frames.first());
     let keyframe_relative = if let Some(frame) = keyframe {
         let target = directory.join("keyframes").join(format!(
@@ -739,12 +1108,21 @@ fn write_report(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        frames_sent: block.frames.iter().filter(|frame| frame.sent).count(),
+        frames_sent: None,
+        base_frames_sent: Some(block.base_frames_sent),
+        learning_frames_sent: Some(
+            block
+                .frames
+                .iter()
+                .filter(|frame| frame.sent_to_learning)
+                .count(),
+        ),
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
         model: Some(config.tera_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
+        learning_enrichment: learning_enrichment.cloned(),
         reason: None,
         error: None,
     };
@@ -828,12 +1206,15 @@ fn write_terminal_block(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        frames_sent: block.frames.iter().filter(|frame| frame.sent).count(),
+        frames_sent: None,
+        base_frames_sent: None,
+        learning_frames_sent: None,
         keyframe: None,
         model: None,
         title: None,
         report: None,
         subjects: Vec::new(),
+        learning_enrichment: None,
         reason: Some(reason.to_string()),
         error: (outcome == "invalid_model_output").then_some(reason.to_string()),
     };
@@ -1110,6 +1491,12 @@ fn set_status(
     };
 }
 
+fn set_work_status(status: &Arc<Mutex<JournalStatus>>, summary: String, current_frames: usize) {
+    let mut current = status.lock().unwrap_or_else(|error| error.into_inner());
+    current.summary = summary;
+    current.current_frames = current_frames;
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1132,11 +1519,15 @@ fn clock(ts: i64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivitySample, BlockArtifact, DedupState, capture_interval_for_sample,
-        context_detailed_offset, json_journal_entry, should_suppress_description,
+        ActivitySample, Block, BlockArtifact, DedupState, DescriptionQueue, FrameRecord,
+        capture_interval_for_sample, context_detailed_offset, json_journal_entry, matches_denylist,
+        ordinary_cadence_candidates, select_frame_candidates, select_frame_candidates_with_size,
+        should_suppress_description,
     };
     use crate::block_artifact::{ActivitySubject, BLOCK_SCHEMA_VERSION};
     use std::collections::BTreeMap;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn context_keeps_only_the_configured_number_of_recent_blocks_in_full() {
@@ -1158,7 +1549,9 @@ mod tests {
             app_seconds: BTreeMap::new(),
             timeline: Vec::new(),
             frames_captured: 1,
-            frames_sent: 1,
+            frames_sent: None,
+            base_frames_sent: Some(1),
+            learning_frames_sent: Some(0),
             keyframe: None,
             model: Some("model".to_string()),
             title: Some("Title".to_string()),
@@ -1167,7 +1560,10 @@ mod tests {
                 namespaces: vec!["work".to_string()],
                 subject: "Structured subject must not be rendered.".to_string(),
                 estimated_duration_s: 600,
+                unattended: Some(false),
+                learning: None,
             }],
+            learning_enrichment: None,
             reason: None,
             error: None,
         };
@@ -1178,21 +1574,178 @@ mod tests {
     }
 
     #[test]
+    fn legacy_version_one_report_remains_a_journal_input() {
+        let artifact: BlockArtifact = serde_json::from_str(
+            r#"{
+                "schema_version":1,"block":"1970-01-01T0000","window_start":0,"window_end":600,
+                "outcome":"described","active_seconds":600,"idle_seconds":0,"app_seconds":{},
+                "timeline":[],"frames_captured":1,"frames_sent":1,"title":"Legacy title",
+                "report":"Legacy report.","subjects":[
+                    {"namespaces":["work"],"subject":"Worked.","estimated_duration_s":600}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let (_, entry) = json_journal_entry(&artifact).unwrap();
+        assert!(entry.contains("Legacy title"));
+        assert!(entry.contains("Legacy report."));
+    }
+
+    #[test]
     fn capture_stops_while_locked_and_slows_while_idle() {
         let mut sample = ActivitySample::default();
         assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120),
+            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
             Some(20)
         );
 
         sample.idle_s = 120.0;
         assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120),
+            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
             Some(120)
         );
 
         sample.locked = true;
-        assert_eq!(capture_interval_for_sample(&sample, 120.0, 20, 120), None);
+        assert_eq!(
+            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn dense_capture_continues_during_input_idle_but_stops_while_locked() {
+        let mut sample = ActivitySample {
+            idle_s: 600.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            capture_interval_for_sample(&sample, 120.0, 20, 120, true, 10),
+            Some(10)
+        );
+        sample.locked = true;
+        assert_eq!(
+            capture_interval_for_sample(&sample, 120.0, 20, 120, true, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn dense_capture_denylist_matches_foreground_executable_and_title() {
+        let sample = ActivitySample {
+            exe: "PasswordManager.exe".to_string(),
+            title: "Personal vault".to_string(),
+            ..Default::default()
+        };
+        assert!(matches_denylist(&["passwordmanager".to_string()], &sample));
+        assert!(matches_denylist(&["personal vault".to_string()], &sample));
+        assert!(!matches_denylist(&["unrelated".to_string()], &sample));
+    }
+
+    #[test]
+    fn ordinary_and_learning_selection_use_distinct_cadences_and_gaps() {
+        let frames = (0..=6)
+            .map(|index| FrameRecord {
+                path: format!("frame-{index}"),
+                ts: index * 10,
+                monitor: 1,
+                width: 100,
+                height: 100,
+                delta: 0.0,
+                window: "document".to_string(),
+                sent: false,
+                sent_to_base: false,
+                sent_to_learning: false,
+                input_idle: false,
+            })
+            .collect::<Vec<_>>();
+        let ordinary = ordinary_cadence_candidates(&frames, 20, 120);
+        assert_eq!(
+            ordinary.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
+            vec![0, 20, 40, 60]
+        );
+
+        let base = select_frame_candidates(ordinary, 120, 2.0, 100, 48.0);
+        let learning = select_frame_candidates(frames.iter().collect(), 30, 2.0, 100, 48.0);
+        assert_eq!(
+            base.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
+            vec![0, 60]
+        );
+        assert_eq!(
+            learning.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
+            vec![0, 30, 60]
+        );
+    }
+
+    #[test]
+    fn frame_selection_enforces_independent_count_and_payload_limits() {
+        let frames = (0..=5)
+            .map(|index| FrameRecord {
+                path: format!("frame-{index}"),
+                ts: index * 10,
+                monitor: 1,
+                width: 100,
+                height: 100,
+                delta: index as f32 + 1.0,
+                window: "document".to_string(),
+                sent: false,
+                sent_to_base: false,
+                sent_to_learning: false,
+                input_idle: false,
+            })
+            .collect::<Vec<_>>();
+
+        let count_limited =
+            select_frame_candidates_with_size(frames.iter().collect(), 120, 0.0, 3, 48.0, |_| {
+                Some(100)
+            });
+        assert_eq!(count_limited.len(), 3);
+        assert_eq!(count_limited.first().unwrap().ts, 0);
+        assert_eq!(count_limited.last().unwrap().ts, 50);
+
+        let payload_limited =
+            select_frame_candidates_with_size(frames.iter().collect(), 120, 0.0, 100, 1.0, |_| {
+                Some(250_000)
+            });
+        assert_eq!(payload_limited.len(), 2);
+        assert_eq!(payload_limited.first().unwrap().ts, 0);
+        assert_eq!(payload_limited.last().unwrap().ts, 50);
+    }
+
+    #[test]
+    fn delayed_description_processing_does_not_block_the_capture_caller() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let queue = DescriptionQueue::spawn_with_processor(move |_block| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        let block = Block::new(0, 600);
+        let before = Instant::now();
+        queue.enqueue(block).unwrap();
+        assert!(before.elapsed() < Duration::from_millis(100));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn pending_manifest_preserves_a_successful_base_narrative_for_enrichment_resume() {
+        let mut block = Block::new(0, 600);
+        block.base_frames_sent = 3;
+        block.base_narrative = Some(crate::block_artifact::ActivityNarrative {
+            title: "Learning: term lookup".to_string(),
+            report: "The user looked up a term.".to_string(),
+            subjects: vec![crate::block_artifact::ActivitySubject {
+                namespaces: vec!["learning".to_string(), "lookup".to_string()],
+                subject: "Looked up a term.".to_string(),
+                estimated_duration_s: 60,
+                unattended: Some(false),
+                learning: None,
+            }],
+        });
+        let recovered: Block =
+            serde_json::from_slice(&serde_json::to_vec(&block).unwrap()).unwrap();
+        assert_eq!(recovered.base_frames_sent, 3);
+        assert!(recovered.base_narrative.unwrap().has_learning());
     }
 
     #[test]

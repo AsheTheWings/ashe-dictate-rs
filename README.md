@@ -10,10 +10,13 @@ small overlays to show live state and results.
 - Correct grammar, spelling, and punctuation in selected text.
 - Ask a question using selected text and append the answer in place.
 - Capture desktop activity on an adaptive cadence and generate grounded block reports.
-- Slow capture during idle periods, stop while Windows is locked, and omit sensitive apps.
+- Keep ordinary idle evidence sparse, stop capture while Windows is locked, and omit
+  sensitive apps.
 - Maintain recent detailed context, a bounded rolling summary, and a complete daily report.
 - Store each completed activity block as canonical JSON while aggregating its report into
   the human-readable journal.
+- Enrich learning blocks with atomic topics, visible searches and sources, and an
+  evidence-backed treatment depth.
 - Seal older day artifacts into authenticated, self-contained encrypted archives and
   optionally send those archives to an authenticated remote endpoint.
 
@@ -45,17 +48,39 @@ lossless screenshots. Visually redundant frames are omitted from model requests,
 count and payload size are capped, and blocks with too little active or visual change are
 stored without an unnecessary model call.
 
-The model returns a title, Markdown report, and a list of subjects. Each subject includes
-one to four broad-to-specific namespaces and an independently estimated duration, so
-overlapping estimates remain valid during multitasking. Parseable generated data is kept
-without semantic filtering. The chronological `journal.md` is rebuilt from the report
-fields in the JSON block artifacts.
+The base model returns a title, Markdown report, and a list of subjects. Each subject
+includes one to four broad-to-specific namespaces, an independently estimated duration,
+and an `unattended` judgment. Estimates remain valid when they overlap during multitasking.
+Namespaces use stable domain-specific positions; preferred roots include
+`software-development`, `entertainment`, `social-media`, and `learning`.
 
-Recent completed blocks remain available in full. Older canonical JSON blocks are projected
-into a structured aggregate and folded once into the bounded plaintext `summary.md`, which
-serves as convenient long-term context. At the end of each day, canonical blocks, measured
-totals, and explicit coverage gaps are likewise supplied as one structured aggregate for the
-full daily report. Markdown is used only for the generated human-readable output documents.
+When a base subject is rooted at `learning`, the worker makes a second request from a denser
+temporary evidence buffer. That request replaces provisional learning subjects with atomic
+learning units containing visible search queries, source material, and one evidence-backed
+depth: `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or
+`synthesis`. Depth describes observable exposure and engagement, not comprehension or
+retention. Passive activity is not considered unattended merely because keyboard and mouse
+input stopped.
+
+The ordinary block request and learning request have independent frame selection and
+payload accounting. Learning enrichment captures temporary frames every 10 seconds by
+default, including while input-idle, but continues to stop while Windows is locked and to
+honor the foreground denylist. Model description runs separately from capture so a slow
+request does not create a gap in the following block. The chronological `journal.md` is
+rebuilt from the base report fields in the JSON block artifacts; structured subjects remain
+canonical in JSON.
+
+Block schema version 2 stores attention judgments, learning records, and separate base and
+learning frame counts. Version-1 artifacts remain readable and keep their missing attention
+judgment as unknown. Recent completed blocks remain available in full. Older canonical JSON
+blocks are projected into a structured aggregate and folded once into the bounded plaintext
+`summary.md`, which serves as convenient long-term context.
+
+At the end of each day, the worker generates `daily.md` deterministically without a daily
+model request. It projects block titles, subject namespaces, subject estimates, and measured
+timelines; identifies missing and pending coverage gaps; totals active, idle, application,
+and outcome telemetry; and aggregates estimated duration and attention counts for every
+namespace prefix. Namespace durations remain independent estimates and may overlap.
 
 ## Encrypted archives
 

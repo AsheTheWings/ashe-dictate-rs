@@ -1,8 +1,7 @@
 use crate::block_artifact::{BlockArtifact, BlockDocumentInput};
 use crate::config::AppConfig;
-use crate::llm_client;
 use crate::logger;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Local, NaiveDate, TimeZone};
 use crossbeam_channel::{Receiver, Sender};
 use serde::Serialize;
@@ -13,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAILY_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAILY_PROMPT_VERSION: &str = "ashe-worker-daily-v3";
+const DAILY_GENERATOR_VERSION: &str = "ashe-worker-daily-v4";
 
 pub struct DailyReportHandle {
     tx: Option<Sender<()>>,
@@ -38,7 +37,7 @@ impl Drop for DailyReportHandle {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct DailyTotals {
     active_seconds: u64,
     idle_seconds: u64,
@@ -46,14 +45,22 @@ struct DailyTotals {
     outcomes: BTreeMap<String, usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct NamespaceStats {
+    estimated_duration_s: u64,
+    subjects: usize,
+    unattended_subjects: usize,
+    attention_unknown_subjects: usize,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct CoverageGap {
     start: String,
     end: String,
     status: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct DailyCoverage {
     complete: bool,
     gaps: Vec<CoverageGap>,
@@ -63,32 +70,14 @@ struct DailySource {
     blocks: Vec<BlockDocumentInput>,
     pending_ids: HashSet<String>,
     totals: DailyTotals,
+    namespace_stats: BTreeMap<String, NamespaceStats>,
     coverage: DailyCoverage,
     hash: String,
 }
 
-impl DailySource {
-    fn document_input(&self, day: &str, timezone: &str) -> Value {
-        let mut pending_block_ids = self.pending_ids.iter().cloned().collect::<Vec<_>>();
-        pending_block_ids.sort();
-        json!({
-            "day": day,
-            "timezone": timezone,
-            "aggregate": {
-                "measured_totals": &self.totals,
-                "coverage": &self.coverage,
-                "pending_block_ids": pending_block_ids,
-                "blocks": &self.blocks,
-            },
-        })
-    }
-}
-
 fn run(config: AppConfig, stop: Receiver<()>) {
     loop {
-        if !config.tera_api_key.trim().is_empty()
-            && let Err(error) = scan_closed_days(&config)
-        {
+        if let Err(error) = scan_closed_days(&config) {
             logger::info(format!("Daily report scan failed: {error:#}"));
         }
         match stop.recv_timeout(DAILY_SCAN_INTERVAL) {
@@ -140,24 +129,16 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
     }
 
     let timezone = Local::now().offset().to_string();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build daily-report runtime")?;
-    let report = runtime.block_on(llm_client::generate_daily_activity_report(
-        config.clone(),
-        source.document_input(day, &timezone),
-    ))?;
+    let body = render_daily_report(&source);
     let document = format!(
-        "---\ndate: {day}\ntimezone: {timezone}\ngenerated_at: {}\nsource_hash: {}\nprompt_version: {}\nsource_blocks: {}\npending_blocks: {}\ncoverage_complete: {}\nmodel: {}\n---\n\n# Activity report — {day}\n\n{}\n",
+        "---\ndate: {day}\ntimezone: {timezone}\ngenerated_at: {}\nsource_hash: {}\ngenerator_version: {}\nsource_blocks: {}\npending_blocks: {}\ncoverage_complete: {}\n---\n\n# Activity report — {day}\n\n{}",
         Local::now().to_rfc3339(),
         source.hash,
-        DAILY_PROMPT_VERSION,
+        DAILY_GENERATOR_VERSION,
         source.blocks.len(),
         source.pending_ids.len(),
         source.coverage.complete,
-        config.tera_model,
-        report.trim(),
+        body,
     );
     let _write_guard = crate::artifact_store::lock();
     if output.parent().is_some_and(|directory| {
@@ -194,25 +175,173 @@ fn build_daily_source(config: &AppConfig, day: &str) -> Result<DailySource> {
         .collect::<HashSet<_>>();
     let coverage = coverage_input(day, config.journal_block_minutes, &report_ids, &pending_ids);
     let totals = measured_totals(&blocks);
+    let namespace_stats = namespace_totals(&blocks);
     let mut pending_for_hash = pending_ids.iter().cloned().collect::<Vec<_>>();
     pending_for_hash.sort();
+    let projected_blocks = blocks
+        .iter()
+        .map(|block| {
+            json!({
+                "block": block.block,
+                "window_start": block.window_start,
+                "window_end": block.window_end,
+                "outcome": block.outcome,
+                "active_seconds": block.active_seconds,
+                "idle_seconds": block.idle_seconds,
+                "app_seconds": block.app_seconds,
+                "timeline": block.timeline,
+                "title": block.title,
+                "subjects": block.subjects,
+            })
+        })
+        .collect::<Vec<_>>();
     let hash_source = json!({
-        "prompt_version": DAILY_PROMPT_VERSION,
+        "generator_version": DAILY_GENERATOR_VERSION,
         "day": day,
-        "model": config.tera_model,
         "block_minutes": config.journal_block_minutes,
         "pending_block_ids": pending_for_hash,
         "measured_totals": &totals,
+        "namespace_stats": &namespace_stats,
         "coverage": &coverage,
-        "blocks": &blocks,
+        "blocks": projected_blocks,
     });
     Ok(DailySource {
         blocks,
         pending_ids,
         totals,
+        namespace_stats,
         coverage,
         hash: stable_hash(&serde_json::to_vec(&hash_source)?),
     })
+}
+
+fn render_daily_report(source: &DailySource) -> String {
+    let mut output = String::new();
+    output.push_str("## Blocks\n\n");
+    if source.blocks.is_empty() {
+        output.push_str("No completed blocks.\n\n");
+    } else {
+        let mut blocks = source.blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by(|left, right| left.block.cmp(&right.block));
+        for block in blocks {
+            let title = block.title.as_deref().unwrap_or(&block.outcome);
+            output.push_str(&format!(
+                "### {}–{} — {}\n\n",
+                local_clock(block.window_start, "%H:%M"),
+                local_clock(block.window_end, "%H:%M"),
+                markdown_inline(title),
+            ));
+            output.push_str(&format!(
+                "- Telemetry: {} active, {} idle; outcome `{}`.\n",
+                human_duration(block.active_seconds),
+                human_duration(block.idle_seconds),
+                markdown_code(&block.outcome),
+            ));
+            if block.subjects.is_empty() {
+                output.push_str("- Namespaces: none.\n");
+            } else {
+                output.push_str("- Subjects:\n");
+                for subject in &block.subjects {
+                    let namespace = namespace_path(&subject.namespaces);
+                    let attention = match subject.unattended {
+                        Some(true) => ", unattended",
+                        Some(false) => "",
+                        None => ", attention unknown",
+                    };
+                    let depth = subject
+                        .learning
+                        .as_ref()
+                        .map(|learning| format!(", depth `{}`", enum_kebab(&learning.depth)))
+                        .unwrap_or_default();
+                    output.push_str(&format!(
+                        "  - `{}` — {} ({}{}{})\n",
+                        markdown_code(&namespace),
+                        markdown_inline(&subject.subject),
+                        human_duration(subject.estimated_duration_s),
+                        attention,
+                        depth,
+                    ));
+                }
+            }
+            if block.timeline.is_empty() {
+                output.push_str("- Timeline: unavailable.\n\n");
+            } else {
+                output.push_str("- Timeline:\n");
+                for line in &block.timeline {
+                    output.push_str(&format!("  - {}\n", markdown_inline(line)));
+                }
+                output.push('\n');
+            }
+        }
+    }
+
+    output.push_str("## Telemetry statistics\n\n");
+    output.push_str(&format!(
+        "- Active: {}\n- Idle: {}\n",
+        human_duration(source.totals.active_seconds),
+        human_duration(source.totals.idle_seconds),
+    ));
+    output.push_str("\n### Applications\n\n");
+    if source.totals.app_seconds.is_empty() {
+        output.push_str("No measured application time.\n");
+    } else {
+        let mut apps = source.totals.app_seconds.iter().collect::<Vec<_>>();
+        apps.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        output.push_str("| Application | Measured time |\n| --- | ---: |\n");
+        for (app, seconds) in apps {
+            output.push_str(&format!(
+                "| {} | {} |\n",
+                markdown_table(app),
+                human_duration(*seconds)
+            ));
+        }
+    }
+    output.push_str("\n### Outcomes\n\n");
+    if source.totals.outcomes.is_empty() {
+        output.push_str("No block outcomes.\n");
+    } else {
+        output.push_str("| Outcome | Blocks |\n| --- | ---: |\n");
+        for (outcome, count) in &source.totals.outcomes {
+            output.push_str(&format!("| `{}` | {} |\n", markdown_code(outcome), count));
+        }
+    }
+
+    output.push_str("\n## Namespace statistics\n\n");
+    output.push_str(
+        "Durations are independent model estimates and may overlap across subjects and namespace prefixes.\n\n",
+    );
+    if source.namespace_stats.is_empty() {
+        output.push_str("No subject namespaces.\n");
+    } else {
+        output.push_str(
+            "| Namespace | Estimated time | Subjects | Unattended | Attention unknown |\n| --- | ---: | ---: | ---: | ---: |\n",
+        );
+        for (namespace, stats) in &source.namespace_stats {
+            output.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                markdown_code(namespace),
+                human_duration(stats.estimated_duration_s),
+                stats.subjects,
+                stats.unattended_subjects,
+                stats.attention_unknown_subjects,
+            ));
+        }
+    }
+
+    output.push_str("\n## Coverage gaps\n\n");
+    if source.coverage.complete {
+        output.push_str("Complete coverage.\n");
+    } else {
+        for gap in &source.coverage.gaps {
+            output.push_str(&format!(
+                "- {}–{}: {}.\n",
+                markdown_inline(&gap.start),
+                markdown_inline(&gap.end),
+                markdown_inline(gap.status),
+            ));
+        }
+    }
+    output
 }
 
 fn load_day_reports(config: &AppConfig, day: &str) -> Result<Vec<BlockDocumentInput>> {
@@ -333,6 +462,85 @@ fn measured_totals(blocks: &[BlockDocumentInput]) -> DailyTotals {
     }
 }
 
+fn namespace_totals(blocks: &[BlockDocumentInput]) -> BTreeMap<String, NamespaceStats> {
+    let mut totals = BTreeMap::new();
+    for subject in blocks.iter().flat_map(|block| &block.subjects) {
+        if subject.namespaces.is_empty() {
+            add_namespace_stat(&mut totals, "unclassified", subject);
+            continue;
+        }
+        for length in 1..=subject.namespaces.len() {
+            let namespace = namespace_path(&subject.namespaces[..length]);
+            add_namespace_stat(&mut totals, &namespace, subject);
+        }
+    }
+    totals
+}
+
+fn add_namespace_stat(
+    totals: &mut BTreeMap<String, NamespaceStats>,
+    namespace: &str,
+    subject: &crate::block_artifact::ActivitySubject,
+) {
+    let stats = totals
+        .entry(namespace.to_string())
+        .or_insert(NamespaceStats {
+            estimated_duration_s: 0,
+            subjects: 0,
+            unattended_subjects: 0,
+            attention_unknown_subjects: 0,
+        });
+    stats.estimated_duration_s = stats
+        .estimated_duration_s
+        .saturating_add(subject.estimated_duration_s);
+    stats.subjects += 1;
+    match subject.unattended {
+        Some(true) => stats.unattended_subjects += 1,
+        Some(false) => {}
+        None => stats.attention_unknown_subjects += 1,
+    }
+}
+
+fn namespace_path(namespaces: &[String]) -> String {
+    if namespaces.is_empty() {
+        "unclassified".to_string()
+    } else {
+        namespaces.join(" / ")
+    }
+}
+
+fn enum_kebab<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn human_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn markdown_inline(text: &str) -> String {
+    text.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+fn markdown_code(text: &str) -> String {
+    markdown_inline(text).replace('`', "'")
+}
+
+fn markdown_table(text: &str) -> String {
+    markdown_inline(text).replace('|', "\\|")
+}
+
 fn frontmatter_value(content: &str, name: &str) -> Option<String> {
     if !content.starts_with("---\n") {
         return None;
@@ -408,4 +616,155 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DailyCoverage, DailySource, DailyTotals, NamespaceStats, coverage_input, day_bounds,
+        local_clock, namespace_totals, render_daily_report,
+    };
+    use crate::block_artifact::{ActivitySubject, BlockDocumentInput};
+    use std::collections::{BTreeMap, HashSet};
+
+    fn block(subjects: Vec<ActivitySubject>) -> BlockDocumentInput {
+        BlockDocumentInput {
+            block: "2026-07-28T1200".to_string(),
+            window_start: 1_775_000_000,
+            window_end: 1_775_000_600,
+            outcome: "described".to_string(),
+            active_seconds: 420,
+            idle_seconds: 180,
+            app_seconds: BTreeMap::from([("code.exe".to_string(), 600)]),
+            timeline: vec!["12:00:00-12:10:00 (10m00s) code.exe — Ashe".to_string()],
+            title: Some("Software development: implemented learning records".to_string()),
+            report: Some("This prose must not drive the daily report.".to_string()),
+            subjects,
+            learning_enrichment: None,
+            reason: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn namespace_statistics_include_every_prefix_and_attention_state() {
+        let blocks = vec![block(vec![ActivitySubject {
+            namespaces: vec![
+                "software-development".to_string(),
+                "agentic-coding".to_string(),
+                "ashe-worker".to_string(),
+            ],
+            subject: "Implemented the change.".to_string(),
+            estimated_duration_s: 300,
+            unattended: Some(true),
+            learning: None,
+        }])];
+        let stats = namespace_totals(&blocks);
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats["software-development"].estimated_duration_s, 300);
+        assert_eq!(
+            stats["software-development / agentic-coding"].unattended_subjects,
+            1
+        );
+        assert_eq!(
+            stats["software-development / agentic-coding / ashe-worker"].subjects,
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_subjects_are_counted_with_unknown_attention() {
+        let blocks = vec![block(vec![ActivitySubject {
+            namespaces: vec!["learning".to_string()],
+            subject: "Read material.".to_string(),
+            estimated_duration_s: 90,
+            unattended: None,
+            learning: None,
+        }])];
+        let stats = namespace_totals(&blocks);
+        assert_eq!(stats["learning"].attention_unknown_subjects, 1);
+    }
+
+    #[test]
+    fn coverage_distinguishes_pending_and_missing_intervals() {
+        let day = "2026-07-28";
+        let (start, _) = day_bounds(day).unwrap();
+        let span = 720 * 60;
+        let first = start + (span - start.rem_euclid(span)).rem_euclid(span);
+        let reports = HashSet::from([format!("{day}T{}", local_clock(first, "%H%M"))]);
+        let pending = HashSet::from([format!("{day}T{}", local_clock(first + span, "%H%M"))]);
+        let pending_coverage = coverage_input(day, 720, &reports, &pending);
+        assert!(!pending_coverage.complete);
+        assert!(
+            pending_coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.status == "pending description")
+        );
+
+        let missing_coverage = coverage_input(day, 720, &reports, &HashSet::new());
+        assert!(
+            missing_coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.status == "missing/unknown")
+        );
+    }
+
+    #[test]
+    fn daily_markdown_is_a_deterministic_structured_projection() {
+        let later = block(vec![ActivitySubject {
+            namespaces: vec!["learning".to_string(), "lookup".to_string()],
+            subject: "Looked up a Rust term.".to_string(),
+            estimated_duration_s: 120,
+            unattended: Some(false),
+            learning: None,
+        }]);
+        let mut earlier = block(vec![]);
+        earlier.block = "2026-07-28T1100".to_string();
+        earlier.window_start -= 3_600;
+        earlier.window_end -= 3_600;
+        earlier.title = Some("Earlier title".to_string());
+        earlier.timeline = vec!["11:00:00-11:10:00 earlier timeline".to_string()];
+        let source = DailySource {
+            totals: DailyTotals {
+                active_seconds: 420,
+                idle_seconds: 180,
+                app_seconds: BTreeMap::from([("code.exe".to_string(), 600)]),
+                outcomes: BTreeMap::from([("described".to_string(), 1)]),
+            },
+            namespace_stats: BTreeMap::from([(
+                "learning".to_string(),
+                NamespaceStats {
+                    estimated_duration_s: 120,
+                    subjects: 1,
+                    unattended_subjects: 0,
+                    attention_unknown_subjects: 0,
+                },
+            )]),
+            coverage: DailyCoverage {
+                complete: false,
+                gaps: vec![super::CoverageGap {
+                    start: "00:00".to_string(),
+                    end: "12:00".to_string(),
+                    status: "missing/unknown",
+                }],
+            },
+            pending_ids: HashSet::new(),
+            blocks: vec![later, earlier],
+            hash: "hash".to_string(),
+        };
+        let report = render_daily_report(&source);
+        assert!(report.contains("## Blocks"));
+        assert!(
+            report.find("Earlier title").unwrap() < report.find("Software development").unwrap()
+        );
+        assert!(report.contains("earlier timeline"));
+        assert!(report.contains("`learning / lookup`"));
+        assert!(report.contains("## Telemetry statistics"));
+        assert!(report.contains("## Namespace statistics"));
+        assert!(report.contains("## Coverage gaps"));
+        assert!(report.contains("00:00–12:00: missing/unknown"));
+        assert!(!report.contains("This prose must not drive the daily report."));
+    }
 }
