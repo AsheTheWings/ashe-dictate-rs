@@ -1,8 +1,8 @@
 use crate::activity::{self, ActivitySample};
 use crate::archive::ArchiveHandle;
 use crate::block_artifact::{
-    ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput, LearningEnrichment,
-    LearningEnrichmentStatus,
+    ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput,
+    LEARNING_ARTIFACT_SCHEMA_VERSION, LearningArtifact, LearningEnrichmentStatus,
 };
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
@@ -642,9 +642,15 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
             &block,
             &base,
             &metrics,
-            Some(LearningEnrichment {
+            Some(LearningArtifact {
+                schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
+                block: block.id(),
+                window_start: block.start,
+                window_end: block.end,
                 status: LearningEnrichmentStatus::InsufficientEvidence,
                 frames_sent: 0,
+                model: None,
+                subjects: Vec::new(),
                 error: Some("no selected learning frame remained readable".to_string()),
             }),
             status,
@@ -665,15 +671,20 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
         duration_budget_s,
     )) {
         Ok(learning) => {
-            let narrative = base.with_learning_subjects(learning.learning_subjects);
             finish_description(
                 config,
                 &block,
-                &narrative,
+                &base,
                 &metrics,
-                Some(LearningEnrichment {
+                Some(LearningArtifact {
+                    schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
+                    block: block.id(),
+                    window_start: block.start,
+                    window_end: block.end,
                     status: LearningEnrichmentStatus::Complete,
                     frames_sent: learning_paths.len(),
+                    model: Some(config.tera_model.clone()),
+                    subjects: learning.learning_subjects,
                     error: None,
                 }),
                 status,
@@ -693,9 +704,15 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<J
                 &block,
                 &base,
                 &metrics,
-                Some(LearningEnrichment {
+                Some(LearningArtifact {
+                    schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
+                    block: block.id(),
+                    window_start: block.start,
+                    window_end: block.end,
                     status: LearningEnrichmentStatus::InvalidModelOutput,
                     frames_sent: learning_paths.len(),
+                    model: Some(config.tera_model.clone()),
+                    subjects: Vec::new(),
                     error: Some(sanitized_error(&error)),
                 }),
                 status,
@@ -710,7 +727,7 @@ fn finish_description(
     block: &Block,
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
-    learning_enrichment: Option<LearningEnrichment>,
+    learning_artifact: Option<LearningArtifact>,
     status: &Arc<Mutex<JournalStatus>>,
 ) {
     let title = narrative.title.clone();
@@ -719,7 +736,7 @@ fn finish_description(
         block,
         narrative,
         metrics,
-        learning_enrichment.as_ref(),
+        learning_artifact.as_ref(),
     ) {
         logger::info(format!("Writing journal block failed: {error:#}"));
         return;
@@ -1025,6 +1042,12 @@ fn report_path(root: &Path, block: &Block) -> PathBuf {
         .join(format!("{}.json", block.slug()))
 }
 
+fn learning_report_path(root: &Path, block: &Block) -> PathBuf {
+    day_dir(root, &block.day)
+        .join("learning")
+        .join(format!("{}.json", block.slug()))
+}
+
 fn save_pending(root: &Path, block: &Block) -> Result<()> {
     let _write_guard = crate::artifact_store::lock();
     let path = pending_path(root, block);
@@ -1063,7 +1086,7 @@ fn write_report(
     block: &Block,
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
-    learning_enrichment: Option<&LearningEnrichment>,
+    learning_artifact: Option<&LearningArtifact>,
 ) -> Result<()> {
     let _write_guard = crate::artifact_store::lock();
     let directory = day_dir(&config.journal_artifacts_dir, &block.day);
@@ -1075,6 +1098,9 @@ fn write_report(
     );
     fs::create_dir_all(directory.join("blocks"))?;
     fs::create_dir_all(directory.join("keyframes"))?;
+    if learning_artifact.is_some() {
+        fs::create_dir_all(directory.join("learning"))?;
+    }
     let keyframe = block
         .frames
         .iter()
@@ -1110,22 +1136,22 @@ fn write_report(
         frames_captured: block.captured,
         frames_sent: None,
         base_frames_sent: Some(block.base_frames_sent),
-        learning_frames_sent: Some(
-            block
-                .frames
-                .iter()
-                .filter(|frame| frame.sent_to_learning)
-                .count(),
-        ),
+        learning_frames_sent: None,
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
         model: Some(config.tera_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
-        learning_enrichment: learning_enrichment.cloned(),
+        learning_enrichment: None,
         reason: None,
         error: None,
     };
+    if let Some(learning) = learning_artifact {
+        write_learning_artifact(
+            &learning_report_path(&config.journal_artifacts_dir, block),
+            learning,
+        )?;
+    }
     write_block_artifact(
         &report_path(&config.journal_artifacts_dir, block),
         &artifact,
@@ -1223,6 +1249,12 @@ fn write_terminal_block(
 }
 
 fn write_block_artifact(path: &Path, artifact: &BlockArtifact) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
+    replace_file(&temporary, path)
+}
+
+fn write_learning_artifact(path: &Path, artifact: &LearningArtifact) -> Result<()> {
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
     replace_file(&temporary, path)
@@ -1522,10 +1554,15 @@ mod tests {
         ActivitySample, Block, BlockArtifact, DedupState, DescriptionQueue, FrameRecord,
         capture_interval_for_sample, context_detailed_offset, json_journal_entry, matches_denylist,
         ordinary_cadence_candidates, select_frame_candidates, select_frame_candidates_with_size,
-        should_suppress_description,
+        should_suppress_description, write_report,
     };
-    use crate::block_artifact::{ActivitySubject, BLOCK_SCHEMA_VERSION};
+    use crate::block_artifact::{
+        ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LEARNING_ARTIFACT_SCHEMA_VERSION,
+        LearningArtifact, LearningDepth, LearningEnrichmentStatus, LearningRecord,
+    };
+    use crate::config::AppConfig;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1749,6 +1786,80 @@ mod tests {
     }
 
     #[test]
+    fn activity_and_learning_are_written_to_separate_artifact_directories() {
+        let root = tempfile_directory("separate-learning");
+        let mut config = AppConfig::load();
+        config.journal_artifacts_dir = root.clone();
+        config.tera_model = "test-model".to_string();
+        let block = Block::new(0, 600);
+        let base = ActivityNarrative {
+            title: "Learning: reviewed ownership".to_string(),
+            report: "The user reviewed ownership material.".to_string(),
+            subjects: vec![ActivitySubject {
+                namespaces: vec!["learning".to_string(), "reading".to_string()],
+                subject: "Reviewed ownership material.".to_string(),
+                estimated_duration_s: 300,
+                unattended: Some(false),
+                learning: None,
+            }],
+        };
+        let learning = LearningArtifact {
+            schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
+            block: block.id(),
+            window_start: block.start,
+            window_end: block.end,
+            status: LearningEnrichmentStatus::Complete,
+            frames_sent: 4,
+            model: Some("test-model".to_string()),
+            subjects: vec![ActivitySubject {
+                namespaces: vec![
+                    "learning".to_string(),
+                    "reading".to_string(),
+                    "rust".to_string(),
+                    "ownership".to_string(),
+                ],
+                subject: "Reviewed Rust ownership rules.".to_string(),
+                estimated_duration_s: 240,
+                unattended: Some(false),
+                learning: Some(LearningRecord {
+                    search_queries: Vec::new(),
+                    sources: Vec::new(),
+                    depth: LearningDepth::FocusedExplanation,
+                }),
+            }],
+            error: None,
+        };
+        let metrics = super::BlockMetrics {
+            timeline: vec!["00:00:00-00:10:00 material".to_string()],
+            totals: "browser: 10m00s".to_string(),
+            app_seconds: BTreeMap::from([("browser".to_string(), 600)]),
+            active_seconds: 300,
+            idle_seconds: 300,
+        };
+
+        write_report(&config, &block, &base, &metrics, Some(&learning)).unwrap();
+
+        let activity: BlockArtifact =
+            serde_json::from_slice(&fs::read(super::report_path(&root, &block)).unwrap()).unwrap();
+        let stored_learning: LearningArtifact =
+            serde_json::from_slice(&fs::read(super::learning_report_path(&root, &block)).unwrap())
+                .unwrap();
+        assert_eq!(activity.subjects, base.subjects);
+        assert!(activity.subjects[0].learning.is_none());
+        assert!(activity.learning_enrichment.is_none());
+        assert!(activity.learning_frames_sent.is_none());
+        assert_eq!(stored_learning.subjects, learning.subjects);
+        assert_eq!(
+            super::load_successful_reports(&root, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn description_is_suppressed_only_for_low_activity_and_static_visuals() {
         assert!(should_suppress_description(29, 1, 30));
         assert!(!should_suppress_description(30, 1, 30));
@@ -1781,5 +1892,18 @@ mod tests {
         assert_eq!(state.observe(low_delta.clone(), 120, 2.0, 120), 1.0);
         assert_eq!(state.retained_ts, Some(120));
         assert_eq!(state.observe(low_delta, 140, 2.0, 120), 0.0);
+    }
+
+    fn tempfile_directory(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ashe-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
     }
 }

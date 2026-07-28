@@ -355,15 +355,18 @@ mod tests {
     fn sealed_day_cleanup_removes_plaintext_and_images_but_keeps_archive() {
         let root = tempfile_directory("sealed-cleanup");
         fs::create_dir_all(root.join("blocks")).unwrap();
+        fs::create_dir_all(root.join("learning")).unwrap();
         fs::create_dir_all(root.join("keyframes")).unwrap();
         fs::write(root.join(ARCHIVE_FILENAME), "ciphertext").unwrap();
         fs::write(root.join("journal.md"), "plaintext").unwrap();
         fs::write(root.join("blocks/1200.json"), "plaintext").unwrap();
+        fs::write(root.join("learning/1200.json"), "plaintext").unwrap();
         fs::write(root.join("keyframes/1200.webp"), "image").unwrap();
         cleanup_sealed_day(&root).unwrap();
         assert!(root.join(ARCHIVE_FILENAME).is_file());
         assert!(!root.join("journal.md").exists());
         assert!(!root.join("blocks").exists());
+        assert!(!root.join("learning").exists());
         assert!(!root.join("keyframes").exists());
         fs::remove_dir_all(root).unwrap();
     }

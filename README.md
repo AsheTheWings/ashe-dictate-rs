@@ -55,12 +55,12 @@ Namespaces use stable domain-specific positions; preferred roots include
 `software-development`, `entertainment`, `social-media`, and `learning`.
 
 When a base subject is rooted at `learning`, the worker makes a second request from a denser
-temporary evidence buffer. That request replaces provisional learning subjects with atomic
-learning units containing visible search queries, source material, and one evidence-backed
-depth: `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or
-`synthesis`. Depth describes observable exposure and engagement, not comprehension or
-retention. Passive activity is not considered unattended merely because keyboard and mouse
-input stopped.
+temporary evidence buffer. The activity block keeps the base response unchanged. The second
+request writes a separate JSON artifact under that day's `learning/` directory containing
+atomic learning units, visible search queries, source material, and one evidence-backed depth:
+`lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or `synthesis`.
+Depth describes observable exposure and engagement, not comprehension or retention. Passive
+activity is not considered unattended merely because keyboard and mouse input stopped.
 
 The ordinary block request and learning request have independent frame selection and
 payload accounting. Learning enrichment captures temporary frames every 10 seconds by
@@ -70,11 +70,12 @@ request does not create a gap in the following block. The chronological `journal
 rebuilt from the base report fields in the JSON block artifacts; structured subjects remain
 canonical in JSON.
 
-Block schema version 2 stores attention judgments, learning records, and separate base and
-learning frame counts. Version-1 artifacts remain readable and keep their missing attention
-judgment as unknown. Recent completed blocks remain available in full. Older canonical JSON
-blocks are projected into a structured aggregate and folded once into the bounded plaintext
-`summary.md`, which serves as convenient long-term context.
+Block schema version 2 stores the base activity description and attention judgments.
+Learning artifacts have their own schema and request frame count. Version-1 block artifacts
+remain readable and keep their missing attention judgment as unknown. Recent activity blocks
+remain available in full. Older activity blocks are projected into a structured aggregate and
+folded once into the bounded plaintext `summary.md`; learning artifacts are never included in
+that rollup.
 
 At the end of each day, the worker generates `daily.md` deterministically without a daily
 model request. It projects block titles, subject namespaces, subject estimates, and measured

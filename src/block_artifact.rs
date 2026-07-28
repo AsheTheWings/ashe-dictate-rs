@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 pub const LEGACY_BLOCK_SCHEMA_VERSION: u32 = 1;
 pub const BLOCK_SCHEMA_VERSION: u32 = 2;
+pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -97,21 +98,6 @@ impl ActivityNarrative {
 
     pub fn has_learning(&self) -> bool {
         self.subjects.iter().any(ActivitySubject::is_learning)
-    }
-
-    pub fn with_learning_subjects(&self, learning_subjects: Vec<ActivitySubject>) -> Self {
-        let mut subjects = self
-            .subjects
-            .iter()
-            .filter(|subject| !subject.is_learning())
-            .cloned()
-            .collect::<Vec<_>>();
-        subjects.extend(learning_subjects);
-        Self {
-            title: self.title.clone(),
-            report: self.report.clone(),
-            subjects,
-        }
     }
 
     pub fn validate_duration_budget(&self, duration_budget_s: u64) -> Result<(), String> {
@@ -302,6 +288,22 @@ pub struct LearningEnrichment {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct LearningArtifact {
+    pub schema_version: u32,
+    pub block: String,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub status: LearningEnrichmentStatus,
+    pub frames_sent: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub subjects: Vec<ActivitySubject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockArtifact {
     pub schema_version: u32,
     pub block: String,
@@ -467,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn learning_merge_preserves_base_document_and_non_learning_subjects() {
+    fn learning_artifact_is_separate_from_the_base_narrative() {
         let base = ActivityNarrative::parse(
             r#"{"title":"Mixed block","report":"Worked and learned.","subjects":[
                 {"namespaces":["software-development","coding","ashe-worker"],"subject":"Changed code.","estimated_duration_s":300,"unattended":false},
@@ -482,11 +484,33 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let merged = base.with_learning_subjects(enriched.learning_subjects);
-        assert_eq!(merged.title, "Mixed block");
-        assert_eq!(merged.report, "Worked and learned.");
-        assert_eq!(merged.subjects.len(), 3);
-        assert_eq!(merged.subjects[0].namespaces[0], "software-development");
+        let artifact = super::LearningArtifact {
+            schema_version: super::LEARNING_ARTIFACT_SCHEMA_VERSION,
+            block: "2026-07-28T1200".to_string(),
+            window_start: 1,
+            window_end: 2,
+            status: super::LearningEnrichmentStatus::Complete,
+            frames_sent: 3,
+            model: Some("model".to_string()),
+            subjects: enriched.learning_subjects,
+            error: None,
+        };
+
+        assert_eq!(base.title, "Mixed block");
+        assert_eq!(base.report, "Worked and learned.");
+        assert_eq!(base.subjects.len(), 2);
+        assert!(
+            base.subjects
+                .iter()
+                .all(|subject| subject.learning.is_none())
+        );
+        assert_eq!(artifact.subjects.len(), 2);
+        assert!(
+            artifact
+                .subjects
+                .iter()
+                .all(|subject| subject.is_learning() && subject.learning.is_some())
+        );
     }
 
     #[test]

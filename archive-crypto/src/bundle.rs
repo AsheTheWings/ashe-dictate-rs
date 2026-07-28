@@ -271,18 +271,24 @@ mod tests {
         let root = tempfile_directory("bundle");
         let day = root.join("2026-07-25");
         fs::create_dir_all(day.join("blocks")).unwrap();
+        fs::create_dir_all(day.join("learning")).unwrap();
         fs::create_dir_all(day.join("keyframes")).unwrap();
         fs::write(day.join("journal.md"), "journal").unwrap();
         fs::write(day.join("blocks/1200-1210.json"), "{}").unwrap();
+        fs::write(day.join("learning/1200-1210.json"), "learning").unwrap();
         fs::write(day.join("keyframes/1200.webp"), "image").unwrap();
         let bundle = pack_day(&day, "2026-07-25").unwrap();
-        assert_eq!(bundle.source_paths.len(), 2);
+        assert_eq!(bundle.source_paths.len(), 3);
         let restored = root.join("restored");
         let restored_day = extract_bundle(&bundle.payload, &restored).unwrap();
         assert_eq!(restored_day, "2026-07-25");
         assert_eq!(
             fs::read_to_string(restored.join("journal.md")).unwrap(),
             "journal"
+        );
+        assert_eq!(
+            fs::read_to_string(restored.join("learning/1200-1210.json")).unwrap(),
+            "learning"
         );
         assert!(!restored.join("keyframes").exists());
         fs::remove_dir_all(root).unwrap();
