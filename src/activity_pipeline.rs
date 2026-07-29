@@ -2,7 +2,6 @@ use crate::activity_telemetry::{self, ActivitySample};
 use crate::archive::ArchiveHandle;
 use crate::block_artifact::{
     ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, BlockDocumentInput,
-    LEARNING_ARTIFACT_SCHEMA_VERSION, LearningArtifact, LearningEnrichmentStatus,
 };
 use crate::config::AppConfig;
 use crate::daily_report::DailyReportHandle;
@@ -19,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PENDING_BLOCK_SCHEMA_VERSION: u32 = 1;
+const PENDING_BLOCK_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct ActivityStatus {
@@ -155,9 +154,7 @@ struct FrameRecord {
     height: u32,
     delta: f32,
     window: String,
-    sent_to_base: bool,
-    sent_to_learning: bool,
-    input_idle: bool,
+    sent_to_model: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -171,8 +168,6 @@ struct Block {
     samples: Vec<ActivitySample>,
     captured: usize,
     attempts: usize,
-    base_narrative: Option<ActivityNarrative>,
-    base_frames_sent: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -232,8 +227,6 @@ impl Block {
             samples: Vec::new(),
             captured: 0,
             attempts: 0,
-            base_narrative: None,
-            base_frames_sent: 0,
         }
     }
 
@@ -282,11 +275,9 @@ fn run(
     if running {
         block = recover_pending(&config, block_seconds, &descriptions)?;
         logger::info(format!(
-            "Activity tracking started: capture={}s idle_capture={}s learning_capture={}s learning_enrichment={} block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
+            "Activity tracking started: capture={}s max_frame_gap={}s block={}m dedup={}pct idle={}s min_active={}s artifacts={}",
             config.activity_capture_interval,
-            config.activity_idle_capture_interval,
-            config.learning_capture_interval,
-            config.learning_enrichment_enabled,
+            config.activity_max_frame_gap_s,
             config.activity_block_minutes,
             config.activity_dedup_threshold,
             config.activity_idle_threshold_s,
@@ -358,21 +349,11 @@ fn run(
         }
         was_inactive = inactive;
 
-        let Some(capture_interval) = capture_interval_for_sample(
-            &sample,
-            config.activity_idle_threshold_s,
-            config.activity_capture_interval,
-            config.activity_idle_capture_interval,
-            config.learning_enrichment_enabled,
-            config.learning_capture_interval,
-        ) else {
+        let Some(capture_interval) =
+            capture_interval_for_sample(&sample, config.activity_capture_interval)
+        else {
             // Sampling continues for accurate coverage, but locked desktops are never captured.
-            next_capture = stamp
-                + (if config.learning_enrichment_enabled {
-                    config.learning_capture_interval
-                } else {
-                    config.activity_capture_interval
-                }) as i64;
+            next_capture = stamp + config.activity_capture_interval as i64;
             continue;
         };
 
@@ -431,9 +412,7 @@ fn capture(
         height: frame.height,
         delta,
         window: sample.label(),
-        sent_to_base: false,
-        sent_to_learning: false,
-        input_idle: sample.idle_s >= config.activity_idle_threshold_s,
+        sent_to_model: false,
     });
     block.captured += 1;
     Ok(())
@@ -451,22 +430,11 @@ fn matches_denylist(denylist: &[String], sample: &ActivitySample) -> bool {
     denylist.iter().any(|term| text.contains(term))
 }
 
-fn capture_interval_for_sample(
-    sample: &ActivitySample,
-    idle_threshold_s: f64,
-    active_interval_s: u64,
-    idle_interval_s: u64,
-    learning_enrichment_enabled: bool,
-    learning_interval_s: u64,
-) -> Option<u64> {
+fn capture_interval_for_sample(sample: &ActivitySample, capture_interval_s: u64) -> Option<u64> {
     if sample.locked {
         None
-    } else if learning_enrichment_enabled {
-        Some(learning_interval_s)
-    } else if sample.idle_s >= idle_threshold_s {
-        Some(idle_interval_s)
     } else {
-        Some(active_interval_s)
+        Some(capture_interval_s)
     }
 }
 
@@ -480,7 +448,7 @@ fn should_suppress_description(
 
 fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<ActivityStatus>>) {
     let metrics = block_metrics(config, &block);
-    if block.base_narrative.is_none() && block.frames.is_empty() {
+    if block.frames.is_empty() {
         let outcome = terminal_outcome(&block);
         let reason = if outcome == "locked" {
             "workstation locked"
@@ -491,27 +459,25 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<A
         let _ = clear_pending(&config.activity_artifacts_dir, &block);
         return;
     }
-    if block.base_narrative.is_none() {
-        let distinct_frames = block
-            .frames
-            .iter()
-            .filter(|frame| frame.delta >= config.activity_dedup_threshold)
-            .count();
-        if should_suppress_description(
-            metrics.active_seconds,
-            distinct_frames,
-            config.activity_min_active_seconds,
-        ) {
-            let outcome = terminal_outcome(&block);
-            let reason = if outcome == "locked" {
-                "workstation locked"
-            } else {
-                "idle or unchanged"
-            };
-            let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
-            let _ = clear_pending(&config.activity_artifacts_dir, &block);
-            return;
-        }
+    let distinct_frames = block
+        .frames
+        .iter()
+        .filter(|frame| frame.delta >= config.activity_dedup_threshold)
+        .count();
+    if should_suppress_description(
+        metrics.active_seconds,
+        distinct_frames,
+        config.activity_min_active_seconds,
+    ) {
+        let outcome = terminal_outcome(&block);
+        let reason = if outcome == "locked" {
+            "workstation locked"
+        } else {
+            "idle or unchanged"
+        };
+        let _ = write_terminal_block(config, &block, outcome, reason, &metrics);
+        let _ = clear_pending(&config.activity_artifacts_dir, &block);
+        return;
     }
 
     set_work_status(
@@ -526,7 +492,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<A
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            retry_description(config, &mut block, status, "base", &error);
+            retry_description(config, &mut block, status, &error);
             return;
         }
     };
@@ -536,191 +502,77 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<A
         .saturating_add(metrics.idle_seconds)
         .clamp(1, nominal_duration_s);
 
-    if block.base_narrative.is_none() {
-        let selected_paths = {
-            let selected = select_base_frames(&block.frames, config);
-            readable_images(selected)
-        };
-        let (paths, images) = selected_paths;
-        if images.is_empty() {
+    let (paths, images) = {
+        let selected = select_frames(&block.frames, config);
+        readable_images(selected)
+    };
+    if images.is_empty() {
+        let reason = "no selected frame remained readable";
+        if let Err(error) =
+            write_terminal_block(config, &block, "insufficient_evidence", reason, &metrics)
+        {
             logger::info(format!(
-                "No readable base frames for activity block {}",
+                "Writing insufficient-evidence block {} failed: {error:#}",
                 block.id()
             ));
             return;
         }
-        for frame in &mut block.frames {
-            frame.sent_to_base = paths.contains(&frame.path);
-        }
-        let result = runtime.block_on(async {
-            let earlier_context = build_earlier_context(config, block.start).await?;
-            let context = base_description_context(
-                config,
-                &block,
-                &metrics,
-                nominal_duration_s,
-                duration_budget_s,
-                images.len(),
-                &earlier_context,
-            );
-            llm_client::describe_activity_block(config.clone(), context, images, duration_budget_s)
-                .await
-        });
-        match result {
-            Ok(narrative) => {
-                block.base_frames_sent = paths.len();
-                block.base_narrative = Some(narrative);
-                if let Err(error) = save_pending(&config.activity_artifacts_dir, &block) {
-                    logger::info(format!(
-                        "Persisting base description of {} failed: {error:#}",
-                        block.id()
-                    ));
-                    return;
-                }
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<llm_client::InvalidActivityOutput>()
-                    .is_some() =>
-            {
-                let reason = sanitized_error(&error);
-                if let Err(write_error) =
-                    write_terminal_block(config, &block, "invalid_model_output", &reason, &metrics)
-                {
-                    logger::info(format!(
-                        "Writing invalid-output block {} failed: {write_error:#}",
-                        block.id()
-                    ));
-                    return;
-                }
-                let _ = clear_pending(&config.activity_artifacts_dir, &block);
-                logger::info(format!(
-                    "Base description of {} produced invalid structured output",
-                    block.id()
-                ));
-                set_work_status(
-                    status,
-                    "activity block had invalid model output".to_string(),
-                    0,
-                );
-                return;
-            }
-            Err(error) => {
-                retry_description(config, &mut block, status, "base", &error);
-                return;
-            }
-        }
-    }
-
-    let base = block
-        .base_narrative
-        .clone()
-        .expect("base narrative set or recovered");
-    if !config.learning_enrichment_enabled || !base.has_learning() {
-        finish_description(config, &block, &base, &metrics, None, status);
-        return;
-    }
-
-    set_work_status(
-        status,
-        format!("enriching learning in {}", block.label()),
-        block.frames.len(),
-    );
-    let (learning_paths, learning_images) = {
-        let selected = select_learning_frames(&block.frames, config);
-        readable_images(selected)
-    };
-    for frame in &mut block.frames {
-        frame.sent_to_learning = learning_paths.contains(&frame.path);
-    }
-    if learning_images.is_empty() {
-        finish_description(
-            config,
-            &block,
-            &base,
-            &metrics,
-            Some(LearningArtifact {
-                schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
-                block: block.id(),
-                window_start: block.start,
-                window_end: block.end,
-                status: LearningEnrichmentStatus::InsufficientEvidence,
-                frames_sent: 0,
-                model: None,
-                subjects: Vec::new(),
-                error: Some("no selected learning frame remained readable".to_string()),
-            }),
+        let _ = clear_pending(&config.activity_artifacts_dir, &block);
+        set_work_status(
             status,
+            "activity block lacked readable evidence".to_string(),
+            0,
         );
         return;
     }
-    let learning_context = learning_description_context(
-        &block,
-        &metrics,
-        duration_budget_s,
-        &base,
-        learning_images.len(),
-    );
-    match runtime.block_on(llm_client::describe_learning_block(
-        config.clone(),
-        learning_context,
-        learning_images,
-        duration_budget_s,
-    )) {
-        Ok(learning) => {
-            let enrichment_status = if learning.learning_subjects.is_empty() {
-                LearningEnrichmentStatus::NoLearning
-            } else {
-                LearningEnrichmentStatus::Complete
-            };
-            finish_description(
-                config,
-                &block,
-                &base,
-                &metrics,
-                Some(LearningArtifact {
-                    schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
-                    block: block.id(),
-                    window_start: block.start,
-                    window_end: block.end,
-                    status: enrichment_status,
-                    frames_sent: learning_paths.len(),
-                    model: Some(config.tera_model.clone()),
-                    subjects: learning.learning_subjects,
-                    error: None,
-                }),
-                status,
-            );
+    for frame in &mut block.frames {
+        frame.sent_to_model = paths.contains(&frame.path);
+    }
+    let result = runtime.block_on(async {
+        let earlier_context = build_earlier_context(config, block.start).await?;
+        let context = description_context(
+            config,
+            &block,
+            &metrics,
+            nominal_duration_s,
+            duration_budget_s,
+            images.len(),
+            &earlier_context,
+        );
+        llm_client::describe_activity_block(config.clone(), context, images, duration_budget_s)
+            .await
+    });
+    match result {
+        Ok(narrative) => {
+            finish_description(config, &block, &narrative, &metrics, paths.len(), status)
         }
         Err(error)
             if error
-                .downcast_ref::<llm_client::InvalidLearningOutput>()
+                .downcast_ref::<llm_client::InvalidActivityOutput>()
                 .is_some() =>
         {
+            let reason = sanitized_error(&error);
+            if let Err(write_error) =
+                write_terminal_block(config, &block, "invalid_model_output", &reason, &metrics)
+            {
+                logger::info(format!(
+                    "Writing invalid-output block {} failed: {write_error:#}",
+                    block.id()
+                ));
+                return;
+            }
+            let _ = clear_pending(&config.activity_artifacts_dir, &block);
             logger::info(format!(
-                "Learning enrichment of {} produced invalid structured output",
+                "Description of {} produced invalid structured output",
                 block.id()
             ));
-            finish_description(
-                config,
-                &block,
-                &base,
-                &metrics,
-                Some(LearningArtifact {
-                    schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
-                    block: block.id(),
-                    window_start: block.start,
-                    window_end: block.end,
-                    status: LearningEnrichmentStatus::InvalidModelOutput,
-                    frames_sent: learning_paths.len(),
-                    model: Some(config.tera_model.clone()),
-                    subjects: Vec::new(),
-                    error: Some(sanitized_error(&error)),
-                }),
+            set_work_status(
                 status,
+                "activity block had invalid model output".to_string(),
+                0,
             );
         }
-        Err(error) => retry_description(config, &mut block, status, "learning", &error),
+        Err(error) => retry_description(config, &mut block, status, &error),
     }
 }
 
@@ -729,17 +581,11 @@ fn finish_description(
     block: &Block,
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
-    learning_artifact: Option<LearningArtifact>,
+    frames_sent: usize,
     status: &Arc<Mutex<ActivityStatus>>,
 ) {
     let title = narrative.title.clone();
-    if let Err(error) = write_report(
-        config,
-        block,
-        narrative,
-        metrics,
-        learning_artifact.as_ref(),
-    ) {
+    if let Err(error) = write_report(config, block, narrative, metrics, frames_sent) {
         logger::info(format!("Writing activity block failed: {error:#}"));
         return;
     }
@@ -751,24 +597,23 @@ fn retry_description(
     config: &AppConfig,
     block: &mut Block,
     status: &Arc<Mutex<ActivityStatus>>,
-    stage: &str,
     _error: &anyhow::Error,
 ) {
     block.attempts += 1;
     let _ = save_pending(&config.activity_artifacts_dir, block);
     logger::info(format!(
-        "Activity description stage={stage} block={} attempt={} failed; retained for retry",
+        "Activity description block={} attempt={} failed; retained for retry",
         block.id(),
         block.attempts
     ));
     set_work_status(
         status,
-        format!("{stage} description pending: request failed"),
+        "activity description pending: request failed".to_string(),
         block.frames.len(),
     );
 }
 
-fn base_description_context(
+fn description_context(
     config: &AppConfig,
     block: &Block,
     metrics: &BlockMetrics,
@@ -778,7 +623,7 @@ fn base_description_context(
     earlier_context: &str,
 ) -> String {
     format!(
-        "## Block {} on {}\nThis block spans {} seconds with {} seconds of measured coverage. Captured {} temporary screenshots; {} ordinary-policy images are attached in chronological order. The ordinary evidence policy targets every {} seconds during input activity and every {} seconds after the idle threshold.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nWrite the report for this block only.",
+        "## Block {} on {}\nThis block spans {} seconds with {} seconds of measured coverage. Captured {} temporary screenshots; {} selected images are attached in chronological order. The evidence capture policy targets every {} seconds while the workstation is unlocked, and visual deduplication retains a frame at least every {} seconds.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n{}\n\nProduce the unified activity report and independently validated learning units for this block only.",
         block.label(),
         block.day,
         nominal_duration_s,
@@ -786,7 +631,7 @@ fn base_description_context(
         block.captured,
         image_count,
         config.activity_capture_interval,
-        config.activity_idle_capture_interval,
+        config.activity_max_frame_gap_s,
         if metrics.totals.is_empty() {
             "unavailable"
         } else {
@@ -799,35 +644,6 @@ fn base_description_context(
             .collect::<Vec<_>>()
             .join("\n"),
         earlier_context,
-    )
-}
-
-fn learning_description_context(
-    block: &Block,
-    metrics: &BlockMetrics,
-    duration_budget_s: u64,
-    base: &ActivityNarrative,
-    image_count: usize,
-) -> String {
-    let base_json = serde_json::to_string_pretty(base).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "## Learning validation for block {} on {}\nMeasured coverage is {} seconds and {} dense chronological images are attached.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n### Provisional high-recall base narrative (structured JSON)\n{}\n\nIndependently decide whether this block contains any genuine intellectual learning, then return only the validated atomic learning subjects. The empty result is valid.",
-        block.label(),
-        block.day,
-        duration_budget_s,
-        image_count,
-        if metrics.totals.is_empty() {
-            "unavailable"
-        } else {
-            &metrics.totals
-        },
-        metrics
-            .timeline
-            .iter()
-            .map(|line| format!("- {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        base_json,
     )
 }
 
@@ -863,59 +679,10 @@ fn readable_images(frames: Vec<&FrameRecord>) -> (HashSet<String>, Vec<(String, 
     (paths, images)
 }
 
-fn select_base_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a FrameRecord> {
-    let candidates = ordinary_cadence_candidates(
-        frames,
-        config.activity_capture_interval,
-        config.activity_idle_capture_interval,
-    );
-    select_frame_candidates(
-        candidates,
-        config.activity_max_frame_gap_s,
-        config.activity_dedup_threshold,
-        config.activity_max_frames_per_call,
-        config.activity_max_payload_mb,
-    )
-}
-
-fn ordinary_cadence_candidates(
-    frames: &[FrameRecord],
-    active_interval_s: u64,
-    idle_interval_s: u64,
-) -> Vec<&FrameRecord> {
-    let mut candidates = Vec::new();
-    let mut next_due = None;
-    let mut was_idle = false;
-    for frame in frames {
-        let resumed = was_idle && !frame.input_idle;
-        if next_due.is_none_or(|due| frame.ts >= due) || resumed {
-            candidates.push(frame);
-            let interval = if frame.input_idle {
-                idle_interval_s
-            } else {
-                active_interval_s
-            };
-            next_due = Some(frame.ts + interval as i64);
-        }
-        was_idle = frame.input_idle;
-    }
-    if let Some(last) = frames.last()
-        && candidates
-            .last()
-            .is_none_or(|frame| frame.path != last.path)
-    {
-        candidates.push(last);
-    }
-    candidates
-}
-
-fn select_learning_frames<'a>(
-    frames: &'a [FrameRecord],
-    config: &AppConfig,
-) -> Vec<&'a FrameRecord> {
+fn select_frames<'a>(frames: &'a [FrameRecord], config: &AppConfig) -> Vec<&'a FrameRecord> {
     select_frame_candidates(
         frames.iter().collect(),
-        config.learning_max_frame_gap_s,
+        config.activity_max_frame_gap_s,
         config.activity_dedup_threshold,
         config.activity_max_frames_per_call,
         config.activity_max_payload_mb,
@@ -1047,12 +814,6 @@ fn report_path(root: &Path, block: &Block) -> PathBuf {
         .join(format!("{}.json", block.slug()))
 }
 
-fn learning_report_path(root: &Path, block: &Block) -> PathBuf {
-    day_dir(root, &block.day)
-        .join("learning")
-        .join(format!("{}.json", block.slug()))
-}
-
 fn save_pending(root: &Path, block: &Block) -> Result<()> {
     let _write_guard = crate::artifact_store::lock(root)?;
     let path = pending_path(root, block);
@@ -1091,7 +852,7 @@ fn write_report(
     block: &Block,
     narrative: &ActivityNarrative,
     metrics: &BlockMetrics,
-    learning_artifact: Option<&LearningArtifact>,
+    frames_sent: usize,
 ) -> Result<()> {
     let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
     let directory = day_dir(&config.activity_artifacts_dir, &block.day);
@@ -1103,13 +864,10 @@ fn write_report(
     );
     fs::create_dir_all(directory.join("blocks"))?;
     fs::create_dir_all(directory.join("keyframes"))?;
-    if learning_artifact.is_some() {
-        fs::create_dir_all(directory.join("learning"))?;
-    }
     let keyframe = block
         .frames
         .iter()
-        .find(|frame| frame.sent_to_base)
+        .find(|frame| frame.sent_to_model)
         .or_else(|| block.frames.first());
     let keyframe_relative = if let Some(frame) = keyframe {
         let target = directory.join("keyframes").join(format!(
@@ -1139,21 +897,16 @@ fn write_report(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        base_frames_sent: block.base_frames_sent,
+        frames_sent,
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
         model: Some(config.tera_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
+        learning_subjects: narrative.learning_subjects.clone(),
         reason: None,
         error: None,
     };
-    if let Some(learning) = learning_artifact {
-        write_learning_artifact(
-            &learning_report_path(&config.activity_artifacts_dir, block),
-            learning,
-        )?;
-    }
     write_block_artifact(
         &report_path(&config.activity_artifacts_dir, block),
         &artifact,
@@ -1234,12 +987,13 @@ fn write_terminal_block(
         app_seconds: metrics.app_seconds.clone(),
         timeline: metrics.timeline.clone(),
         frames_captured: block.captured,
-        base_frames_sent: 0,
+        frames_sent: 0,
         keyframe: None,
         model: None,
         title: None,
         report: None,
         subjects: Vec::new(),
+        learning_subjects: Vec::new(),
         reason: Some(reason.to_string()),
         error: (outcome == "invalid_model_output").then_some(reason.to_string()),
     };
@@ -1248,12 +1002,6 @@ fn write_terminal_block(
 }
 
 fn write_block_artifact(path: &Path, artifact: &BlockArtifact) -> Result<()> {
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
-    replace_file(&temporary, path)
-}
-
-fn write_learning_artifact(path: &Path, artifact: &LearningArtifact) -> Result<()> {
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
     replace_file(&temporary, path)
@@ -1554,12 +1302,12 @@ mod tests {
     use super::{
         ActivitySample, Block, BlockArtifact, DedupState, DescriptionQueue, FrameRecord,
         capture_interval_for_sample, context_detailed_offset, json_journal_entry, matches_denylist,
-        ordinary_cadence_candidates, select_frame_candidates, select_frame_candidates_with_size,
-        should_suppress_description, write_report,
+        select_frame_candidates, select_frame_candidates_with_size, should_suppress_description,
+        write_report,
     };
     use crate::block_artifact::{
-        ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LEARNING_ARTIFACT_SCHEMA_VERSION,
-        LearningArtifact, LearningDepth, LearningEnrichmentStatus, LearningRecord, LearningSubject,
+        ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LearningDepth, LearningRecord,
+        LearningSubject,
     };
     use crate::config::AppConfig;
     use std::collections::BTreeMap;
@@ -1587,7 +1335,7 @@ mod tests {
             app_seconds: BTreeMap::new(),
             timeline: Vec::new(),
             frames_captured: 1,
-            base_frames_sent: 1,
+            frames_sent: 1,
             keyframe: None,
             model: Some("model".to_string()),
             title: Some("Title".to_string()),
@@ -1597,7 +1345,9 @@ mod tests {
                 subject: "Structured subject must not be rendered.".to_string(),
                 estimated_duration_s: 600,
                 unattended: false,
+                agentic_coding: None,
             }],
+            learning_subjects: Vec::new(),
             reason: None,
             error: None,
         };
@@ -1608,41 +1358,15 @@ mod tests {
     }
 
     #[test]
-    fn capture_stops_while_locked_and_slows_while_idle() {
+    fn unified_capture_keeps_ten_second_cadence_while_unlocked() {
         let mut sample = ActivitySample::default();
-        assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
-            Some(20)
-        );
+        assert_eq!(capture_interval_for_sample(&sample, 10), Some(10));
 
         sample.idle_s = 120.0;
-        assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
-            Some(120)
-        );
+        assert_eq!(capture_interval_for_sample(&sample, 10), Some(10));
 
         sample.locked = true;
-        assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120, false, 10),
-            None
-        );
-    }
-
-    #[test]
-    fn dense_capture_continues_during_input_idle_but_stops_while_locked() {
-        let mut sample = ActivitySample {
-            idle_s: 600.0,
-            ..Default::default()
-        };
-        assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120, true, 10),
-            Some(10)
-        );
-        sample.locked = true;
-        assert_eq!(
-            capture_interval_for_sample(&sample, 120.0, 20, 120, true, 10),
-            None
-        );
+        assert_eq!(capture_interval_for_sample(&sample, 10), None);
     }
 
     #[test]
@@ -1658,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_and_learning_selection_use_distinct_cadences_and_gaps() {
+    fn unified_selection_retains_static_evidence_at_the_configured_gap() {
         let frames = (0..=6)
             .map(|index| FrameRecord {
                 path: format!("frame-{index}"),
@@ -1668,25 +1392,12 @@ mod tests {
                 height: 100,
                 delta: 0.0,
                 window: "document".to_string(),
-                sent_to_base: false,
-                sent_to_learning: false,
-                input_idle: false,
+                sent_to_model: false,
             })
             .collect::<Vec<_>>();
-        let ordinary = ordinary_cadence_candidates(&frames, 20, 120);
+        let selected = select_frame_candidates(frames.iter().collect(), 30, 2.0, 100, 48.0);
         assert_eq!(
-            ordinary.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
-            vec![0, 20, 40, 60]
-        );
-
-        let base = select_frame_candidates(ordinary, 120, 2.0, 100, 48.0);
-        let learning = select_frame_candidates(frames.iter().collect(), 30, 2.0, 100, 48.0);
-        assert_eq!(
-            base.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
-            vec![0, 60]
-        );
-        assert_eq!(
-            learning.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
+            selected.iter().map(|frame| frame.ts).collect::<Vec<_>>(),
             vec![0, 30, 60]
         );
     }
@@ -1702,9 +1413,7 @@ mod tests {
                 height: 100,
                 delta: index as f32 + 1.0,
                 window: "document".to_string(),
-                sent_to_base: false,
-                sent_to_learning: false,
-                input_idle: false,
+                sent_to_model: false,
             })
             .collect::<Vec<_>>();
 
@@ -1742,33 +1451,25 @@ mod tests {
     }
 
     #[test]
-    fn pending_manifest_preserves_a_successful_base_narrative_for_enrichment_resume() {
-        let mut block = Block::new(0, 600);
-        block.base_frames_sent = 3;
-        block.base_narrative = Some(crate::block_artifact::ActivityNarrative {
-            title: "Learning: term lookup".to_string(),
-            report: "The user looked up a term.".to_string(),
-            subjects: vec![crate::block_artifact::ActivitySubject {
-                namespaces: vec!["learning".to_string(), "lookup".to_string()],
-                subject: "Looked up a term.".to_string(),
-                estimated_duration_s: 60,
-                unattended: false,
-            }],
-        });
+    fn pending_manifest_round_trips_the_unified_pipeline_shape() {
+        let block = Block::new(0, 600);
         let recovered: Block =
             serde_json::from_slice(&serde_json::to_vec(&block).unwrap()).unwrap();
-        assert_eq!(recovered.base_frames_sent, 3);
-        assert!(recovered.base_narrative.unwrap().has_learning());
+        assert_eq!(
+            recovered.schema_version,
+            super::PENDING_BLOCK_SCHEMA_VERSION
+        );
+        assert_eq!(recovered.attempts, 0);
     }
 
     #[test]
-    fn activity_and_learning_are_written_to_separate_artifact_directories() {
-        let root = tempfile_directory("separate-learning");
+    fn activity_and_learning_are_written_to_one_block_artifact() {
+        let root = tempfile_directory("unified-learning");
         let mut config = AppConfig::load();
         config.activity_artifacts_dir = root.clone();
         config.tera_model = "test-model".to_string();
         let block = Block::new(0, 600);
-        let base = ActivityNarrative {
+        let narrative = ActivityNarrative {
             title: "Learning: reviewed ownership".to_string(),
             report: "The user reviewed ownership material.".to_string(),
             subjects: vec![ActivitySubject {
@@ -1776,17 +1477,9 @@ mod tests {
                 subject: "Reviewed ownership material.".to_string(),
                 estimated_duration_s: 300,
                 unattended: false,
+                agentic_coding: None,
             }],
-        };
-        let learning = LearningArtifact {
-            schema_version: LEARNING_ARTIFACT_SCHEMA_VERSION,
-            block: block.id(),
-            window_start: block.start,
-            window_end: block.end,
-            status: LearningEnrichmentStatus::Complete,
-            frames_sent: 4,
-            model: Some("test-model".to_string()),
-            subjects: vec![LearningSubject {
+            learning_subjects: vec![LearningSubject {
                 namespaces: vec![
                     "learning".to_string(),
                     "reading".to_string(),
@@ -1801,7 +1494,6 @@ mod tests {
                     depth: LearningDepth::FocusedExplanation,
                 },
             }],
-            error: None,
         };
         let metrics = super::BlockMetrics {
             timeline: vec!["00:00:00-00:10:00 material".to_string()],
@@ -1811,15 +1503,14 @@ mod tests {
             idle_seconds: 300,
         };
 
-        write_report(&config, &block, &base, &metrics, Some(&learning)).unwrap();
+        write_report(&config, &block, &narrative, &metrics, 4).unwrap();
 
-        let activity: BlockArtifact =
+        let artifact: BlockArtifact =
             serde_json::from_slice(&fs::read(super::report_path(&root, &block)).unwrap()).unwrap();
-        let stored_learning: LearningArtifact =
-            serde_json::from_slice(&fs::read(super::learning_report_path(&root, &block)).unwrap())
-                .unwrap();
-        assert_eq!(activity.subjects, base.subjects);
-        assert_eq!(stored_learning.subjects, learning.subjects);
+        assert_eq!(artifact.subjects, narrative.subjects);
+        assert_eq!(artifact.learning_subjects, narrative.learning_subjects);
+        assert_eq!(artifact.frames_sent, 4);
+        assert!(!root.join("1970-01-01").join("learning").exists());
         assert_eq!(
             super::load_successful_reports(&root, i64::MAX)
                 .unwrap()

@@ -5,10 +5,8 @@ const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_TERA_API_BASE: &str = "https://tera.asheservices.online/v1";
 const DEFAULT_TERA_MODEL: &str = "cloudcode/chat-gemini-3-flash-paid-tier";
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
-const DEFAULT_ACTIVITY_CAPTURE_INTERVAL: u64 = 20;
-const DEFAULT_ACTIVITY_IDLE_CAPTURE_INTERVAL: u64 = 120;
-const DEFAULT_LEARNING_CAPTURE_INTERVAL: u64 = 10;
-const DEFAULT_LEARNING_MAX_FRAME_GAP_S: u64 = 30;
+const DEFAULT_ACTIVITY_CAPTURE_INTERVAL: u64 = 10;
+const DEFAULT_ACTIVITY_MAX_FRAME_GAP_S: u64 = 30;
 const DEFAULT_ACTIVITY_BLOCK_MINUTES: u64 = 10;
 const DEFAULT_ACTIVITY_DEDUP_THRESHOLD: f32 = 2.0;
 const DEFAULT_ACTIVITY_MAX_FRAMES_PER_CALL: usize = 100;
@@ -38,10 +36,6 @@ pub struct AppConfig {
     pub activity_enabled: bool,
     pub activity_artifacts_dir: PathBuf,
     pub activity_capture_interval: u64,
-    pub activity_idle_capture_interval: u64,
-    pub learning_enrichment_enabled: bool,
-    pub learning_capture_interval: u64,
-    pub learning_max_frame_gap_s: u64,
     pub activity_telemetry_interval_ms: u64,
     pub activity_block_minutes: u64,
     pub activity_monitor: i32,
@@ -76,12 +70,6 @@ impl AppConfig {
         let activity_capture_interval =
             read_u64("ASHE_CAPTURE_INTERVAL", DEFAULT_ACTIVITY_CAPTURE_INTERVAL).max(1);
 
-        let learning_capture_interval = read_u64(
-            "ASHE_LEARNING_CAPTURE_INTERVAL",
-            DEFAULT_LEARNING_CAPTURE_INTERVAL,
-        )
-        .max(1);
-
         Self {
             deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").unwrap_or_default(),
             deepgram_model: std::env::var("DEEPGRAM_MODEL")
@@ -112,18 +100,6 @@ impl AppConfig {
             activity_enabled: read_bool("ASHE_ACTIVITY_ENABLED", true),
             activity_artifacts_dir,
             activity_capture_interval,
-            activity_idle_capture_interval: read_u64(
-                "ASHE_IDLE_CAPTURE_INTERVAL",
-                DEFAULT_ACTIVITY_IDLE_CAPTURE_INTERVAL,
-            )
-            .max(activity_capture_interval),
-            learning_enrichment_enabled: read_bool("ASHE_LEARNING_ENRICHMENT_ENABLED", true),
-            learning_capture_interval,
-            learning_max_frame_gap_s: read_u64(
-                "ASHE_LEARNING_MAX_FRAME_GAP_S",
-                DEFAULT_LEARNING_MAX_FRAME_GAP_S,
-            )
-            .max(learning_capture_interval),
             activity_telemetry_interval_ms: (read_f32("ASHE_TELEMETRY_INTERVAL", 2.0).max(0.5)
                 * 1000.0) as u64,
             activity_block_minutes: read_u64("ASHE_BLOCK_MINUTES", DEFAULT_ACTIVITY_BLOCK_MINUTES)
@@ -134,7 +110,11 @@ impl AppConfig {
                 DEFAULT_ACTIVITY_DEDUP_THRESHOLD,
             )
             .clamp(0.0, 100.0),
-            activity_max_frame_gap_s: read_u64("ASHE_MAX_FRAME_GAP_S", 120),
+            activity_max_frame_gap_s: read_u64(
+                "ASHE_MAX_FRAME_GAP_S",
+                DEFAULT_ACTIVITY_MAX_FRAME_GAP_S,
+            )
+            .max(activity_capture_interval),
             activity_max_frames_per_call: read_usize(
                 "ASHE_MAX_FRAMES_PER_CALL",
                 DEFAULT_ACTIVITY_MAX_FRAMES_PER_CALL,
@@ -233,7 +213,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} learning_enrichment_enabled={} learning_capture_interval={}s learning_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -244,9 +224,8 @@ impl AppConfig {
             self.llm_reasoning_effort.is_some(),
             self.activity_enabled,
             self.activity_artifacts_dir.display(),
-            self.learning_enrichment_enabled,
-            self.learning_capture_interval,
-            self.learning_max_frame_gap_s,
+            self.activity_capture_interval,
+            self.activity_max_frame_gap_s,
             self.activity_context_blocks,
             self.activity_context_summary_max_chars,
             self.daily_report_enabled,
@@ -348,4 +327,15 @@ fn default_artifacts_dir() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("artifacts")))
         .unwrap_or_else(|| PathBuf::from("artifacts"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_ACTIVITY_CAPTURE_INTERVAL, DEFAULT_ACTIVITY_MAX_FRAME_GAP_S};
+
+    #[test]
+    fn unified_activity_evidence_defaults_to_ten_second_capture() {
+        assert_eq!(DEFAULT_ACTIVITY_CAPTURE_INTERVAL, 10);
+        assert_eq!(DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, 30);
+    }
 }

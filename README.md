@@ -9,14 +9,14 @@ small overlays to show live state and results.
 - Dictate into the active text field, with speech transcription and automatic cleanup.
 - Correct grammar, spelling, and punctuation in selected text.
 - Ask a question using selected text and append the answer in place.
-- Capture desktop activity on an adaptive cadence and generate grounded block reports.
-- Keep ordinary idle evidence sparse, stop capture while Windows is locked, and omit
-  sensitive apps.
+- Capture desktop activity every 10 seconds by default and generate grounded block reports.
+- Continue evidence capture while input-idle, stop while Windows is locked, and omit sensitive
+  apps.
 - Maintain recent detailed context, a bounded rolling summary, and a complete daily report.
 - Store each completed activity block as canonical JSON while aggregating its report into
   the human-readable `journal.md` projection.
-- Enrich learning blocks with atomic topics, visible searches and sources, and an
-  evidence-backed treatment depth.
+- Generate activity and learning together, including atomic learning topics, visible searches
+  and sources, and an evidence-backed treatment depth.
 - Seal older day artifacts into authenticated, self-contained encrypted archives and
   optionally send those archives to an authenticated remote endpoint.
 
@@ -43,55 +43,92 @@ quit.
 
 ## Activity tracking
 
-Each block combines measured foreground-window and idle-time telemetry with selected
-lossless screenshots. Visually redundant frames are omitted from model requests, request
-count and payload size are capped, and blocks with too little active or visual change are
-stored without an unnecessary model call.
+Each block combines measured foreground-window and idle-time telemetry with selected lossless
+screenshots captured every 10 seconds by default while the workstation is unlocked. Visually
+redundant frames are omitted from model requests, request count and payload size are capped, and
+blocks with too little active or visual change are stored without an unnecessary model call.
 
-The base model returns a title, Markdown report, and a list of subjects. Each subject
-includes one to four broad-to-specific namespaces, an independently estimated duration,
-and an `unattended` judgment. Estimates remain valid when they overlap during multitasking.
-Namespaces use stable domain-specific positions; preferred roots include
-`software-development`, `entertainment`, `social-media`, and `learning`.
+One model request returns a title, Markdown report, broad activity subjects, and independently
+validated learning subjects. Each activity subject includes one to four broad-to-specific
+namespaces, an independently estimated duration, and an `unattended` judgment. Estimates remain
+valid when they overlap during multitasking. Namespaces use stable domain-specific positions;
+preferred roots include `software-development`, `entertainment`, `social-media`, and `learning`.
 
-Base learning subjects intentionally favor recall: they are provisional candidates that cause
-the worker to make a second request from a denser temporary evidence buffer. The activity block
-keeps the broad base response unchanged. The second request independently validates whether the
-evidence contains transferable intellectual content rather than merely information retrieval or
-task execution. A genuine unit identifies a concept, mechanism, relationship, rationale, method,
-argument, or principle that was substantively examined. Reading, searching, watching, operating
-software, or applying an action are evidence channels and do not qualify by themselves.
+Agentic development receives a distinct `software-development/agentic-coding` activity subject
+when supported. That subject records an `agentic_coding` object containing the visible medium
+(`code-editor` or `tui`), a canonical tool name such as `cursor`, `devin`, `zed`, `vscode`,
+`opencode`, or `codex`, and `model_id` only when the identifier is visible. The metadata is
+subject-scoped so one block can accurately represent multiple coding environments.
 
-The validator may reject every provisional candidate. Its successful empty result is stored with
-`status: no-learning`, distinguishing a completed cross-check from missing evidence, invalid
-output, or a failed request. Otherwise the request writes validated atomic learning units, visible
-search queries, source material, and one evidence-backed depth:
+Within the same response, the model independently validates whether evidence contains transferable
+intellectual content rather than merely information retrieval or task execution. A genuine unit
+identifies a concept, mechanism, relationship, rationale, method, argument, or principle that was
+substantively examined. Reading, searching, watching, operating software, or applying an action are
+evidence channels and do not qualify by themselves. The validator may reject every broad learning
+activity; a successful empty `learning_subjects` array is the canonical no-learning result.
+Otherwise it records atomic learning units, visible search queries, source material, and one
+evidence-backed depth:
 `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or `synthesis`.
 Depth describes observable exposure and engagement, not comprehension or retention. Passive
-activity is not considered unattended merely because keyboard and mouse input stopped.
-`unattended` remains exclusively on the base activity subject and is not duplicated or
-reclassified by the learning request.
+activity is not considered unattended merely because keyboard and mouse input stopped. `unattended`
+and agentic-coding environment metadata remain exclusively on broad activity subjects.
 
-The ordinary block request and learning request have independent frame selection and
-payload accounting. Learning enrichment captures temporary frames every 10 seconds by
-default, including while input-idle, but continues to stop while Windows is locked and to
-honor the foreground denylist. Model description runs separately from capture so a slow
-request does not create a gap in the following block. The chronological `journal.md` is
-rebuilt from the base report fields in the JSON block artifacts; structured subjects remain
-canonical in JSON.
+The unified request uses one chronological evidence selection and one payload count. Capture
+continues while input-idle, but stops while Windows is locked and honors the foreground denylist.
+Model description runs separately from capture so a slow request does not create a gap in the
+following block. The chronological `journal.md` is rebuilt from report fields in JSON block
+artifacts; structured activity and learning subjects remain canonical in JSON.
 
-Block schema version 2 stores the base activity description and attention judgments.
-Learning artifact schema version 3 records the validator outcome and request frame count. Both
-formats are strict;
-older block or pending-manifest shapes are not accepted. Recent activity blocks remain available
-in full. Older activity blocks are projected into a structured aggregate and folded once into
-the bounded plaintext `summary.md`; learning artifacts are never included in that rollup.
+Block schema version 3 stores the activity description, attention judgments, agentic-coding
+environment, validated learning units, and unified request frame count in one strict artifact.
+Separate learning artifacts are no longer written. Older block or pending-manifest shapes are not
+accepted. Recent blocks remain available in full. Older blocks are projected into a structured
+aggregate and folded once into the bounded plaintext `summary.md`, including their validated
+learning and agentic-coding context.
 
-At the end of each day, the worker generates `daily.md` deterministically without a daily
-model request. It projects block titles, subject namespaces, subject estimates, and measured
-timelines; identifies missing and pending coverage gaps; totals active, idle, application,
-and outcome telemetry; and aggregates estimated duration and attention counts for every
-namespace prefix. Namespace durations remain independent estimates and may overlap.
+The generated portion of a described block has this shape:
+
+```json
+{
+  "title": "Software development: revised activity generation",
+  "report": "...",
+  "subjects": [
+    {
+      "namespaces": ["software-development", "agentic-coding", "ashe-worker"],
+      "subject": "Used Codex to revise the activity pipeline.",
+      "estimated_duration_s": 420,
+      "unattended": false,
+      "agentic_coding": {
+        "medium": "tui",
+        "tool": "codex",
+        "model_id": "gpt-5.4"
+      }
+    }
+  ],
+  "learning_subjects": [
+    {
+      "namespaces": ["learning", "applied", "rust", "serde-schema"],
+      "subject": "Applied strict Serde fields to the unified artifact schema.",
+      "estimated_duration_s": 120,
+      "learning": {
+        "search_queries": [],
+        "sources": [{ "kind": "code", "title": "block_artifact.rs" }],
+        "depth": "applied"
+      }
+    }
+  ]
+}
+```
+
+`agentic_coding` is required exactly on `software-development/agentic-coding` activity subjects;
+`model_id` is optional and omitted when it is not visible. `learning_subjects` is always present and
+may be empty after a successful validation.
+
+At the end of each day, the worker generates `daily.md` deterministically without a daily model
+request. It projects block titles, activity subjects, validated learning units, subject estimates,
+and measured timelines; identifies missing and pending coverage gaps; totals active, idle,
+application, and outcome telemetry; and aggregates estimated duration and attention counts for
+every activity namespace prefix. Namespace durations remain independent estimates and may overlap.
 
 ## Encrypted archives
 

@@ -1,4 +1,4 @@
-use crate::block_artifact::{ActivityNarrative, LearningNarrative};
+use crate::block_artifact::ActivityNarrative;
 use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -33,9 +33,9 @@ const GRAMMAR_PROMPT: &str = "Fix grammar, spelling, punctuation, and casing in 
 const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's question directly and concisely. Do not restate the question. Reply in the same language as the question. Return only the answer.";
 const QUESTION_TEMPERATURE: f32 = 0.7;
 
-const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity describer. Produce a factual account of what the user did during this time block, whether software development, learning, entertainment, social media, messaging, shopping, games, or personal administration. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level. Emit a learning-rooted subject whenever the user meaningfully acquires, examines, follows, applies, or synthesizes information, including a term lookup or informational media consumption. Learning may overlap another supported activity subject. Informational or intellectual media is learning; narrative leisure media and sports are entertainment. This base request identifies learning provisionally but does not produce learning-specific metadata.";
-const LEARNING_PROMPT: &str = "You are Ashe Worker's final validator and documenter of intellectual learning within an activity block. The provisional base narrative is intentionally optimized for recall: its learning-rooted subjects identify material worth inspecting, but they are hypotheses rather than conclusions and may all be rejected. Independently cross-check them against the measured context and chronological visual evidence before deciding whether this block contains any genuine learning units.\n\nA learning unit is a discrete piece of transferable intellectual content: a concept, mechanism, causal relationship, rationale, method, procedure with explanatory substance, comparison, argument, model, or principle that the user meaningfully examined, followed, reasoned about, or applied. The unit must identify that knowledge content, not merely an activity, source, query, answer, outcome, or intention. Its value should remain intelligible beyond the immediate action that occasioned it.\n\nDistinguish intellectual engagement from information retrieval and task execution. Searching, reading, watching, asking a question, receiving an answer, operating software, executing commands, editing code, testing, or delegating work are only evidence channels; none independently establishes learning. Immediate usefulness is also insufficient when the information's value is exhausted by the current transaction, navigation step, status check, selection, or one-off decision. Applied learning requires visible evidence that a principle or method was reasoned through and used, not merely that an action was performed or succeeded.\n\nFor each candidate, determine whether the evidence exposes substantive meaning, operation, relationships, constraints, reasoning, or implications. Reject candidates supported only by a query, title, brief incidental answer, activity label, elapsed time, source prestige, or the provisional base claim. Consolidate repeated treatment of the same idea, and separate units only when their intellectual content is meaningfully distinct. Report only what was visibly examined; do not claim novelty, mastery, comprehension, retention, or educational intent. If nothing meets this standard, return no learning units. Do not manufacture a unit merely because the block was routed for enrichment. Do not mention screenshots, frames, telemetry, prompts, JSON, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
-const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity from the structured JSON input. Merge previous_summary with blocks. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The blocks array is the only new material. Treat measured fields as ground truth and do not infer later activity. Learning artifacts are stored separately and are never inputs to this summary. Return Markdown prose only, without a title or preamble.";
+const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity describer. Produce a factual account of what the user did during this time block, whether software development, learning, entertainment, social media, messaging, shopping, games, or personal administration. Treat the measured app/window timeline as ground truth. Read visible details closely and describe progression rather than listing images. Never score productivity. Do not mention screenshots, frames, telemetry, prompts, JSON, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.\n\nRepresent meaningful learning activity in the broad activity subjects whenever the user acquires, examines, follows, applies, or synthesizes information, including a term lookup or informational media consumption. Learning may overlap another supported activity subject. Informational or intellectual media is learning; narrative leisure media and sports are entertainment.\n\nGive additional preference to sustained agentic-coding work when an LLM coding agent primarily performs the development. Distinguish its visible medium as code-editor for graphical editors such as Cursor, Devin, Zed, or VSCode, and tui for terminal interfaces such as OpenCode or Codex. Identify the concrete tool from visible application and interface evidence. Record the model identifier only when it is actually visible; never infer a model from the tool, provider, task, or appearance. Use separate subjects when sustained work visibly switches agentic-coding tool, medium, or model so each subject's environment metadata remains accurate.";
+const LEARNING_PROMPT: &str = "Independently validate and document intellectual learning within the same activity block. Broad learning activity subjects identify material worth inspecting, but they are not conclusions and may all fail the stricter learning-unit standard. Cross-check every candidate against the measured context and chronological visual evidence before deciding whether the block contains any genuine learning units.\n\nA learning unit is a discrete piece of transferable intellectual content: a concept, mechanism, causal relationship, rationale, method, procedure with explanatory substance, comparison, argument, model, or principle that the user meaningfully examined, followed, reasoned about, or applied. The unit must identify that knowledge content, not merely an activity, source, query, answer, outcome, or intention. Its value should remain intelligible beyond the immediate action that occasioned it.\n\nDistinguish intellectual engagement from information retrieval and task execution. Searching, reading, watching, asking a question, receiving an answer, operating software, executing commands, editing code, testing, or delegating work are only evidence channels; none independently establishes learning. Immediate usefulness is also insufficient when the information's value is exhausted by the current transaction, navigation step, status check, selection, or one-off decision. Applied learning requires visible evidence that a principle or method was reasoned through and used, not merely that an action was performed or succeeded.\n\nFor each candidate, determine whether the evidence exposes substantive meaning, operation, relationships, constraints, reasoning, or implications. Reject candidates supported only by a query, title, brief incidental answer, activity label, elapsed time, source prestige, or a broad activity subject. Consolidate repeated treatment of the same idea, and separate units only when their intellectual content is meaningfully distinct. Report only what was visibly examined; do not claim novelty, mastery, comprehension, retention, or educational intent. If nothing meets this standard, return no learning units. Do not manufacture a unit merely because learning activity is present. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
+const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity and learning from the structured JSON input. Merge previous_summary with blocks. Preserve concrete project, app, document, site, game, media, person, open-task, agentic-coding tool, visible model, and validated learning-topic names; compress routine detail; preserve rough chronology and current state. The blocks array is the only new material. Treat measured fields as ground truth and do not infer later activity. Return Markdown prose only, without a title or preamble.";
 
 pub async fn describe_activity_block(
     config: AppConfig,
@@ -55,9 +55,7 @@ pub async fn describe_activity_block(
             )
         }));
     }
-    let instructions = format!(
-        "{ACTIVITY_PROMPT}\n\nReturn exactly one JSON object and nothing else: no Markdown fence, preamble, or trailing commentary. The object must contain exactly title, report, and subjects. title is a short plain-text string in the form 'Area: what happened'. report is 120-250 words of concise Markdown prose. subjects is an array of 1-8 sustained, meaningfully distinct activity subjects; do not split incidental actions into separate entries. Each subject object must contain exactly namespaces, subject, estimated_duration_s, and unattended. namespaces is an ordered array of 1-4 unique lowercase kebab-case strings. Level 1 is the broad domain; level 2 is the domain-specific activity mode or channel; level 3 is the domain-specific grouping such as project, media type, knowledge field, or social surface; level 4 is the concrete focus such as project topic, media title, event, thread topic, or atomic learning topic. Prefer these exact roots when applicable: software-development, entertainment, social-media, learning. Under software-development use agentic-coding when an LLM coding agent primarily performs the development and coding when the user primarily codes manually. Under entertainment use streaming followed by movie, tv-show, live-stream, or football-match when supported. Under social-media use the canonical service slug such as x-com. Under learning use a supported mode such as lookup, reading, watching, coursework, practice, or discussion. Do not invent specificity. Put actions and outcomes in subject, not namespaces, and use consistent namespace spelling within the response. subject is one self-contained factual statement. estimated_duration_s is a positive integer estimating time spent on that subject and must remain within the {duration_budget_s} seconds of measured coverage. unattended is true only when the subject appears to have continued for most of its estimated duration with little evidence of user interaction or attention. Measured input idle is evidence, not proof of absence. Default passive reading, films, television, and live streams to unattended=false unless the combined timeline and progression reasonably show that they were left running or left unchanged. Judge each subject independently: subjects may overlap when the user multitasks, so their estimated durations do not need to sum to the coverage duration. Uncertain, idle, or unclassified time may remain unallocated; passive activity may receive time even without keyboard or mouse input. Use the measured timeline and visible progression rather than dividing time evenly."
-    );
+    let instructions = activity_instructions(duration_budget_s);
     let mut body = json!({
         "model": config.tera_model,
         "instructions": instructions,
@@ -96,66 +94,9 @@ pub async fn describe_activity_block(
     Ok(narrative)
 }
 
-pub async fn describe_learning_block(
-    config: AppConfig,
-    context: String,
-    frames: Vec<(String, Vec<u8>)>,
-    duration_budget_s: u64,
-) -> Result<LearningNarrative> {
-    let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
-    let mut content = vec![json!({ "type": "input_text", "text": context })];
-    for (label, bytes) in frames {
-        content.push(json!({ "type": "input_text", "text": label }));
-        content.push(json!({
-            "type": "input_image",
-            "image_url": format!(
-                "data:image/webp;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            )
-        }));
-    }
-    let instructions = learning_instructions(duration_budget_s);
-    let mut body = json!({
-        "model": config.tera_model,
-        "instructions": instructions,
-        "input": [{ "role": "user", "content": content }]
-    });
-    apply_reasoning_effort(&mut body, config.llm_reasoning_effort.as_deref());
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .context("failed to build learning HTTP client")?;
-    let response = client
-        .post(endpoint)
-        .bearer_auth(&config.tera_api_key)
-        .json(&body)
-        .send()
-        .await
-        .context("learning description request failed")?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .context("learning description returned a non-JSON body")?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("detail").and_then(Value::as_str))
-            .unwrap_or("unknown error");
-        return Err(anyhow!("learning description failed ({status}): {message}"));
-    }
-    let narrative = LearningNarrative::parse(&extract_output_text(&payload))
-        .map_err(|message| anyhow::Error::new(InvalidLearningOutput(message)))?;
-    narrative
-        .validate_duration_budget(duration_budget_s)
-        .map_err(|message| anyhow::Error::new(InvalidLearningOutput(message)))?;
-    Ok(narrative)
-}
-
-fn learning_instructions(duration_budget_s: u64) -> String {
+fn activity_instructions(duration_budget_s: u64) -> String {
     format!(
-        "{LEARNING_PROMPT}\n\nReturn exactly one JSON object with exactly one field, learning_subjects, and nothing else. learning_subjects is an array containing zero or more validated atomic learning subjects; an empty array is the correct result when no candidate qualifies. Each subject contains exactly namespaces, subject, estimated_duration_s, and learning. namespaces contains 1-4 ordered lowercase kebab-case strings rooted at learning; use level 2 for the learning mode, level 3 for the knowledge field, and level 4 for the atomic topic when supported. subject is one cautious factual statement naming the intellectual content and using observable verbs such as examined, reviewed, worked through, compared, or applied. estimated_duration_s is positive and must remain within {duration_budget_s} seconds of measured coverage; independently judged subjects may overlap. Attention and unattended state belong exclusively to the base activity artifact and must not be returned here. learning contains exactly search_queries, sources, and depth. search_queries contains only visibly entered or displayed queries. sources contains visible source objects: each has kind and may have title, provider, and creator only when supported. kind is exactly one of search-results, documentation, article, paper, video, course, book, forum, social-post, code, or other. depth is the strongest observable treatment after a candidate has independently qualified as intellectual learning: lookup for a brief definition or short answer; orientation for purpose and high-level structure; focused-explanation for mechanism, relationships, rationale, examples, or tradeoffs; procedural for followed steps whose method was substantively examined; applied for visible reasoned use of a principle or method; synthesis for visibly comparing or combining multiple sources or ideas. Choose the lower supported depth when uncertain. A depth of lookup does not make merely transactional or incidental retrieval eligible. Time spent, source prestige, technical difficulty, multiple open tabs, and input-idle state do not by themselves establish either eligibility or depth."
+        "{ACTIVITY_PROMPT}\n\n{LEARNING_PROMPT}\n\nReturn exactly one JSON object and nothing else: no Markdown fence, preamble, or trailing commentary. The object must contain exactly title, report, subjects, and learning_subjects.\n\ntitle is a short plain-text string in the form 'Area: what happened'. report is 120-250 words of concise Markdown prose covering the block as a whole.\n\nsubjects is an array of 1-8 sustained, meaningfully distinct activity subjects; do not split incidental actions into separate entries. Every activity subject contains namespaces, subject, estimated_duration_s, unattended, and agentic_coding only when required below. namespaces is an ordered array of 1-4 unique lowercase kebab-case strings. Level 1 is the broad domain; level 2 is the domain-specific activity mode or channel; level 3 is the domain-specific grouping such as project, media type, knowledge field, or social surface; level 4 is the concrete focus such as project topic, media title, event, thread topic, or atomic learning topic. Prefer these exact roots when applicable: software-development, entertainment, social-media, learning. Under software-development use agentic-coding when an LLM coding agent primarily performs the development and coding when the user primarily codes manually. Prefer a distinct sustained software-development/agentic-coding subject whenever supported. Under entertainment use streaming followed by movie, tv-show, live-stream, or football-match when supported. Under social-media use the canonical service slug such as x-com. Under learning use a supported mode such as lookup, reading, watching, coursework, practice, or discussion. Do not invent specificity. Put actions and outcomes in subject, not namespaces, and use consistent namespace spelling within the response. subject is one self-contained factual statement. estimated_duration_s is a positive integer estimating time spent on that subject and must remain within the {duration_budget_s} seconds of measured coverage. unattended is true only when the subject appears to have continued for most of its estimated duration with little evidence of user interaction or attention. Measured input idle is evidence, not proof of absence. Default passive reading, films, television, and live streams to unattended=false unless the combined timeline and progression reasonably show that they were left running or left unchanged. Judge each subject independently: subjects may overlap when the user multitasks, so their estimated durations do not need to sum to the coverage duration. Uncertain, idle, or unclassified time may remain unallocated; passive activity may receive time even without keyboard or mouse input. Use the measured timeline and visible progression rather than dividing time evenly.\n\nEvery software-development/agentic-coding subject must include agentic_coding with exactly medium, tool, and model_id only when visible. medium is exactly code-editor or tui. tool is the canonical lowercase kebab-case product name, such as cursor, devin, zed, vscode, opencode, or codex. Preserve model_id exactly as visibly written, including provider qualification when shown; omit model_id when it is not visible. Every other activity subject must omit agentic_coding.\n\nlearning_subjects is an array containing zero or more independently validated atomic learning subjects; an empty array is the correct result when no candidate qualifies. Each learning subject contains exactly namespaces, subject, estimated_duration_s, and learning. namespaces contains 1-4 ordered lowercase kebab-case strings rooted at learning; use level 2 for the learning mode, level 3 for the knowledge field, and level 4 for the atomic topic when supported. subject is one cautious factual statement naming the intellectual content and using observable verbs such as examined, reviewed, worked through, compared, or applied. estimated_duration_s is positive and must remain within {duration_budget_s} seconds of measured coverage; independently judged subjects may overlap. Attention, unattended state, and agentic-coding environment metadata belong exclusively to activity subjects and must not be returned here. learning contains exactly search_queries, sources, and depth. search_queries contains only visibly entered or displayed queries. sources contains visible source objects: each has kind and may have title, provider, and creator only when supported. kind is exactly one of search-results, documentation, article, paper, video, course, book, forum, social-post, code, or other. depth is the strongest observable treatment after a candidate has independently qualified as intellectual learning: lookup for a brief definition or short answer; orientation for purpose and high-level structure; focused-explanation for mechanism, relationships, rationale, examples, or tradeoffs; procedural for followed steps whose method was substantively examined; applied for visible reasoned use of a principle or method; synthesis for visibly comparing or combining multiple sources or ideas. Choose the lower supported depth when uncertain. A depth of lookup does not make merely transactional or incidental retrieval eligible. Time spent, source prestige, technical difficulty, multiple open tabs, and input-idle state do not by themselves establish either eligibility or depth."
     )
 }
 
@@ -223,17 +164,6 @@ impl std::fmt::Display for InvalidActivityOutput {
 }
 
 impl std::error::Error for InvalidActivityOutput {}
-
-#[derive(Debug)]
-pub struct InvalidLearningOutput(pub String);
-
-impl std::fmt::Display for InvalidLearningOutput {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "invalid structured learning output: {}", self.0)
-    }
-}
-
-impl std::error::Error for InvalidLearningOutput {}
 
 /// Correct grammar/spelling/punctuation in selected text and return only the rewrite.
 ///
@@ -386,7 +316,7 @@ fn tagged(tag: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_reasoning_effort, learning_instructions};
+    use super::{activity_instructions, apply_reasoning_effort};
     use serde_json::json;
 
     #[test]
@@ -407,13 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn learning_instructions_validate_intellectual_content_independently() {
-        let instructions = learning_instructions(600);
-        assert!(instructions.contains("hypotheses rather than conclusions"));
+    fn unified_instructions_preserve_activity_learning_and_agentic_detail() {
+        let instructions = activity_instructions(600);
+        assert!(instructions.contains("exactly title, report, subjects, and learning_subjects"));
+        assert!(instructions.contains("not conclusions"));
         assert!(instructions.contains("information retrieval and task execution"));
         assert!(instructions.contains("Immediate usefulness is also insufficient"));
         assert!(instructions.contains("not merely that an action was performed or succeeded"));
         assert!(instructions.contains("an empty array is the correct result"));
         assert!(instructions.contains("within 600 seconds of measured coverage"));
+        assert!(instructions.contains("medium is exactly code-editor or tui"));
+        assert!(instructions.contains("omit model_id when it is not visible"));
     }
 }
