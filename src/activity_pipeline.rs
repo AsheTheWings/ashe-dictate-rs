@@ -1049,7 +1049,7 @@ fn learning_report_path(root: &Path, block: &Block) -> PathBuf {
 }
 
 fn save_pending(root: &Path, block: &Block) -> Result<()> {
-    let _write_guard = crate::artifact_store::lock();
+    let _write_guard = crate::artifact_store::lock(root)?;
     let path = pending_path(root, block);
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(block)?)?;
@@ -1073,7 +1073,7 @@ fn save_pending(root: &Path, block: &Block) -> Result<()> {
 }
 
 fn clear_pending(root: &Path, block: &Block) -> Result<()> {
-    let _write_guard = crate::artifact_store::lock();
+    let _write_guard = crate::artifact_store::lock(root)?;
     let path = pending_path(root, block);
     if path.exists() {
         fs::remove_file(path)?;
@@ -1088,7 +1088,7 @@ fn write_report(
     metrics: &BlockMetrics,
     learning_artifact: Option<&LearningArtifact>,
 ) -> Result<()> {
-    let _write_guard = crate::artifact_store::lock();
+    let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
     let directory = day_dir(&config.activity_artifacts_dir, &block.day);
     anyhow::ensure!(
         !directory
@@ -1208,7 +1208,7 @@ fn write_terminal_block(
     reason: &str,
     metrics: &BlockMetrics,
 ) -> Result<()> {
-    let _write_guard = crate::artifact_store::lock();
+    let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
     let directory = day_dir(&config.activity_artifacts_dir, &block.day);
     anyhow::ensure!(
         !directory

@@ -1,18 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod activity_pipeline;
 mod activity_telemetry;
-mod archive;
-mod artifact_store;
 mod audio;
-mod block_artifact;
-mod config;
-mod daily_report;
 mod deepgram_client;
 mod injector;
 mod llm_client;
-mod logger;
-#[cfg(all(target_os = "windows", target_env = "gnu"))]
-mod mingw_compat;
 mod overlay_view;
 mod screen_capture;
 mod ui_app;
@@ -20,6 +12,7 @@ mod util;
 mod win32_service;
 
 use anyhow::Result;
+pub use ashe_worker::{archive, artifact_store, block_artifact, config, daily_report, logger};
 use ui_app::UiApp;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,

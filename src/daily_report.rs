@@ -120,7 +120,7 @@ fn grace_period_elapsed(day: &str, grace_minutes: u64) -> bool {
     day_bounds(day).is_some_and(|(_, end)| now() >= end.saturating_add((grace_minutes * 60) as i64))
 }
 
-fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
+pub(crate) fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
     let source = build_daily_source(config, day)?;
     let output = config.activity_artifacts_dir.join(day).join("daily.md");
     if read_frontmatter_value(&output, "source_hash").as_deref() == Some(&source.hash) {
@@ -139,7 +139,7 @@ fn generate_day(config: &AppConfig, day: &str) -> Result<()> {
         source.coverage.complete,
         body,
     );
-    let _write_guard = crate::artifact_store::lock();
+    let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
     if output.parent().is_some_and(|directory| {
         directory
             .join(ashe_archive_crypto::ARCHIVE_FILENAME)

@@ -3,8 +3,8 @@ use crate::daily_report;
 use crate::logger;
 use anyhow::{Context, Result, ensure};
 use ashe_archive_crypto::{
-    ARCHIVE_FILENAME, RecipientMaterial, encrypt_archive_file, inspect_archive, pack_day,
-    sha256_file,
+    ARCHIVE_FILENAME, ArchiveMetadata, RecipientMaterial, encrypt_archive_file, inspect_archive,
+    pack_day, sha256_file,
 };
 use chrono::{Days, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender};
@@ -27,19 +27,13 @@ impl ArchiveHandle {
             logger::info("Archive sealing disabled: no compiled or configured recipient");
             return Self { tx: None };
         }
-        let recipient =
-            match serde_json::from_str::<RecipientMaterial>(config.archive_recipient_json.trim())
-                .context("archive recipient JSON is invalid")
-                .and_then(|recipient| {
-                    recipient.validate_public_material()?;
-                    Ok(recipient)
-                }) {
-                Ok(recipient) => recipient,
-                Err(error) => {
-                    logger::info(format!("Archive sealing disabled: {error:#}"));
-                    return Self { tx: None };
-                }
-            };
+        let recipient = match archive_recipient(&config) {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                logger::info(format!("Archive sealing disabled: {error:#}"));
+                return Self { tx: None };
+            }
+        };
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || run(config, recipient, rx));
         Self { tx: Some(tx) }
@@ -64,6 +58,27 @@ struct UploadState {
 struct UploadedArchive {
     day: String,
     acknowledged_at: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct UploadedArchiveRecord {
+    pub day: String,
+    pub sha256: String,
+    pub acknowledged_at: u64,
+    pub archive_present: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SealDayOutcome {
+    Sealed {
+        path: PathBuf,
+        metadata: ArchiveMetadata,
+    },
+    AlreadySealed {
+        path: PathBuf,
+        sha256: String,
+        size: u64,
+    },
 }
 
 fn run(config: AppConfig, recipient: RecipientMaterial, stop: Receiver<()>) {
@@ -93,7 +108,7 @@ fn scan_and_seal(config: &AppConfig, recipient: &RecipientMaterial) -> Result<()
         if day >= oldest_plaintext {
             continue;
         }
-        let _write_guard = crate::artifact_store::lock();
+        let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
         let archive = directory.join(ARCHIVE_FILENAME);
         if archive.is_file() {
             cleanup_sealed_day(&directory)?;
@@ -118,8 +133,8 @@ fn scan_and_seal(config: &AppConfig, recipient: &RecipientMaterial) -> Result<()
             ));
             continue;
         }
-        let bundle = match pack_day(&directory, &day_text) {
-            Ok(bundle) => bundle,
+        let result = match seal_day_locked(&directory, &day_text, recipient) {
+            Ok(result) => result,
             Err(error) => {
                 logger::info(format!(
                     "Archive sealing deferred for {day_text}: {error:#}"
@@ -127,29 +142,148 @@ fn scan_and_seal(config: &AppConfig, recipient: &RecipientMaterial) -> Result<()
                 continue;
             }
         };
-        let temporary = directory.join(format!("{ARCHIVE_FILENAME}.tmp"));
-        if temporary.exists() {
-            fs::remove_file(&temporary).with_context(|| {
-                format!(
-                    "failed to remove stale archive temporary {}",
-                    temporary.display()
-                )
-            })?;
-        }
-        let metadata = encrypt_archive_file(&day_text, &bundle.payload, recipient, &temporary)?;
-        fs::rename(&temporary, &archive)
-            .with_context(|| format!("failed to commit {}", archive.display()))?;
-        cleanup_paths(&bundle.source_paths)?;
-        cleanup_sealed_day(&directory)?;
+        log_seal_outcome(&day_text, &result);
+    }
+    Ok(())
+}
+
+pub fn seal_day_manually(config: &AppConfig, day_text: &str) -> Result<SealDayOutcome> {
+    let day = parse_day(day_text)?;
+    ensure!(
+        day < Local::now().date_naive(),
+        "refusing to archive the current or a future day"
+    );
+    let directory = config.activity_artifacts_dir.join(day_text);
+    ensure!(
+        directory.is_dir(),
+        "artifact day does not exist: {day_text}"
+    );
+    if directory.join(ARCHIVE_FILENAME).is_file() {
+        let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
+        return seal_day_locked(&directory, day_text, &archive_recipient(config)?);
+    }
+    ensure!(
+        !has_pending_block(&config.activity_artifacts_dir, day_text),
+        "day has a pending activity block"
+    );
+    if config.daily_report_enabled {
+        daily_report::generate_day(config, day_text)
+            .with_context(|| format!("failed to generate daily report for {day_text}"))?;
+    }
+    let recipient = archive_recipient(config)?;
+    let _write_guard = crate::artifact_store::lock(&config.activity_artifacts_dir)?;
+    if directory.join(ARCHIVE_FILENAME).is_file() {
+        return seal_day_locked(&directory, day_text, &recipient);
+    }
+    ensure!(
+        !has_pending_block(&config.activity_artifacts_dir, day_text),
+        "day gained a pending activity block while preparing the archive"
+    );
+    if config.daily_report_enabled {
+        ensure!(directory.join("daily.md").is_file(), "daily.md is missing");
+        ensure!(
+            daily_report::report_is_current(config, day_text),
+            "daily.md is stale"
+        );
+    }
+    seal_day_locked(&directory, day_text, &recipient)
+}
+
+pub fn uploaded_archives(root: &Path) -> Result<Vec<UploadedArchiveRecord>> {
+    let _read_guard = crate::artifact_store::lock(root)?;
+    let state = read_upload_state(root)?;
+    let mut records = state
+        .uploaded
+        .into_iter()
+        .map(|(sha256, uploaded)| UploadedArchiveRecord {
+            archive_present: root.join(&uploaded.day).join(ARCHIVE_FILENAME).is_file(),
+            day: uploaded.day,
+            sha256,
+            acknowledged_at: uploaded.acknowledged_at,
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.day
+            .cmp(&right.day)
+            .then_with(|| left.acknowledged_at.cmp(&right.acknowledged_at))
+            .then_with(|| left.sha256.cmp(&right.sha256))
+    });
+    Ok(records)
+}
+
+fn archive_recipient(config: &AppConfig) -> Result<RecipientMaterial> {
+    ensure!(
+        !config.archive_recipient_json.trim().is_empty(),
+        "archive recipient is not configured"
+    );
+    let recipient = serde_json::from_str::<RecipientMaterial>(config.archive_recipient_json.trim())
+        .context("archive recipient JSON is invalid")?;
+    recipient.validate_public_material()?;
+    Ok(recipient)
+}
+
+fn parse_day(day: &str) -> Result<NaiveDate> {
+    let parsed = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .with_context(|| format!("invalid day {day:?}; expected YYYY-MM-DD"))?;
+    ensure!(
+        parsed.format("%Y-%m-%d").to_string() == day,
+        "day must use canonical YYYY-MM-DD form"
+    );
+    Ok(parsed)
+}
+
+fn seal_day_locked(
+    directory: &Path,
+    day_text: &str,
+    recipient: &RecipientMaterial,
+) -> Result<SealDayOutcome> {
+    let archive = directory.join(ARCHIVE_FILENAME);
+    if archive.is_file() {
+        let header = inspect_archive(&archive)?;
+        ensure!(
+            header.day == day_text,
+            "existing archive day does not match its directory"
+        );
+        let sha256 = sha256_file(&archive)?;
+        let size = fs::metadata(&archive)?.len();
+        cleanup_sealed_day(directory)?;
+        return Ok(SealDayOutcome::AlreadySealed {
+            path: archive,
+            sha256,
+            size,
+        });
+    }
+    let bundle = pack_day(directory, day_text)?;
+    let temporary = directory.join(format!("{ARCHIVE_FILENAME}.tmp"));
+    if temporary.exists() {
+        fs::remove_file(&temporary).with_context(|| {
+            format!(
+                "failed to remove stale archive temporary {}",
+                temporary.display()
+            )
+        })?;
+    }
+    let metadata = encrypt_archive_file(day_text, &bundle.payload, recipient, &temporary)?;
+    fs::rename(&temporary, &archive)
+        .with_context(|| format!("failed to commit {}", archive.display()))?;
+    cleanup_paths(&bundle.source_paths)?;
+    cleanup_sealed_day(directory)?;
+    Ok(SealDayOutcome::Sealed {
+        path: archive,
+        metadata,
+    })
+}
+
+fn log_seal_outcome(day: &str, outcome: &SealDayOutcome) {
+    if let SealDayOutcome::Sealed { path, metadata } = outcome {
         logger::info(format!(
             "Sealed archive day={} path={} bytes={} sha256={}",
-            day_text,
-            archive.display(),
+            day,
+            path.display(),
             metadata.size,
             metadata.sha256
         ));
     }
-    Ok(())
 }
 
 fn upload_archives(config: &AppConfig) -> Result<()> {
@@ -164,7 +298,7 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
         parsed_upload_url.scheme() == "https",
         "ASHE_ARCHIVE_UPLOAD_URL must use HTTPS"
     );
-    let mut state = read_upload_state(&config.activity_artifacts_dir);
+    let mut state = read_upload_state(&config.activity_artifacts_dir)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -320,14 +454,19 @@ fn remove_empty_subdirectories(root: &Path, directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_upload_state(root: &Path) -> UploadState {
-    fs::read(root.join(UPLOAD_STATE_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+fn read_upload_state(root: &Path) -> Result<UploadState> {
+    let path = root.join(UPLOAD_STATE_FILE);
+    if !path.exists() {
+        return Ok(UploadState::default());
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read upload state {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("upload state is invalid: {}", path.display()))
 }
 
 fn write_upload_state(root: &Path, state: &UploadState) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock(root)?;
     let path = root.join(UPLOAD_STATE_FILE);
     let temporary = root.join(format!("{UPLOAD_STATE_FILE}.tmp"));
     fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
@@ -347,8 +486,11 @@ fn now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_sealed_day;
-    use ashe_archive_crypto::ARCHIVE_FILENAME;
+    use super::{
+        SealDayOutcome, cleanup_sealed_day, parse_day, seal_day_locked, uploaded_archives,
+    };
+    use ashe_archive_crypto::{ARCHIVE_FILENAME, RecipientMaterial, inspect_archive};
+    use libsodium_rs::crypto_pwhash::argon2id;
     use std::fs;
 
     #[test]
@@ -369,6 +511,61 @@ mod tests {
         assert!(!root.join("learning").exists());
         assert!(!root.join("keyframes").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uploaded_list_reports_receiver_receipts_and_local_presence() {
+        let root = tempfile_directory("uploaded-list");
+        fs::create_dir(root.join("2026-07-26")).unwrap();
+        fs::write(root.join("2026-07-26/archive.ashe"), "ciphertext").unwrap();
+        fs::write(
+            root.join("archive-upload-state.json"),
+            r#"{
+                "uploaded": {
+                    "bbb": {"day":"2026-07-27","acknowledged_at":20},
+                    "aaa": {"day":"2026-07-26","acknowledged_at":10}
+                }
+            }"#,
+        )
+        .unwrap();
+        let records = uploaded_archives(&root).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].day, "2026-07-26");
+        assert_eq!(records[0].sha256, "aaa");
+        assert!(records[0].archive_present);
+        assert_eq!(records[1].day, "2026-07-27");
+        assert!(!records[1].archive_present);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealing_encrypts_then_removes_plaintext() {
+        let root = tempfile_directory("manual-seal");
+        let day = root.join("2026-07-25");
+        fs::create_dir(&day).unwrap();
+        fs::write(day.join("daily.md"), "daily report").unwrap();
+        let recipient = RecipientMaterial::create_with_limits(
+            "alpha beta gamma delta epsilon",
+            argon2id::OPSLIMIT_INTERACTIVE,
+            argon2id::MEMLIMIT_INTERACTIVE,
+        )
+        .unwrap();
+        let outcome = seal_day_locked(&day, "2026-07-25", &recipient).unwrap();
+        let SealDayOutcome::Sealed { path, metadata } = outcome else {
+            panic!("expected newly sealed archive")
+        };
+        assert_eq!(metadata.day, "2026-07-25");
+        assert_eq!(inspect_archive(&path).unwrap().day, "2026-07-25");
+        assert!(!day.join("daily.md").exists());
+        assert!(day.join(ARCHIVE_FILENAME).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_days_require_canonical_dates() {
+        assert!(parse_day("2026-07-25").is_ok());
+        assert!(parse_day("2026-7-25").is_err());
+        assert!(parse_day("not-a-day").is_err());
     }
 
     fn tempfile_directory(label: &str) -> std::path::PathBuf {

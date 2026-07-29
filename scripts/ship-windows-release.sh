@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="x86_64-pc-windows-gnu"
 BINARY="ashe-worker.exe"
-DECRYPT_BINARY="ashe-archive-decrypt.exe"
+CLI_BINARY="ashe-worker-cli.exe"
 ENV_FILE="$PROJECT_ROOT/.env.local"
 
 read_project_env() {
@@ -81,14 +81,10 @@ if [[ ! -f "$RECIPIENT_FILE" ]]; then
 fi
 ASHE_BUILD_ID="$BUILD_ID" ASHE_ARCHIVE_RECIPIENT_FILE="$RECIPIENT_FILE" \
   "$CARGO_BIN" build --release --target "$TARGET"
-"$CARGO_BIN" build --release --target "$TARGET" \
-  --manifest-path "$PROJECT_ROOT/archive-crypto/Cargo.toml" \
-  --bin ashe-archive-decrypt
 mkdir -p "$RELEASE_DIR"
 cp "$PROJECT_ROOT/target/$TARGET/release/$BINARY" "$RELEASE_DIR/$BINARY"
-cp "$PROJECT_ROOT/archive-crypto/target/$TARGET/release/$DECRYPT_BINARY" \
-  "$RELEASE_DIR/$DECRYPT_BINARY"
+cp "$PROJECT_ROOT/target/$TARGET/release/$CLI_BINARY" "$RELEASE_DIR/$CLI_BINARY"
 cp "$PROJECT_ROOT/.env.example" "$RELEASE_DIR/.env.example"
 printf '%s\n' "$BUILD_ID" > "$RELEASE_DIR/ashe-worker.build.txt"
 printf 'Shipped %s and %s build_id=%s\n' \
-  "$RELEASE_DIR/$BINARY" "$RELEASE_DIR/$DECRYPT_BINARY" "$BUILD_ID"
+  "$RELEASE_DIR/$BINARY" "$RELEASE_DIR/$CLI_BINARY" "$BUILD_ID"

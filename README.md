@@ -97,12 +97,31 @@ data key is wrapped to the archive recipient, and the archive embeds the private
 protected by the five-word passphrase. An archive and that passphrase are sufficient for
 recovery; losing the passphrase permanently loses access by design.
 
-To restore an archive, run the supplied decrypt utility with the archive and a new output
-directory, then enter the passphrase at its hidden prompt:
+The supplied CLI centralizes manual archive operations. To see archives that the configured
+receiver has acknowledged, using the local upload receipt state:
 
 ```powershell
-.\ashe-archive-decrypt.exe <archive> <output-directory>
+.\ashe-worker-cli.exe archive list-uploaded
 ```
+
+To archive a closed day immediately, rather than waiting for the retention scan, provide its
+calendar date. The command refuses current, future, and pending days; generates and validates the
+deterministic daily report when enabled; verifies the encrypted archive; and only then removes the
+plaintext and image artifacts:
+
+```powershell
+.\ashe-worker-cli.exe archive seal 2026-07-27
+```
+
+To restore an archive into a new output directory, run the decrypt command and enter the
+passphrase at its hidden prompt:
+
+```powershell
+.\ashe-worker-cli.exe archive decrypt <archive> <output-directory>
+```
+
+All artifact commands use the worker's configured artifact directory. Pass
+`--artifacts-dir <path>` before `archive` to override it for `list-uploaded` or `seal`.
 
 Remote backup is an abstract authenticated HTTPS upload. The worker sends only the encrypted
 archive and relies on a successful acknowledgement for retry-safe delivery; it has no
@@ -110,13 +129,13 @@ knowledge of the receiver's storage or replication implementation.
 
 ## Build and release
 
-Build the Windows binary from the project root:
+Build the Windows GUI and CLI binaries from the project root:
 
 ```powershell
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-From Linux or WSL, the shipping script cross-builds the worker and decrypt utility, then
+From Linux or WSL, the shipping script cross-builds the worker and unified CLI, then
 copies them to the configured release directory:
 
 ```bash
