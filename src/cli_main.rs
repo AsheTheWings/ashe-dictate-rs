@@ -11,14 +11,12 @@ use zeroize::Zeroizing;
 const HELP: &str = r#"Ashe Worker command-line tools
 
 Usage:
-  ashe-worker-cli [--artifacts-dir <path>] archive list-uploaded
   ashe-worker-cli [--artifacts-dir <path>] archive seal <YYYY-MM-DD>
   ashe-worker-cli archive upload <archive>
   ashe-worker-cli archive decrypt <archive> <output-directory> [--passphrase-file <path>]
   ashe-worker-cli --help
 
 Commands:
-  archive list-uploaded  List archives currently stored by the configured receiver
   archive seal           Generate/check daily.md, encrypt a closed day, then remove plaintext
   archive upload         Upload an existing encrypted archive unchanged
   archive decrypt        Decrypt and restore an archive into a new directory
@@ -40,10 +38,6 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
             print!("{HELP}");
             Ok(())
         }
-        Command::ListUploaded { artifacts_dir } => {
-            let config = load_config(artifacts_dir);
-            list_uploaded(&config)
-        }
         Command::Seal { artifacts_dir, day } => {
             let config = load_config(artifacts_dir);
             seal_day(&config, &day)
@@ -62,9 +56,6 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
 
 enum Command {
     Help,
-    ListUploaded {
-        artifacts_dir: Option<PathBuf>,
-    },
     Seal {
         artifacts_dir: Option<PathBuf>,
         day: String,
@@ -101,13 +92,6 @@ fn parse_args(arguments: Vec<OsString>) -> Result<Command> {
     ensure!(command == "archive", "unknown command; run with --help");
     let action = arguments.next().context("archive action is required")?;
     match action.to_string_lossy().as_ref() {
-        "list-uploaded" => {
-            ensure!(
-                arguments.next().is_none(),
-                "archive list-uploaded takes no arguments"
-            );
-            Ok(Command::ListUploaded { artifacts_dir })
-        }
         "seal" => {
             let day = arguments
                 .next()
@@ -181,25 +165,6 @@ fn load_config(artifacts_dir: Option<PathBuf>) -> AppConfig {
         config.activity_artifacts_dir = path;
     }
     config
-}
-
-fn list_uploaded(config: &AppConfig) -> Result<()> {
-    let records = archive::uploaded_archives(config)?;
-    if records.is_empty() {
-        println!("No archives are currently stored by the receiver.");
-        return Ok(());
-    }
-    println!("DAY         BYTES        LOCAL  SHA256");
-    for record in records {
-        println!(
-            "{}  {:<12} {:<6} {}",
-            record.day,
-            record.size,
-            if record.archive_present { "yes" } else { "no" },
-            record.sha256
-        );
-    }
-    Ok(())
 }
 
 fn upload_archive(config: &AppConfig, path: &Path) -> Result<()> {
@@ -277,17 +242,6 @@ mod tests {
 
     #[test]
     fn parses_archive_commands() {
-        let Command::ListUploaded { artifacts_dir } = parse_args(args(&[
-            "--artifacts-dir",
-            "store",
-            "archive",
-            "list-uploaded",
-        ]))
-        .unwrap() else {
-            panic!("expected list-uploaded")
-        };
-        assert_eq!(artifacts_dir, Some(PathBuf::from("store")));
-
         let Command::Seal { day, .. } =
             parse_args(args(&["archive", "seal", "2026-07-28"])).unwrap()
         else {
@@ -326,7 +280,7 @@ mod tests {
     #[test]
     fn rejects_ambiguous_archive_arguments() {
         assert!(parse_args(args(&["archive", "seal"])).is_err());
-        assert!(parse_args(args(&["archive", "list-uploaded", "extra"])).is_err());
+        assert!(parse_args(args(&["archive", "list-uploaded"])).is_err());
         assert!(parse_args(args(&["archive", "upload"])).is_err());
         assert!(
             parse_args(args(&[

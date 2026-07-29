@@ -8,12 +8,14 @@ use ashe_archive_crypto::{
 };
 use chrono::{Days, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const UPLOAD_STATE_FILE: &str = "archive-upload-state.json";
 
 pub struct ArchiveHandle {
     tx: Option<Sender<()>>,
@@ -46,24 +48,16 @@ impl Drop for ArchiveHandle {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RemoteArchive {
+#[derive(Default, Deserialize, Serialize)]
+struct UploadState {
+    #[serde(default)]
+    uploaded: BTreeMap<String, UploadedArchive>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct UploadedArchive {
     day: String,
-    sha256: String,
-    size: u64,
-}
-
-#[derive(Deserialize)]
-struct ArchiveListResponse {
-    archives: Vec<RemoteArchive>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct UploadedArchiveRecord {
-    pub day: String,
-    pub sha256: String,
-    pub size: u64,
-    pub archive_present: bool,
+    acknowledged_at: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -194,23 +188,6 @@ pub fn seal_day_manually(config: &AppConfig, day_text: &str) -> Result<SealDayOu
     seal_day_locked(&directory, day_text, &recipient)
 }
 
-pub fn uploaded_archives(config: &AppConfig) -> Result<Vec<UploadedArchiveRecord>> {
-    let (upload_url, upload_token) = receiver_config(config)?;
-    let runtime = upload_runtime()?;
-    let client = upload_client()?;
-    let archives = runtime.block_on(list_remote_archives(&client, &upload_url, &upload_token))?;
-    let local = local_archive_hashes(&config.activity_artifacts_dir)?;
-    Ok(archives
-        .into_iter()
-        .map(|archive| UploadedArchiveRecord {
-            archive_present: local.contains(&archive.sha256),
-            day: archive.day,
-            sha256: archive.sha256,
-            size: archive.size,
-        })
-        .collect())
-}
-
 pub fn upload_archive_manually(config: &AppConfig, path: &Path) -> Result<UploadArchiveOutcome> {
     ensure!(path.is_file(), "archive does not exist: {}", path.display());
     let header = inspect_archive(path)?;
@@ -227,6 +204,7 @@ pub fn upload_archive_manually(config: &AppConfig, path: &Path) -> Result<Upload
         &header.day,
         &sha256,
     ))?;
+    record_uploaded_archive(&config.activity_artifacts_dir, &sha256, &header.day)?;
     Ok(UploadArchiveOutcome {
         day: header.day,
         sha256,
@@ -315,20 +293,17 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
     let (upload_url, upload_token) = receiver_config(config)?;
+    let state = read_upload_state(&config.activity_artifacts_dir)?;
     let runtime = upload_runtime()?;
     let client = upload_client()?;
-    let mut uploaded = runtime
-        .block_on(list_remote_archives(&client, &upload_url, &upload_token))?
-        .into_iter()
-        .map(|archive| archive.sha256)
-        .collect::<HashSet<_>>();
+    let mut accepted = BTreeMap::new();
     for (_, directory) in dated_directories(&config.activity_artifacts_dir)? {
         let path = directory.join(ARCHIVE_FILENAME);
         if !path.is_file() {
             continue;
         }
         let sha256 = sha256_file(&path)?;
-        if uploaded.contains(&sha256) {
+        if state.uploaded.contains_key(&sha256) || accepted.contains_key(&sha256) {
             continue;
         }
         let header = inspect_archive(&path)?;
@@ -340,7 +315,14 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
             &header.day,
             &sha256,
         ))?;
-        uploaded.insert(sha256.clone());
+        record_uploaded_archive(&config.activity_artifacts_dir, &sha256, &header.day)?;
+        accepted.insert(
+            sha256.clone(),
+            UploadedArchive {
+                day: header.day.clone(),
+                acknowledged_at: now(),
+            },
+        );
         logger::info(format!(
             "Archive receiver acknowledged day={} sha256={sha256}",
             header.day
@@ -387,42 +369,6 @@ fn upload_client() -> Result<reqwest::Client> {
         .context("failed to build archive-upload client")
 }
 
-async fn list_remote_archives(
-    client: &reqwest::Client,
-    upload_url: &str,
-    upload_token: &str,
-) -> Result<Vec<RemoteArchive>> {
-    let response = client
-        .get(upload_url)
-        .bearer_auth(upload_token)
-        .send()
-        .await?;
-    ensure!(
-        response.status().is_success(),
-        "archive receiver returned HTTP {} while listing archives",
-        response.status()
-    );
-    let mut archives = response
-        .json::<ArchiveListResponse>()
-        .await
-        .context("archive receiver returned an invalid archive list")?
-        .archives;
-    for archive in &archives {
-        parse_day(&archive.day)?;
-        ensure!(
-            valid_sha256(&archive.sha256),
-            "receiver returned an invalid SHA-256"
-        );
-        ensure!(archive.size > 0, "receiver returned an empty archive");
-    }
-    archives.sort_by(|left, right| {
-        left.day
-            .cmp(&right.day)
-            .then_with(|| left.sha256.cmp(&right.sha256))
-    });
-    Ok(archives)
-}
-
 async fn send_archive(
     client: &reqwest::Client,
     upload_url: &str,
@@ -448,24 +394,6 @@ async fn send_archive(
         day
     );
     Ok(())
-}
-
-fn local_archive_hashes(root: &Path) -> Result<HashSet<String>> {
-    let mut hashes = HashSet::new();
-    for (_, directory) in dated_directories(root)? {
-        let path = directory.join(ARCHIVE_FILENAME);
-        if path.is_file() {
-            hashes.insert(sha256_file(&path)?);
-        }
-    }
-    Ok(hashes)
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn dated_directories(root: &Path) -> Result<Vec<(NaiveDate, PathBuf)>> {
@@ -568,9 +496,63 @@ fn remove_empty_subdirectories(root: &Path, directory: &Path) -> Result<()> {
     Ok(())
 }
 
+fn record_uploaded_archive(root: &Path, sha256: &str, day: &str) -> Result<()> {
+    let mut uploaded = BTreeMap::new();
+    uploaded.insert(
+        sha256.to_string(),
+        UploadedArchive {
+            day: day.to_string(),
+            acknowledged_at: now(),
+        },
+    );
+    record_uploaded_archives(root, uploaded)
+}
+
+fn record_uploaded_archives(
+    root: &Path,
+    uploaded: BTreeMap<String, UploadedArchive>,
+) -> Result<()> {
+    let _write_guard = crate::artifact_store::lock(root)?;
+    let mut state = read_upload_state(root)?;
+    state.uploaded.extend(uploaded);
+    write_upload_state_unlocked(root, &state)
+}
+
+fn read_upload_state(root: &Path) -> Result<UploadState> {
+    let path = root.join(UPLOAD_STATE_FILE);
+    if !path.exists() {
+        return Ok(UploadState::default());
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read upload state {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("upload state is invalid: {}", path.display()))
+}
+
+fn write_upload_state_unlocked(root: &Path, state: &UploadState) -> Result<()> {
+    let path = root.join(UPLOAD_STATE_FILE);
+    let temporary = root.join(format!("{UPLOAD_STATE_FILE}.tmp"));
+    fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SealDayOutcome, cleanup_sealed_day, parse_day, seal_day_locked, valid_sha256};
+    use super::{
+        SealDayOutcome, UploadState, UploadedArchive, cleanup_sealed_day, parse_day,
+        read_upload_state, record_uploaded_archives, seal_day_locked,
+    };
     use ashe_archive_crypto::{ARCHIVE_FILENAME, RecipientMaterial, inspect_archive};
     use libsodium_rs::crypto_pwhash::argon2id;
     use std::fs;
@@ -596,11 +578,21 @@ mod tests {
     }
 
     #[test]
-    fn receiver_hashes_must_be_canonical_sha256() {
-        assert!(valid_sha256(&"a".repeat(64)));
-        assert!(!valid_sha256(&"A".repeat(64)));
-        assert!(!valid_sha256("abc"));
-        assert!(!valid_sha256(&"g".repeat(64)));
+    fn upload_receipts_round_trip() {
+        let root = tempfile_directory("upload-receipts");
+        let mut state = UploadState::default();
+        state.uploaded.insert(
+            "abc".to_string(),
+            UploadedArchive {
+                day: "2026-07-27".to_string(),
+                acknowledged_at: 42,
+            },
+        );
+        record_uploaded_archives(&root, state.uploaded).unwrap();
+        let restored = read_upload_state(&root).unwrap();
+        assert_eq!(restored.uploaded["abc"].day, "2026-07-27");
+        assert_eq!(restored.uploaded["abc"].acknowledged_at, 42);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
