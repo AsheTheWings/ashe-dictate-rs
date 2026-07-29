@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const BLOCK_SCHEMA_VERSION: u32 = 2;
-pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+pub const LEARNING_ARTIFACT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -167,9 +167,6 @@ impl LearningNarrative {
             .map_err(|error| {
                 format!("learning response was not the required JSON object: {error}")
             })?;
-        if generated.learning_subjects.is_empty() {
-            return Err("learning_subjects is empty".to_string());
-        }
         let learning_subjects = generated
             .learning_subjects
             .into_iter()
@@ -291,6 +288,7 @@ fn strip_outer_fence<'a>(text: &'a str, opening: &str) -> Option<&'a str> {
 #[serde(rename_all = "kebab-case")]
 pub enum LearningEnrichmentStatus {
     Complete,
+    NoLearning,
     InvalidModelOutput,
     InsufficientEvidence,
 }
@@ -447,6 +445,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn learning_narrative_accepts_an_empty_validated_result() {
+        let narrative = LearningNarrative::parse(r#"{"learning_subjects":[]}"#).unwrap();
+        assert!(narrative.learning_subjects.is_empty());
+    }
+
+    #[test]
+    fn no_learning_status_is_explicit_in_the_artifact_schema() {
+        let artifact = super::LearningArtifact {
+            schema_version: super::LEARNING_ARTIFACT_SCHEMA_VERSION,
+            block: "2026-07-29T1200".to_string(),
+            window_start: 1,
+            window_end: 2,
+            status: super::LearningEnrichmentStatus::NoLearning,
+            frames_sent: 3,
+            model: Some("model".to_string()),
+            subjects: Vec::new(),
+            error: None,
+        };
+        let value = serde_json::to_value(artifact).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["status"], "no-learning");
+        assert_eq!(value["subjects"], serde_json::json!([]));
     }
 
     #[test]

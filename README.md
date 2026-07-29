@@ -54,10 +54,18 @@ and an `unattended` judgment. Estimates remain valid when they overlap during mu
 Namespaces use stable domain-specific positions; preferred roots include
 `software-development`, `entertainment`, `social-media`, and `learning`.
 
-When a base subject is rooted at `learning`, the worker makes a second request from a denser
-temporary evidence buffer. The activity block keeps the base response unchanged. The second
-request writes a separate JSON artifact under that day's `learning/` directory containing
-atomic learning units, visible search queries, source material, and one evidence-backed depth:
+Base learning subjects intentionally favor recall: they are provisional candidates that cause
+the worker to make a second request from a denser temporary evidence buffer. The activity block
+keeps the broad base response unchanged. The second request independently validates whether the
+evidence contains transferable intellectual content rather than merely information retrieval or
+task execution. A genuine unit identifies a concept, mechanism, relationship, rationale, method,
+argument, or principle that was substantively examined. Reading, searching, watching, operating
+software, or applying an action are evidence channels and do not qualify by themselves.
+
+The validator may reject every provisional candidate. Its successful empty result is stored with
+`status: no-learning`, distinguishing a completed cross-check from missing evidence, invalid
+output, or a failed request. Otherwise the request writes validated atomic learning units, visible
+search queries, source material, and one evidence-backed depth:
 `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or `synthesis`.
 Depth describes observable exposure and engagement, not comprehension or retention. Passive
 activity is not considered unattended merely because keyboard and mouse input stopped.
@@ -73,7 +81,8 @@ rebuilt from the base report fields in the JSON block artifacts; structured subj
 canonical in JSON.
 
 Block schema version 2 stores the base activity description and attention judgments.
-Learning artifacts have their own schema and request frame count. Both formats are strict;
+Learning artifact schema version 3 records the validator outcome and request frame count. Both
+formats are strict;
 older block or pending-manifest shapes are not accepted. Recent activity blocks remain available
 in full. Older activity blocks are projected into a structured aggregate and folded once into
 the bounded plaintext `summary.md`; learning artifacts are never included in that rollup.

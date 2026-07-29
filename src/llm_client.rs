@@ -34,7 +34,7 @@ const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's qu
 const QUESTION_TEMPERATURE: f32 = 0.7;
 
 const ACTIVITY_PROMPT: &str = "You are Ashe Worker's activity describer. Produce a factual account of what the user did during this time block, whether software development, learning, entertainment, social media, messaging, shopping, games, or personal administration. Treat the measured app/window timeline as ground truth. Read visible details closely, describe progression rather than listing images, never score productivity, and do not mention screenshots, frames, telemetry, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level. Emit a learning-rooted subject whenever the user meaningfully acquires, examines, follows, applies, or synthesizes information, including a term lookup or informational media consumption. Learning may overlap another supported activity subject. Informational or intellectual media is learning; narrative leisure media and sports are entertainment. This base request identifies learning provisionally but does not produce learning-specific metadata.";
-const LEARNING_PROMPT: &str = "You are Ashe Worker's learning-block analyst. From the measured context, provisional base narrative, and chronological visual evidence, return the evidence-backed atomic learning units covered in this block. Each unit must describe exactly one term, concept, mechanism, procedure, comparison, or application. Report only what was visibly searched, examined, followed, compared, or applied. Do not claim mastery, retention, or understanding. Do not mention screenshots, frames, telemetry, prompts, JSON, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
+const LEARNING_PROMPT: &str = "You are Ashe Worker's final validator and documenter of intellectual learning within an activity block. The provisional base narrative is intentionally optimized for recall: its learning-rooted subjects identify material worth inspecting, but they are hypotheses rather than conclusions and may all be rejected. Independently cross-check them against the measured context and chronological visual evidence before deciding whether this block contains any genuine learning units.\n\nA learning unit is a discrete piece of transferable intellectual content: a concept, mechanism, causal relationship, rationale, method, procedure with explanatory substance, comparison, argument, model, or principle that the user meaningfully examined, followed, reasoned about, or applied. The unit must identify that knowledge content, not merely an activity, source, query, answer, outcome, or intention. Its value should remain intelligible beyond the immediate action that occasioned it.\n\nDistinguish intellectual engagement from information retrieval and task execution. Searching, reading, watching, asking a question, receiving an answer, operating software, executing commands, editing code, testing, or delegating work are only evidence channels; none independently establishes learning. Immediate usefulness is also insufficient when the information's value is exhausted by the current transaction, navigation step, status check, selection, or one-off decision. Applied learning requires visible evidence that a principle or method was reasoned through and used, not merely that an action was performed or succeeded.\n\nFor each candidate, determine whether the evidence exposes substantive meaning, operation, relationships, constraints, reasoning, or implications. Reject candidates supported only by a query, title, brief incidental answer, activity label, elapsed time, source prestige, or the provisional base claim. Consolidate repeated treatment of the same idea, and separate units only when their intellectual content is meaningfully distinct. Report only what was visibly examined; do not claim novelty, mastery, comprehension, retention, or educational intent. If nothing meets this standard, return no learning units. Do not manufacture a unit merely because the block was routed for enrichment. Do not mention screenshots, frames, telemetry, prompts, JSON, or yourself. Keep credentials, financial values, medical details, and intimate conversations at a safe high level.";
 const SUMMARY_PROMPT: &str = "Maintain a continuous rolling summary of the user's computer activity from the structured JSON input. Merge previous_summary with blocks. Preserve concrete project, app, document, site, game, media, person, and open-task names; compress routine detail; preserve rough chronology and current state. The blocks array is the only new material. Treat measured fields as ground truth and do not infer later activity. Learning artifacts are stored separately and are never inputs to this summary. Return Markdown prose only, without a title or preamble.";
 
 pub async fn describe_activity_block(
@@ -114,9 +114,7 @@ pub async fn describe_learning_block(
             )
         }));
     }
-    let instructions = format!(
-        "{LEARNING_PROMPT}\n\nReturn exactly one JSON object with exactly one field, learning_subjects, and nothing else. learning_subjects is a non-empty array of atomic learning subjects. Each subject contains exactly namespaces, subject, estimated_duration_s, and learning. namespaces contains 1-4 ordered lowercase kebab-case strings rooted at learning; use level 2 for the learning mode, level 3 for the knowledge field, and level 4 for the atomic topic when supported. subject is one cautious factual statement using observable verbs such as looked up, reviewed, worked through, compared, or applied. estimated_duration_s is positive and must remain within {duration_budget_s} seconds of measured coverage; independently judged subjects may overlap. Attention and unattended state belong exclusively to the base activity artifact and must not be returned here. learning contains exactly search_queries, sources, and depth. search_queries contains only visibly entered or displayed queries. sources contains visible source objects: each has kind and may have title, provider, and creator only when supported. kind is exactly one of search-results, documentation, article, paper, video, course, book, forum, social-post, code, or other. depth is the strongest observable treatment: lookup for a query, snippet, definition, or short answer; orientation for purpose and high-level structure; focused-explanation for mechanism, relationships, rationale, examples, or tradeoffs; procedural for followed steps; applied for visible use in an active task; synthesis for visibly comparing or combining multiple sources or ideas. Choose the lower supported depth when uncertain. Time spent, source prestige, technical difficulty, multiple open tabs, and input-idle state do not by themselves establish depth."
-    );
+    let instructions = learning_instructions(duration_budget_s);
     let mut body = json!({
         "model": config.tera_model,
         "instructions": instructions,
@@ -153,6 +151,12 @@ pub async fn describe_learning_block(
         .validate_duration_budget(duration_budget_s)
         .map_err(|message| anyhow::Error::new(InvalidLearningOutput(message)))?;
     Ok(narrative)
+}
+
+fn learning_instructions(duration_budget_s: u64) -> String {
+    format!(
+        "{LEARNING_PROMPT}\n\nReturn exactly one JSON object with exactly one field, learning_subjects, and nothing else. learning_subjects is an array containing zero or more validated atomic learning subjects; an empty array is the correct result when no candidate qualifies. Each subject contains exactly namespaces, subject, estimated_duration_s, and learning. namespaces contains 1-4 ordered lowercase kebab-case strings rooted at learning; use level 2 for the learning mode, level 3 for the knowledge field, and level 4 for the atomic topic when supported. subject is one cautious factual statement naming the intellectual content and using observable verbs such as examined, reviewed, worked through, compared, or applied. estimated_duration_s is positive and must remain within {duration_budget_s} seconds of measured coverage; independently judged subjects may overlap. Attention and unattended state belong exclusively to the base activity artifact and must not be returned here. learning contains exactly search_queries, sources, and depth. search_queries contains only visibly entered or displayed queries. sources contains visible source objects: each has kind and may have title, provider, and creator only when supported. kind is exactly one of search-results, documentation, article, paper, video, course, book, forum, social-post, code, or other. depth is the strongest observable treatment after a candidate has independently qualified as intellectual learning: lookup for a brief definition or short answer; orientation for purpose and high-level structure; focused-explanation for mechanism, relationships, rationale, examples, or tradeoffs; procedural for followed steps whose method was substantively examined; applied for visible reasoned use of a principle or method; synthesis for visibly comparing or combining multiple sources or ideas. Choose the lower supported depth when uncertain. A depth of lookup does not make merely transactional or incidental retrieval eligible. Time spent, source prestige, technical difficulty, multiple open tabs, and input-idle state do not by themselves establish either eligibility or depth."
+    )
 }
 
 pub async fn refresh_activity_summary(
@@ -382,7 +386,7 @@ fn tagged(tag: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_reasoning_effort;
+    use super::{apply_reasoning_effort, learning_instructions};
     use serde_json::json;
 
     #[test]
@@ -400,5 +404,16 @@ mod tests {
             body.pointer("/reasoning/effort"),
             Some(&json!("upstream-specific-value"))
         );
+    }
+
+    #[test]
+    fn learning_instructions_validate_intellectual_content_independently() {
+        let instructions = learning_instructions(600);
+        assert!(instructions.contains("hypotheses rather than conclusions"));
+        assert!(instructions.contains("information retrieval and task execution"));
+        assert!(instructions.contains("Immediate usefulness is also insufficient"));
+        assert!(instructions.contains("not merely that an action was performed or succeeded"));
+        assert!(instructions.contains("an empty array is the correct result"));
+        assert!(instructions.contains("within 600 seconds of measured coverage"));
     }
 }

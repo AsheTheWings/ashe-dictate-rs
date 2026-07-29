@@ -668,6 +668,11 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<A
         duration_budget_s,
     )) {
         Ok(learning) => {
+            let enrichment_status = if learning.learning_subjects.is_empty() {
+                LearningEnrichmentStatus::NoLearning
+            } else {
+                LearningEnrichmentStatus::Complete
+            };
             finish_description(
                 config,
                 &block,
@@ -678,7 +683,7 @@ fn describe_and_store(config: &AppConfig, mut block: Block, status: &Arc<Mutex<A
                     block: block.id(),
                     window_start: block.start,
                     window_end: block.end,
-                    status: LearningEnrichmentStatus::Complete,
+                    status: enrichment_status,
                     frames_sent: learning_paths.len(),
                     model: Some(config.tera_model.clone()),
                     subjects: learning.learning_subjects,
@@ -806,7 +811,7 @@ fn learning_description_context(
 ) -> String {
     let base_json = serde_json::to_string_pretty(base).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "## Learning enrichment for block {} on {}\nMeasured coverage is {} seconds and {} dense chronological images are attached.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n### Provisional base narrative (structured JSON)\n{}\n\nReturn the final atomic learning subjects for this block only.",
+        "## Learning validation for block {} on {}\nMeasured coverage is {} seconds and {} dense chronological images are attached.\nMeasured app time: {}.\n\n### Measured focus timeline (ground truth)\n{}\n\n### Provisional high-recall base narrative (structured JSON)\n{}\n\nIndependently decide whether this block contains any genuine intellectual learning, then return only the validated atomic learning subjects. The empty result is valid.",
         block.label(),
         block.day,
         duration_budget_s,
