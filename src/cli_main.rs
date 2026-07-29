@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow, ensure};
 use ashe_archive_crypto::{decrypt_archive_file, extract_bundle};
 use ashe_worker::archive::{self, SealDayOutcome};
 use ashe_worker::config::AppConfig;
-use chrono::{DateTime, Utc};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
@@ -14,12 +13,14 @@ const HELP: &str = r#"Ashe Worker command-line tools
 Usage:
   ashe-worker-cli [--artifacts-dir <path>] archive list-uploaded
   ashe-worker-cli [--artifacts-dir <path>] archive seal <YYYY-MM-DD>
+  ashe-worker-cli archive upload <archive>
   ashe-worker-cli archive decrypt <archive> <output-directory> [--passphrase-file <path>]
   ashe-worker-cli --help
 
 Commands:
-  archive list-uploaded  List archives acknowledged by the configured receiver
+  archive list-uploaded  List archives currently stored by the configured receiver
   archive seal           Generate/check daily.md, encrypt a closed day, then remove plaintext
+  archive upload         Upload an existing encrypted archive unchanged
   archive decrypt        Decrypt and restore an archive into a new directory
 
 Configuration is loaded from .env.local using the same rules as ashe-worker.exe.
@@ -47,6 +48,10 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
             let config = load_config(artifacts_dir);
             seal_day(&config, &day)
         }
+        Command::Upload { archive } => {
+            let config = load_config(None);
+            upload_archive(&config, &archive)
+        }
         Command::Decrypt {
             archive,
             output,
@@ -63,6 +68,9 @@ enum Command {
     Seal {
         artifacts_dir: Option<PathBuf>,
         day: String,
+    },
+    Upload {
+        archive: PathBuf,
     },
     Decrypt {
         archive: PathBuf,
@@ -111,6 +119,21 @@ fn parse_args(arguments: Vec<OsString>) -> Result<Command> {
                 "archive seal takes exactly one day"
             );
             Ok(Command::Seal { artifacts_dir, day })
+        }
+        "upload" => {
+            ensure!(
+                artifacts_dir.is_none(),
+                "--artifacts-dir does not apply to archive upload"
+            );
+            let archive = arguments
+                .next()
+                .map(PathBuf::from)
+                .context("archive upload requires an archive path")?;
+            ensure!(
+                arguments.next().is_none(),
+                "archive upload takes exactly one archive path"
+            );
+            Ok(Command::Upload { archive })
         }
         "decrypt" => {
             ensure!(
@@ -161,24 +184,33 @@ fn load_config(artifacts_dir: Option<PathBuf>) -> AppConfig {
 }
 
 fn list_uploaded(config: &AppConfig) -> Result<()> {
-    let records = archive::uploaded_archives(&config.activity_artifacts_dir)?;
+    let records = archive::uploaded_archives(config)?;
     if records.is_empty() {
-        println!("No receiver-acknowledged archives recorded.");
+        println!("No archives are currently stored by the receiver.");
         return Ok(());
     }
-    println!("DAY         ACKNOWLEDGED_AT          LOCAL  SHA256");
+    println!("DAY         BYTES        LOCAL  SHA256");
     for record in records {
-        let acknowledged = DateTime::<Utc>::from_timestamp(record.acknowledged_at as i64, 0)
-            .map(|value| value.to_rfc3339())
-            .unwrap_or_else(|| record.acknowledged_at.to_string());
         println!(
-            "{}  {:<24} {:<6} {}",
+            "{}  {:<12} {:<6} {}",
             record.day,
-            acknowledged,
+            record.size,
             if record.archive_present { "yes" } else { "no" },
             record.sha256
         );
     }
+    Ok(())
+}
+
+fn upload_archive(config: &AppConfig, path: &Path) -> Result<()> {
+    let uploaded = archive::upload_archive_manually(config, path)?;
+    println!(
+        "Uploaded archive: day={} path={} bytes={} sha256={}",
+        uploaded.day,
+        path.display(),
+        uploaded.size,
+        uploaded.sha256
+    );
     Ok(())
 }
 
@@ -263,6 +295,13 @@ mod tests {
         };
         assert_eq!(day, "2026-07-28");
 
+        let Command::Upload { archive } =
+            parse_args(args(&["archive", "upload", "archive.ashe"])).unwrap()
+        else {
+            panic!("expected upload")
+        };
+        assert_eq!(archive, PathBuf::from("archive.ashe"));
+
         let Command::Decrypt {
             archive,
             output,
@@ -288,6 +327,17 @@ mod tests {
     fn rejects_ambiguous_archive_arguments() {
         assert!(parse_args(args(&["archive", "seal"])).is_err());
         assert!(parse_args(args(&["archive", "list-uploaded", "extra"])).is_err());
+        assert!(parse_args(args(&["archive", "upload"])).is_err());
+        assert!(
+            parse_args(args(&[
+                "--artifacts-dir",
+                "store",
+                "archive",
+                "upload",
+                "archive.ashe",
+            ]))
+            .is_err()
+        );
         assert!(
             parse_args(args(&[
                 "--artifacts-dir",

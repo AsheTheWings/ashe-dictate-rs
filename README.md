@@ -97,11 +97,17 @@ data key is wrapped to the archive recipient, and the archive embeds the private
 protected by the five-word passphrase. An archive and that passphrase are sufficient for
 recovery; losing the passphrase permanently loses access by design.
 
-The supplied CLI centralizes manual archive operations. To see archives that the configured
-receiver has acknowledged, using the local upload receipt state:
+The supplied CLI centralizes manual archive operations. To query the configured receiver for
+the archives it currently stores:
 
 ```powershell
 .\ashe-worker-cli.exe archive list-uploaded
+```
+
+To upload an existing encrypted archive without decrypting or re-encrypting it:
+
+```powershell
+.\ashe-worker-cli.exe archive upload <archive>
 ```
 
 To archive a closed day immediately, rather than waiting for the retention scan, provide its
@@ -120,12 +126,12 @@ passphrase at its hidden prompt:
 .\ashe-worker-cli.exe archive decrypt <archive> <output-directory>
 ```
 
-All artifact commands use the worker's configured artifact directory. Pass
+Commands that inspect local artifacts use the worker's configured artifact directory. Pass
 `--artifacts-dir <path>` before `archive` to override it for `list-uploaded` or `seal`.
 
-Remote backup is an abstract authenticated HTTPS upload. The worker sends only the encrypted
-archive and relies on a successful acknowledgement for retry-safe delivery; it has no
-knowledge of the receiver's storage or replication implementation.
+Remote backup uses authenticated HTTPS inventory and upload endpoints. The worker compares
+local ciphertext hashes with the receiver's current inventory and sends only missing encrypted
+archives. It has no knowledge of the receiver's storage or replication implementation.
 
 ## Build and release
 
