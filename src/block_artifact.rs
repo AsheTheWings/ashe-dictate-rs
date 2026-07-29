@@ -4,20 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const BLOCK_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SoftwareDevelopmentMedium {
-    CodeEditor,
-    Tui,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoftwareDevelopmentRecord {
     #[serde(deserialize_with = "deserialize_nullable_string")]
     pub project: Option<String>,
     pub agentic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub medium: Option<SoftwareDevelopmentMedium>,
+    pub medium: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +262,13 @@ fn validate_common_subject(subject: &ActivitySubject) -> Result<(), String> {
                 "software_development medium and tool must be present together".to_string(),
             );
         }
+        if development
+            .medium
+            .as_ref()
+            .is_some_and(|medium| !is_lowercase_kebab_case(medium))
+        {
+            return Err("software_development medium must be lowercase kebab-case".to_string());
+        }
         if development.agentic && development.medium.is_none() {
             return Err(
                 "agentic software_development requires a visible medium and tool".to_string(),
@@ -511,7 +511,7 @@ impl BlockArtifact {
 mod tests {
     use super::{
         ActivityNarrative, BLOCK_SCHEMA_VERSION, BlockArtifact, LearningDepth, LearningMode,
-        LearningSourceKind, SoftwareDevelopmentMedium,
+        LearningSourceKind,
     };
 
     const UNIFIED: &str = r#"{
@@ -543,7 +543,7 @@ mod tests {
         let development = narrative.subjects[0].software_development.as_ref().unwrap();
         assert_eq!(development.project.as_deref(), Some("ashe-worker"));
         assert!(development.agentic);
-        assert_eq!(development.medium, Some(SoftwareDevelopmentMedium::Tui));
+        assert_eq!(development.medium.as_deref(), Some("tui"));
         assert_eq!(development.tool.as_deref(), Some("codex"));
         assert_eq!(development.model_id.as_deref(), Some("gpt-5.4"));
         assert_eq!(narrative.learning_subjects[0].tags[0], "rust");
@@ -589,10 +589,7 @@ mod tests {
         let narrative = ActivityNarrative::parse(&text).unwrap();
         let development = narrative.subjects[0].software_development.as_ref().unwrap();
         assert!(!development.agentic);
-        assert_eq!(
-            development.medium,
-            Some(SoftwareDevelopmentMedium::CodeEditor)
-        );
+        assert_eq!(development.medium.as_deref(), Some("code-editor"));
         assert_eq!(development.tool.as_deref(), Some("cursor"));
         assert_eq!(development.model_id, None);
     }
@@ -608,6 +605,13 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn software_development_medium_accepts_terminal_and_extensible_values() {
+        assert!(ActivityNarrative::parse(&UNIFIED.replace("\"tui\"", "\"terminal\"")).is_ok());
+        assert!(ActivityNarrative::parse(&UNIFIED.replace("\"tui\"", "\"web-ide\"")).is_ok());
+        assert!(ActivityNarrative::parse(&UNIFIED.replace("\"tui\"", "\"Web IDE\"")).is_err());
     }
 
     #[test]

@@ -1,6 +1,4 @@
-use crate::block_artifact::{
-    BlockArtifact, BlockDocumentInput, LearningDepth, LearningMode, SoftwareDevelopmentMedium,
-};
+use crate::block_artifact::{BlockArtifact, BlockDocumentInput, LearningDepth, LearningMode};
 use crate::config::AppConfig;
 use crate::logger;
 use anyhow::Result;
@@ -14,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAILY_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAILY_GENERATOR_VERSION: &str = "ashe-worker-daily-v6";
+const DAILY_GENERATOR_VERSION: &str = "ashe-worker-daily-v7";
 
 pub struct DailyReportHandle {
     tx: Option<Sender<()>>,
@@ -268,11 +266,11 @@ fn render_daily_report(source: &DailySource) -> String {
                                     .as_ref()
                                     .zip(record.tool.as_ref())
                                     .map_or_else(String::new, |(medium, tool)| {
-                                        let medium = match medium {
-                                            SoftwareDevelopmentMedium::CodeEditor => "code editor",
-                                            SoftwareDevelopmentMedium::Tui => "TUI",
-                                        };
-                                        format!(", {medium} `{}`", markdown_code(tool))
+                                        format!(
+                                            ", medium `{}`, tool `{}`",
+                                            markdown_code(medium),
+                                            markdown_code(tool)
+                                        )
                                     });
                                 let model = record
                                     .model_id
@@ -691,7 +689,7 @@ mod tests {
     };
     use crate::block_artifact::{
         ActivitySubject, BlockDocumentInput, LearningDepth, LearningMode, LearningRecord,
-        LearningSubject, SoftwareDevelopmentMedium, SoftwareDevelopmentRecord,
+        LearningSubject, SoftwareDevelopmentRecord,
     };
     use std::collections::{BTreeMap, HashSet};
 
@@ -728,7 +726,7 @@ mod tests {
             software_development: Some(SoftwareDevelopmentRecord {
                 project: Some("ashe-worker".to_string()),
                 agentic: true,
-                medium: Some(SoftwareDevelopmentMedium::Tui),
+                medium: Some("terminal".to_string()),
                 tool: Some("codex".to_string()),
                 model_id: Some("gpt-5.4".to_string()),
             }),
