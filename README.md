@@ -49,16 +49,21 @@ redundant frames are omitted from model requests, request count and payload size
 blocks with too little active or visual change are stored without an unnecessary model call.
 
 One model request returns a title, Markdown report, broad activity subjects, and independently
-validated learning subjects. Each activity subject includes one to four broad-to-specific
+validated learning subjects. Titles are short factual phrases without an area or namespace prefix.
+Each activity subject includes one to three broad-to-specific
 namespaces, an independently estimated duration, and an `unattended` judgment. Estimates remain
 valid when they overlap during multitasking. Namespaces use stable domain-specific positions;
 preferred roots include `software-development`, `entertainment`, `social-media`, and `learning`.
 
-Agentic development receives a distinct `software-development/agentic-coding` activity subject
-when supported. That subject records an `agentic_coding` object containing the visible medium
-(`code-editor` or `tui`), a canonical tool name such as `cursor`, `devin`, `zed`, `vscode`,
-`opencode`, or `codex`, and `model_id` only when the identifier is visible. The metadata is
-subject-scoped so one block can accurately represent multiple coding environments.
+Every `software-development` subject records a `software_development` object. Its required
+`project` field is the visible project, repository, or workspace name, or `null` when it cannot be
+identified without guessing. Its required `agentic` flag distinguishes LLM-agent execution from
+primarily manual development. Agentic subjects also record the visible medium (`code-editor` or
+`tui`) and a canonical tool name such as `cursor`, `devin`, `zed`, `vscode`, `opencode`, or
+`codex`. Manual subjects may record the same environment pair when visible. `model_id` is allowed
+only for agentic work and only when the identifier is visible. Project and agentic state are
+metadata, not namespaces, so the three namespace levels remain available for domain, development
+activity, and concrete technical focus.
 
 Within the same response, the model independently validates whether evidence contains transferable
 intellectual content rather than merely information retrieval or task execution. A genuine unit
@@ -66,12 +71,12 @@ identifies a concept, mechanism, relationship, rationale, method, argument, or p
 substantively examined. Reading, searching, watching, operating software, or applying an action are
 evidence channels and do not qualify by themselves. The validator may reject every broad learning
 activity; a successful empty `learning_subjects` array is the canonical no-learning result.
-Otherwise it records atomic learning units, visible search queries, source material, and one
-evidence-backed depth:
+Otherwise it records atomic learning units using flat knowledge tags, one to three explicit
+engagement modes, visible search queries, source material, and one evidence-backed depth:
 `lookup`, `orientation`, `focused-explanation`, `procedural`, `applied`, or `synthesis`.
 Depth describes observable exposure and engagement, not comprehension or retention. Passive
 activity is not considered unattended merely because keyboard and mouse input stopped. `unattended`
-and agentic-coding environment metadata remain exclusively on broad activity subjects.
+and software-development environment metadata remain exclusively on broad activity subjects.
 
 The unified request uses one chronological evidence selection and one payload count. Capture
 continues while input-idle, but stops while Windows is locked and honors the foreground denylist.
@@ -79,26 +84,28 @@ Model description runs separately from capture so a slow request does not create
 following block. The chronological `journal.md` is rebuilt from report fields in JSON block
 artifacts; structured activity and learning subjects remain canonical in JSON.
 
-Block schema version 3 stores the activity description, attention judgments, agentic-coding
+Block schema version 3 stores the activity description, attention judgments, software-development
 environment, validated learning units, and unified request frame count in one strict artifact.
 Separate learning artifacts are no longer written. Older block or pending-manifest shapes are not
 accepted. Recent blocks remain available in full. Older blocks are projected into a structured
 aggregate and folded once into the bounded plaintext `summary.md`, including their validated
-learning and agentic-coding context.
+learning and software-development context.
 
 The generated portion of a described block has this shape:
 
 ```json
 {
-  "title": "Software development: revised activity generation",
+  "title": "Revised activity generation",
   "report": "...",
   "subjects": [
     {
-      "namespaces": ["software-development", "agentic-coding", "ashe-worker"],
+      "namespaces": ["software-development", "coding", "activity-generation"],
       "subject": "Used Codex to revise the activity pipeline.",
       "estimated_duration_s": 420,
       "unattended": false,
-      "agentic_coding": {
+      "software_development": {
+        "project": "ashe-worker",
+        "agentic": true,
         "medium": "tui",
         "tool": "codex",
         "model_id": "gpt-5.4"
@@ -107,10 +114,11 @@ The generated portion of a described block has this shape:
   ],
   "learning_subjects": [
     {
-      "namespaces": ["learning", "applied", "rust", "serde-schema"],
+      "tags": ["rust", "serde", "schema-evolution"],
       "subject": "Applied strict Serde fields to the unified artifact schema.",
       "estimated_duration_s": 120,
       "learning": {
+        "modes": ["reading", "practice"],
         "search_queries": [],
         "sources": [{ "kind": "code", "title": "block_artifact.rs" }],
         "depth": "applied"
@@ -120,9 +128,12 @@ The generated portion of a described block has this shape:
 }
 ```
 
-`agentic_coding` is required exactly on `software-development/agentic-coding` activity subjects;
-`model_id` is optional and omitted when it is not visible. `learning_subjects` is always present and
-may be empty after a successful validation.
+`software_development` is required exactly on activity subjects whose root namespace is
+`software-development`. Its `project` and `agentic` fields are always present; `medium` and `tool`
+are a pair and are required for agentic work; `model_id` is optional and omitted unless both
+agentic and visible. Learning `tags` contain only fields, technologies, concepts, and the atomic
+topic; modes, depth, and source kinds stay in their dedicated fields. `learning_subjects` is always
+present and may be empty after a successful validation.
 
 At the end of each day, the worker generates `daily.md` deterministically without a daily model
 request. It projects block titles, activity subjects, validated learning units, subject estimates,

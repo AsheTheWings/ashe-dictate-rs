@@ -1306,8 +1306,8 @@ mod tests {
         write_report,
     };
     use crate::block_artifact::{
-        ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LearningDepth, LearningRecord,
-        LearningSubject,
+        ActivityNarrative, ActivitySubject, BLOCK_SCHEMA_VERSION, LearningDepth, LearningMode,
+        LearningRecord, LearningSubject,
     };
     use crate::config::AppConfig;
     use std::collections::BTreeMap;
@@ -1345,7 +1345,7 @@ mod tests {
                 subject: "Structured subject must not be rendered.".to_string(),
                 estimated_duration_s: 600,
                 unattended: false,
-                agentic_coding: None,
+                software_development: None,
             }],
             learning_subjects: Vec::new(),
             reason: None,
@@ -1470,25 +1470,21 @@ mod tests {
         config.tera_model = "test-model".to_string();
         let block = Block::new(0, 600);
         let narrative = ActivityNarrative {
-            title: "Learning: reviewed ownership".to_string(),
+            title: "Reviewed Rust ownership".to_string(),
             report: "The user reviewed ownership material.".to_string(),
             subjects: vec![ActivitySubject {
                 namespaces: vec!["learning".to_string(), "reading".to_string()],
                 subject: "Reviewed ownership material.".to_string(),
                 estimated_duration_s: 300,
                 unattended: false,
-                agentic_coding: None,
+                software_development: None,
             }],
             learning_subjects: vec![LearningSubject {
-                namespaces: vec![
-                    "learning".to_string(),
-                    "reading".to_string(),
-                    "rust".to_string(),
-                    "ownership".to_string(),
-                ],
+                tags: vec!["rust".to_string(), "ownership".to_string()],
                 subject: "Reviewed Rust ownership rules.".to_string(),
                 estimated_duration_s: 240,
                 learning: LearningRecord {
+                    modes: vec![LearningMode::Reading],
                     search_queries: Vec::new(),
                     sources: Vec::new(),
                     depth: LearningDepth::FocusedExplanation,

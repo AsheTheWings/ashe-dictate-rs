@@ -1,5 +1,5 @@
 use crate::block_artifact::{
-    AgenticCodingMedium, BlockArtifact, BlockDocumentInput, LearningDepth,
+    BlockArtifact, BlockDocumentInput, LearningDepth, LearningMode, SoftwareDevelopmentMedium,
 };
 use crate::config::AppConfig;
 use crate::logger;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAILY_SCAN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAILY_GENERATOR_VERSION: &str = "ashe-worker-daily-v5";
+const DAILY_GENERATOR_VERSION: &str = "ashe-worker-daily-v6";
 
 pub struct DailyReportHandle {
     tx: Option<Sender<()>>,
@@ -255,22 +255,35 @@ fn render_daily_report(source: &DailySource) -> String {
                     } else {
                         ""
                     };
-                    let agentic =
+                    let development =
                         subject
-                            .agentic_coding
+                            .software_development
                             .as_ref()
                             .map_or_else(String::new, |record| {
-                                let medium = match record.medium {
-                                    AgenticCodingMedium::CodeEditor => "code editor",
-                                    AgenticCodingMedium::Tui => "TUI",
-                                };
+                                let project =
+                                    record.project.as_deref().unwrap_or("unknown project");
+                                let execution = if record.agentic { "agentic" } else { "manual" };
+                                let environment = record
+                                    .medium
+                                    .as_ref()
+                                    .zip(record.tool.as_ref())
+                                    .map_or_else(String::new, |(medium, tool)| {
+                                        let medium = match medium {
+                                            SoftwareDevelopmentMedium::CodeEditor => "code editor",
+                                            SoftwareDevelopmentMedium::Tui => "TUI",
+                                        };
+                                        format!(", {medium} `{}`", markdown_code(tool))
+                                    });
                                 let model = record
                                     .model_id
                                     .as_ref()
                                     .map_or_else(String::new, |model_id| {
                                         format!(", model `{}`", markdown_code(model_id))
                                     });
-                                format!(", {medium} `{}`{model}", markdown_code(&record.tool))
+                                format!(
+                                    ", project `{}`, {execution}{environment}{model}",
+                                    markdown_code(project)
+                                )
                             });
                     output.push_str(&format!(
                         "  - `{}` — {} ({}{}{})\n",
@@ -278,7 +291,7 @@ fn render_daily_report(source: &DailySource) -> String {
                         markdown_inline(&subject.subject),
                         human_duration(subject.estimated_duration_s),
                         attention,
-                        agentic,
+                        development,
                     ));
                 }
             }
@@ -287,11 +300,19 @@ fn render_daily_report(source: &DailySource) -> String {
             } else {
                 output.push_str("- Validated learning:\n");
                 for subject in &block.learning_subjects {
+                    let modes = subject
+                        .learning
+                        .modes
+                        .iter()
+                        .map(learning_mode)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     output.push_str(&format!(
-                        "  - `{}` — {} ({}; depth `{}`)\n",
-                        markdown_code(&namespace_path(&subject.namespaces)),
+                        "  - `{}` — {} ({}; modes `{}`; depth `{}`)\n",
+                        markdown_code(&subject.tags.join(", ")),
                         markdown_inline(&subject.subject),
                         human_duration(subject.estimated_duration_s),
+                        markdown_code(&modes),
                         markdown_code(learning_depth(&subject.learning.depth)),
                     ));
                 }
@@ -549,6 +570,17 @@ fn learning_depth(depth: &LearningDepth) -> &'static str {
     }
 }
 
+fn learning_mode(mode: &LearningMode) -> &'static str {
+    match mode {
+        LearningMode::Lookup => "lookup",
+        LearningMode::Reading => "reading",
+        LearningMode::Watching => "watching",
+        LearningMode::Coursework => "coursework",
+        LearningMode::Practice => "practice",
+        LearningMode::Discussion => "discussion",
+    }
+}
+
 fn human_duration(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = seconds % 3600 / 60;
@@ -658,8 +690,8 @@ mod tests {
         local_clock, namespace_totals, render_daily_report,
     };
     use crate::block_artifact::{
-        ActivitySubject, AgenticCodingMedium, AgenticCodingRecord, BlockDocumentInput,
-        LearningDepth, LearningRecord, LearningSubject,
+        ActivitySubject, BlockDocumentInput, LearningDepth, LearningMode, LearningRecord,
+        LearningSubject, SoftwareDevelopmentMedium, SoftwareDevelopmentRecord,
     };
     use std::collections::{BTreeMap, HashSet};
 
@@ -673,7 +705,7 @@ mod tests {
             idle_seconds: 180,
             app_seconds: BTreeMap::from([("code.exe".to_string(), 600)]),
             timeline: vec!["12:00:00-12:10:00 (10m00s) code.exe — Ashe".to_string()],
-            title: Some("Software development: implemented learning records".to_string()),
+            title: Some("Implemented learning records".to_string()),
             report: Some("This prose must not drive the daily report.".to_string()),
             subjects,
             learning_subjects: Vec::new(),
@@ -687,15 +719,17 @@ mod tests {
         let blocks = vec![block(vec![ActivitySubject {
             namespaces: vec![
                 "software-development".to_string(),
-                "agentic-coding".to_string(),
-                "ashe-worker".to_string(),
+                "coding".to_string(),
+                "learning-records".to_string(),
             ],
             subject: "Implemented the change.".to_string(),
             estimated_duration_s: 300,
             unattended: true,
-            agentic_coding: Some(AgenticCodingRecord {
-                medium: AgenticCodingMedium::Tui,
-                tool: "codex".to_string(),
+            software_development: Some(SoftwareDevelopmentRecord {
+                project: Some("ashe-worker".to_string()),
+                agentic: true,
+                medium: Some(SoftwareDevelopmentMedium::Tui),
+                tool: Some("codex".to_string()),
                 model_id: Some("gpt-5.4".to_string()),
             }),
         }])];
@@ -703,11 +737,11 @@ mod tests {
         assert_eq!(stats.len(), 3);
         assert_eq!(stats["software-development"].estimated_duration_s, 300);
         assert_eq!(
-            stats["software-development / agentic-coding"].unattended_subjects,
+            stats["software-development / coding"].unattended_subjects,
             1
         );
         assert_eq!(
-            stats["software-development / agentic-coding / ashe-worker"].subjects,
+            stats["software-development / coding / learning-records"].subjects,
             1
         );
     }
@@ -745,18 +779,14 @@ mod tests {
             subject: "Looked up a Rust term.".to_string(),
             estimated_duration_s: 120,
             unattended: false,
-            agentic_coding: None,
+            software_development: None,
         }]);
         later.learning_subjects = vec![LearningSubject {
-            namespaces: vec![
-                "learning".to_string(),
-                "focused-explanation".to_string(),
-                "rust".to_string(),
-                "ownership".to_string(),
-            ],
+            tags: vec!["rust".to_string(), "ownership".to_string()],
             subject: "Reviewed how Rust ownership transfers values.".to_string(),
             estimated_duration_s: 90,
             learning: LearningRecord {
+                modes: vec![LearningMode::Reading],
                 search_queries: Vec::new(),
                 sources: Vec::new(),
                 depth: LearningDepth::FocusedExplanation,
@@ -798,11 +828,12 @@ mod tests {
         let report = render_daily_report(&source);
         assert!(report.contains("## Blocks"));
         assert!(
-            report.find("Earlier title").unwrap() < report.find("Software development").unwrap()
+            report.find("Earlier title").unwrap() < report.find("Implemented learning").unwrap()
         );
         assert!(report.contains("earlier timeline"));
         assert!(report.contains("`learning / lookup`"));
         assert!(report.contains("Reviewed how Rust ownership transfers values."));
+        assert!(report.contains("modes `reading`"));
         assert!(report.contains("depth `focused-explanation`"));
         assert!(report.contains("## Telemetry statistics"));
         assert!(report.contains("## Namespace statistics"));
