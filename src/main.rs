@@ -13,6 +13,7 @@ mod win32_service;
 
 use anyhow::Result;
 pub use ashe_worker::{archive, artifact_store, block_artifact, config, daily_report, logger};
+use std::process::ExitCode;
 use ui_app::UiApp;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -21,9 +22,23 @@ use windows::Win32::UI::HiDpi::{
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = env!("ASHE_BUILD_ID");
 
-fn main() -> Result<()> {
-    init_process_dpi_awareness();
+fn main() -> ExitCode {
     logger::init();
+    install_panic_logger();
+    match run() {
+        Ok(()) => {
+            logger::info("Ashe Worker runtime exited cleanly");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            logger::info(format!("Ashe Worker runtime failed: {error:#}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    init_process_dpi_awareness();
     init_rustls_crypto_provider();
     logger::info(format!("Build version={APP_VERSION} build_id={BUILD_ID}"));
     logger::info(format!("Log path: {}", logger::log_path().display()));
@@ -34,6 +49,14 @@ fn main() -> Result<()> {
         .window(overlay_view::window_settings())
         .run()
         .map_err(|err| anyhow::anyhow!("Iced runtime failed: {err:#}"))
+}
+
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        logger::info(format!("Unhandled panic: {panic}"));
+        previous(panic);
+    }));
 }
 
 fn app_title(_app: &UiApp) -> String {

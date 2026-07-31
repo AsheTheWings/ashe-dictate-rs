@@ -254,6 +254,10 @@ fn seal_day_locked(
             size,
         });
     }
+    logger::info(format!(
+        "Archive sealing started day={day_text} directory={}",
+        directory.display()
+    ));
     let bundle = pack_day(directory, day_text)?;
     let temporary = directory.join(format!("{ARCHIVE_FILENAME}.tmp"));
     if temporary.exists() {
@@ -377,6 +381,12 @@ async fn send_archive(
     day: &str,
     sha256: &str,
 ) -> Result<()> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("failed to inspect encrypted archive {}", path.display()))?
+        .len();
+    logger::info(format!(
+        "Archive upload started day={day} bytes={size} sha256={sha256}"
+    ));
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read encrypted archive {}", path.display()))?;
     let response = client

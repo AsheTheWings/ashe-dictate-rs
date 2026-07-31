@@ -79,6 +79,7 @@ pub struct UiApp {
 pub enum Message {
     Tick,
     WindowReady(Option<window::Id>),
+    WindowCloseRequested(window::Id),
     PolishCompleted(PolishResult),
     TextActionCompleted(PolishResult),
 }
@@ -126,7 +127,10 @@ impl UiApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(OVERLAY_TICK_MS)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(OVERLAY_TICK_MS)).map(|_| Message::Tick),
+            window::close_requests().map(Message::WindowCloseRequested),
+        ])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -136,6 +140,12 @@ impl UiApp {
                 self.window_id = id;
                 overlay_view::apply_native_styles();
                 self.apply_window_state()
+            }
+            Message::WindowCloseRequested(id) => {
+                logger::info(format!(
+                    "Ignored overlay close request id={id:?}; use the tray Quit action to exit"
+                ));
+                Task::none()
             }
             Message::Tick => self.pump(),
             Message::PolishCompleted(result) => self.finish_polishing(result),

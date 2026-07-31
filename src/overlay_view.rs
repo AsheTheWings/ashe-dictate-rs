@@ -48,6 +48,10 @@ pub fn window_settings() -> window::Settings {
         decorations: false,
         transparent: true,
         level: window::Level::AlwaysOnTop,
+        // The overlay is owned by the tray application. An unsolicited WM_CLOSE for this
+        // hidden helper window must not terminate the background worker; only the tray's
+        // explicit Quit action owns process shutdown.
+        exit_on_close_request: false,
         platform_specific: platform_specific_settings(),
         ..Default::default()
     }
@@ -229,4 +233,12 @@ pub fn apply_window_state<Message: 'static>(
         tasks.push(window::set_mode(id, window::Mode::Hidden));
     }
     Task::batch(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn overlay_close_request_does_not_exit_tray_application() {
+        assert!(!super::window_settings().exit_on_close_request);
+    }
 }
