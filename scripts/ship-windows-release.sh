@@ -11,7 +11,7 @@ read_env() {
   local source_file="$1"
   local wanted="$2"
   local destination="$3"
-  local line name value
+  local line name parsed_value
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -20,15 +20,15 @@ read_env() {
     name="${name#"${name%%[![:space:]]*}"}"
     name="${name%"${name##*[![:space:]]}"}"
     [[ "$name" == "$wanted" ]] || continue
-    value="${line#*=}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-      value="${value:1:${#value}-2}"
-    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-      value="${value:1:${#value}-2}"
+    parsed_value="${line#*=}"
+    parsed_value="${parsed_value#"${parsed_value%%[![:space:]]*}"}"
+    parsed_value="${parsed_value%"${parsed_value##*[![:space:]]}"}"
+    if [[ "$parsed_value" == \"*\" && "$parsed_value" == *\" ]]; then
+      parsed_value="${parsed_value:1:${#parsed_value}-2}"
+    elif [[ "$parsed_value" == \'*\' && "$parsed_value" == *\' ]]; then
+      parsed_value="${parsed_value:1:${#parsed_value}-2}"
     fi
-    printf -v "$destination" '%s' "$value"
+    printf -v "$destination" '%s' "$parsed_value"
     return 0
   done < "$source_file"
   return 1
