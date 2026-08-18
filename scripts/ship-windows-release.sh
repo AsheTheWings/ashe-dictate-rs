@@ -7,9 +7,10 @@ BINARY="ashe-worker.exe"
 CLI_BINARY="ashe-worker-cli.exe"
 ENV_FILE="$PROJECT_ROOT/.env.local"
 
-read_project_env() {
-  local wanted="$1"
-  local destination="$2"
+read_env() {
+  local source_file="$1"
+  local wanted="$2"
+  local destination="$3"
   local line name value
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -29,7 +30,7 @@ read_project_env() {
     fi
     printf -v "$destination" '%s' "$value"
     return 0
-  done < "$ENV_FILE"
+  done < "$source_file"
   return 1
 }
 
@@ -39,8 +40,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 RELEASE_DIR=""
 RECIPIENT_FILE=""
-read_project_env ASHE_RELEASE_DIR RELEASE_DIR || true
-read_project_env ASHE_ARCHIVE_RECIPIENT_FILE RECIPIENT_FILE || true
+read_env "$ENV_FILE" ASHE_RELEASE_DIR RELEASE_DIR || true
+read_env "$ENV_FILE" ASHE_ARCHIVE_RECIPIENT_FILE RECIPIENT_FILE || true
 if [[ -z "$RELEASE_DIR" ]]; then
   echo "ASHE_RELEASE_DIR is required in .env.local; release aborted" >&2
   exit 1
@@ -49,6 +50,20 @@ if [[ -z "$RECIPIENT_FILE" ]]; then
   echo "ASHE_ARCHIVE_RECIPIENT_FILE is required in .env.local; release aborted" >&2
   exit 1
 fi
+
+RUNTIME_ENV_FILE="$RELEASE_DIR/.env.local"
+if [[ ! -f "$RUNTIME_ENV_FILE" ]]; then
+  echo "$RUNTIME_ENV_FILE is required for Windows runtime configuration; release aborted" >&2
+  exit 1
+fi
+for name in ASHE_PASTE_UPLOAD_URL ASHE_PASTE_UPLOAD_TOKEN ASHE_PASTE_REMOTE_DIR; do
+  value=""
+  read_env "$RUNTIME_ENV_FILE" "$name" value || true
+  if [[ -z "$value" ]]; then
+    echo "$name is required in $RUNTIME_ENV_FILE; release aborted" >&2
+    exit 1
+  fi
+done
 
 if [[ -n "${CARGO:-}" ]]; then
   CARGO_BIN="$CARGO"

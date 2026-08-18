@@ -37,7 +37,7 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Win+Shift+H` | Start or stop dictation |
 | `Win+Shift+G` | Correct selected text |
 | `Win+Shift+Q` | Ask a question using selected text |
-| `Win+Shift+V` | Upload a clipboard image and paste its remote path |
+| `Ctrl+Alt+V` | Upload a clipboard image and paste its remote path |
 
 During dictation, use `Enter` to finish, `Esc` to cancel, `Backspace` to remove the latest
 sentence, or `Shift+Backspace` to clear the transcript.
@@ -79,6 +79,9 @@ described in [.env.example](.env.example):
 ```bash
 ./scripts/ship-windows-release.sh
 ```
+
+The helper validates the runtime `.env.local` already present in `ASHE_RELEASE_DIR`; it does not
+copy the project `.env.local` or secrets into the release directory.
 
 ## Troubleshooting
 

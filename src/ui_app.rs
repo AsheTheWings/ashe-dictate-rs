@@ -618,7 +618,7 @@ impl UiApp {
         self.send_win32(Win32Command::ShowMessageBox {
             title: "About Ashe Worker".to_string(),
             text: format!(
-                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nImage path: Win+Shift+V\r\nActivity tracking: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
+                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nImage path: Ctrl+Alt+V\r\nActivity tracking: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
                 APP_VERSION,
                 BUILD_ID,
                 self.activity.status().summary,

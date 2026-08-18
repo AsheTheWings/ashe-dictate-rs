@@ -19,8 +19,8 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_BACK, VK_ESCAPE,
-    VK_RETURN,
+    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
+    VK_BACK, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -509,13 +509,17 @@ unsafe fn register_hotkey(hwnd: HWND) {
             "Ashe Worker",
         );
     }
-    if let Err(err) = RegisterHotKey(
+    if let Err(error) = RegisterHotKey(
         Some(hwnd),
         PASTE_IMAGE_HOTKEY_ID,
-        MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+        MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
         'V' as u32,
     ) {
-        logger::info(format!("RegisterHotKey (paste image) failed: {err:#}"));
+        logger::info(format!(
+            "RegisterHotKey (paste image Ctrl+Alt+V) failed: {error:#}"
+        ));
+    } else {
+        logger::info("Clipboard image hotkey registered as Ctrl+Alt+V");
     }
 }
 
