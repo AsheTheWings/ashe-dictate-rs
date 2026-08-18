@@ -54,9 +54,8 @@ pub struct AppConfig {
     pub archive_recipient_json: String,
     pub archive_plaintext_days: u64,
     pub archive_scan_minutes: u64,
-    pub archive_upload_url: String,
+    pub worker_base_url: String,
     pub archive_upload_token: String,
-    pub paste_upload_url: String,
     pub paste_upload_token: String,
     pub paste_remote_dir: String,
 }
@@ -156,9 +155,8 @@ impl AppConfig {
                 DEFAULT_ARCHIVE_SCAN_MINUTES,
             )
             .max(1),
-            archive_upload_url: std::env::var("ASHE_ARCHIVE_UPLOAD_URL").unwrap_or_default(),
+            worker_base_url: std::env::var("ASHE_WORKER_BASE_URL").unwrap_or_default(),
             archive_upload_token: std::env::var("ASHE_ARCHIVE_UPLOAD_TOKEN").unwrap_or_default(),
-            paste_upload_url: std::env::var("ASHE_PASTE_UPLOAD_URL").unwrap_or_default(),
             paste_upload_token: std::env::var("ASHE_PASTE_UPLOAD_TOKEN").unwrap_or_default(),
             paste_remote_dir: std::env::var("ASHE_PASTE_REMOTE_DIR").unwrap_or_default(),
         }
@@ -204,9 +202,12 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn worker_endpoint(&self, route: &str) -> Result<String> {
+        worker_endpoint_url(&self.worker_base_url, route)
+    }
+
     pub fn validate_for_paste(&self) -> Result<()> {
-        let url = self.paste_upload_url.trim().trim_end_matches('/');
-        ensure_https_url("ASHE_PASTE_UPLOAD_URL", url)?;
+        self.worker_endpoint("/v1/pastes")?;
         if self.paste_upload_token.trim().is_empty() {
             return Err(anyhow!("ASHE_PASTE_UPLOAD_TOKEN is missing"));
         }
@@ -261,24 +262,38 @@ impl AppConfig {
             self.daily_report_grace_minutes,
             !self.archive_recipient_json.trim().is_empty(),
             self.archive_plaintext_days,
-            !self.archive_upload_url.trim().is_empty()
-                && !self.archive_upload_token.trim().is_empty(),
-            !self.paste_upload_url.trim().is_empty()
+            !self.worker_base_url.trim().is_empty() && !self.archive_upload_token.trim().is_empty(),
+            !self.worker_base_url.trim().is_empty()
                 && !self.paste_upload_token.trim().is_empty()
                 && !self.paste_remote_dir.trim().is_empty(),
         )
     }
 }
 
-fn ensure_https_url(name: &str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Err(anyhow!("{name} is missing"));
+fn worker_endpoint_url(base_url: &str, route: &str) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(anyhow!("ASHE_WORKER_BASE_URL is missing"));
     }
-    let parsed = reqwest::Url::parse(value).map_err(|_| anyhow!("{name} is not a valid URL"))?;
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| anyhow!("ASHE_WORKER_BASE_URL is not a valid URL"))?;
     if parsed.scheme() != "https" {
-        return Err(anyhow!("{name} must use HTTPS"));
+        return Err(anyhow!("ASHE_WORKER_BASE_URL must use HTTPS"));
     }
-    Ok(())
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err(anyhow!(
+            "ASHE_WORKER_BASE_URL must contain only an HTTPS origin"
+        ));
+    }
+    if !route.starts_with('/') {
+        return Err(anyhow!("worker endpoint route must start with '/'"));
+    }
+    Ok(format!("{base_url}{route}"))
 }
 
 fn safe_path_part(part: &str) -> bool {
@@ -381,11 +396,23 @@ fn default_artifacts_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_ACTIVITY_CAPTURE_INTERVAL, DEFAULT_ACTIVITY_MAX_FRAME_GAP_S};
+    use super::{
+        DEFAULT_ACTIVITY_CAPTURE_INTERVAL, DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, worker_endpoint_url,
+    };
 
     #[test]
     fn unified_activity_evidence_defaults_to_ten_second_capture() {
         assert_eq!(DEFAULT_ACTIVITY_CAPTURE_INTERVAL, 10);
         assert_eq!(DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, 30);
+    }
+
+    #[test]
+    fn worker_endpoints_derive_from_one_https_origin() {
+        assert_eq!(
+            worker_endpoint_url("https://worker.example.test/", "/v1/pastes").unwrap(),
+            "https://worker.example.test/v1/pastes"
+        );
+        assert!(worker_endpoint_url("http://worker.example.test", "/v1/pastes").is_err());
+        assert!(worker_endpoint_url("https://worker.example.test/api", "/v1/pastes").is_err());
     }
 }

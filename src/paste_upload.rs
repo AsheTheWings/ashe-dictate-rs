@@ -37,11 +37,7 @@ impl PasteUploader {
         let sha256 = format!("{:x}", Sha256::digest(&png));
         let captured_at = captured_at.to_rfc3339_opts(SecondsFormat::Millis, true);
         let filename = canonical_filename(&captured_at, &sha256)?;
-        let endpoint = format!(
-            "{}/{}",
-            config.paste_upload_url.trim().trim_end_matches('/'),
-            sha256
-        );
+        let endpoint = format!("{}/{}", config.worker_endpoint("/v1/pastes")?, sha256);
         let response = self
             .client
             .put(endpoint)

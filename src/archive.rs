@@ -292,8 +292,7 @@ fn log_seal_outcome(day: &str, outcome: &SealDayOutcome) {
 }
 
 fn upload_archives(config: &AppConfig) -> Result<()> {
-    if config.archive_upload_url.trim().is_empty() || config.archive_upload_token.trim().is_empty()
-    {
+    if config.worker_base_url.trim().is_empty() || config.archive_upload_token.trim().is_empty() {
         return Ok(());
     }
     let (upload_url, upload_token) = receiver_config(config)?;
@@ -336,25 +335,11 @@ fn upload_archives(config: &AppConfig) -> Result<()> {
 }
 
 fn receiver_config(config: &AppConfig) -> Result<(String, String)> {
-    let upload_url = config
-        .archive_upload_url
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
+    let upload_url = config.worker_endpoint("/v1/archives")?;
     let upload_token = config.archive_upload_token.trim().to_string();
-    ensure!(
-        !upload_url.is_empty(),
-        "ASHE_ARCHIVE_UPLOAD_URL is required"
-    );
     ensure!(
         !upload_token.is_empty(),
         "ASHE_ARCHIVE_UPLOAD_TOKEN is required"
-    );
-    let parsed_upload_url =
-        reqwest::Url::parse(&upload_url).context("ASHE_ARCHIVE_UPLOAD_URL is not a valid URL")?;
-    ensure!(
-        parsed_upload_url.scheme() == "https",
-        "ASHE_ARCHIVE_UPLOAD_URL must use HTTPS"
     );
     Ok((upload_url, upload_token))
 }
