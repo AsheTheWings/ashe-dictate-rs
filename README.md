@@ -16,6 +16,7 @@ and older records can be placed in encrypted archives for retention or backup.
 - Keep a rolling summary and chronological journal.
 - Exclude configured applications from activity capture.
 - Encrypt older records and optionally upload the encrypted archives.
+- Upload a clipboard image and paste its remote path into the active application.
 
 ## Getting started
 
@@ -36,6 +37,7 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Win+Shift+H` | Start or stop dictation |
 | `Win+Shift+G` | Correct selected text |
 | `Win+Shift+Q` | Ask a question using selected text |
+| `Win+Shift+V` | Upload a clipboard image and paste its remote path |
 
 During dictation, use `Enter` to finish, `Esc` to cancel, `Backspace` to remove the latest
 sentence, or `Shift+Backspace` to clear the transcript.

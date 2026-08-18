@@ -56,6 +56,9 @@ pub struct AppConfig {
     pub archive_scan_minutes: u64,
     pub archive_upload_url: String,
     pub archive_upload_token: String,
+    pub paste_upload_url: String,
+    pub paste_upload_token: String,
+    pub paste_remote_dir: String,
 }
 
 impl AppConfig {
@@ -155,6 +158,9 @@ impl AppConfig {
             .max(1),
             archive_upload_url: std::env::var("ASHE_ARCHIVE_UPLOAD_URL").unwrap_or_default(),
             archive_upload_token: std::env::var("ASHE_ARCHIVE_UPLOAD_TOKEN").unwrap_or_default(),
+            paste_upload_url: std::env::var("ASHE_PASTE_UPLOAD_URL").unwrap_or_default(),
+            paste_upload_token: std::env::var("ASHE_PASTE_UPLOAD_TOKEN").unwrap_or_default(),
+            paste_remote_dir: std::env::var("ASHE_PASTE_REMOTE_DIR").unwrap_or_default(),
         }
     }
 
@@ -198,6 +204,29 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn validate_for_paste(&self) -> Result<()> {
+        let url = self.paste_upload_url.trim().trim_end_matches('/');
+        ensure_https_url("ASHE_PASTE_UPLOAD_URL", url)?;
+        if self.paste_upload_token.trim().is_empty() {
+            return Err(anyhow!("ASHE_PASTE_UPLOAD_TOKEN is missing"));
+        }
+        let directory = self.paste_remote_dir.trim().trim_end_matches('/');
+        if directory.len() < 2 || !directory.starts_with('/') {
+            return Err(anyhow!(
+                "ASHE_PASTE_REMOTE_DIR must be an absolute non-root path"
+            ));
+        }
+        if directory
+            .split('/')
+            .any(|part| matches!(part, "." | "..") || !safe_path_part(part))
+        {
+            return Err(anyhow!(
+                "ASHE_PASTE_REMOTE_DIR contains unsafe path characters"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn deepgram_query_params(&self) -> Vec<(String, String)> {
         let mut pairs = vec![
             ("model".to_string(), self.deepgram_model.clone()),
@@ -213,7 +242,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
@@ -234,8 +263,29 @@ impl AppConfig {
             self.archive_plaintext_days,
             !self.archive_upload_url.trim().is_empty()
                 && !self.archive_upload_token.trim().is_empty(),
+            !self.paste_upload_url.trim().is_empty()
+                && !self.paste_upload_token.trim().is_empty()
+                && !self.paste_remote_dir.trim().is_empty(),
         )
     }
+}
+
+fn ensure_https_url(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(anyhow!("{name} is missing"));
+    }
+    let parsed = reqwest::Url::parse(value).map_err(|_| anyhow!("{name} is not a valid URL"))?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow!("{name} must use HTTPS"));
+    }
+    Ok(())
+}
+
+fn safe_path_part(part: &str) -> bool {
+    part.is_empty()
+        || part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn read_output_sample_rate() -> u32 {

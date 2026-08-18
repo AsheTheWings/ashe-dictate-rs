@@ -6,6 +6,7 @@ use crate::injector;
 use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
+use crate::paste_upload::PasteUploader;
 use crate::win32_service::{self, Win32Command, Win32Event};
 use crossbeam_channel::{Receiver, Sender};
 use iced::{Element, Point, Subscription, Task, window};
@@ -73,6 +74,8 @@ pub struct UiApp {
     error: Option<String>,
     activity: ActivityHandle,
     last_activity_status: String,
+    paste_in_flight: bool,
+    paste_uploader: PasteUploader,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +85,10 @@ pub enum Message {
     WindowCloseRequested(window::Id),
     PolishCompleted(PolishResult),
     TextActionCompleted(PolishResult),
+    PasteImageUploaded {
+        target_hwnd: isize,
+        result: PolishResult,
+    },
 }
 
 impl UiApp {
@@ -119,6 +126,8 @@ impl UiApp {
             error: None,
             activity,
             last_activity_status: String::new(),
+            paste_in_flight: false,
+            paste_uploader: PasteUploader::default(),
         };
         app.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Idle - Win+Shift+H".to_string(),
@@ -150,6 +159,10 @@ impl UiApp {
             Message::Tick => self.pump(),
             Message::PolishCompleted(result) => self.finish_polishing(result),
             Message::TextActionCompleted(result) => self.finish_text_action(result),
+            Message::PasteImageUploaded {
+                target_hwnd,
+                result,
+            } => self.finish_image_upload(target_hwnd, result),
         }
     }
 
@@ -222,6 +235,7 @@ impl UiApp {
                 target_hwnd,
                 Point::new(x as f32, y as f32),
             ),
+            Win32Event::PasteImageRequested { target_hwnd } => self.begin_image_paste(target_hwnd),
             Win32Event::PositionChanged { x, y } => {
                 self.target_position = Some(Point::new(x as f32, y as f32));
                 Task::none()
@@ -267,6 +281,14 @@ impl UiApp {
             }
             Win32Event::QuitRequested => self.quit(),
             Win32Event::PasteCompleted(result) => self.finish_insert(result),
+            Win32Event::PathPasteCompleted(result) => {
+                self.paste_in_flight = false;
+                match result {
+                    Ok(()) => logger::info("Remote clipboard image path pasted"),
+                    Err(error) => logger::info(format!("Remote image path paste failed: {error}")),
+                }
+                Task::none()
+            }
             Win32Event::ServiceStopped => {
                 logger::info("Win32 service stopped event received");
                 Task::none()
@@ -596,7 +618,7 @@ impl UiApp {
         self.send_win32(Win32Command::ShowMessageBox {
             title: "About Ashe Worker".to_string(),
             text: format!(
-                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nActivity tracking: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
+                "Ashe Worker\r\nVersion: {}\r\nBuild: {}\r\n\r\nDictate: Win+Shift+H\r\nGrammar: Win+Shift+G\r\nQuestion: Win+Shift+Q\r\nImage path: Win+Shift+V\r\nActivity tracking: {}\r\nArtifacts: {}\r\nConfig: {}\r\nLog: {}",
                 APP_VERSION,
                 BUILD_ID,
                 self.activity.status().summary,
@@ -605,6 +627,63 @@ impl UiApp {
                 logger::log_path().display()
             ),
         });
+    }
+
+    fn begin_image_paste(&mut self, target_hwnd: isize) -> Task<Message> {
+        if self.state != DictationState::Idle || self.paste_in_flight {
+            logger::info("Clipboard image paste ignored while another action is active");
+            return Task::none();
+        }
+        if target_hwnd == 0 {
+            logger::info("Clipboard image paste ignored without a foreground target");
+            return Task::none();
+        }
+        if let Err(error) = self.config.validate_for_paste() {
+            logger::info(format!(
+                "Clipboard image paste configuration invalid: {error:#}"
+            ));
+            return Task::none();
+        }
+        let png = match injector::capture_clipboard_png() {
+            Ok(png) => png,
+            Err(error) => {
+                logger::info(format!("Clipboard image capture failed: {error:#}"));
+                return Task::none();
+            }
+        };
+        logger::info(format!("Clipboard image captured bytes={}", png.len()));
+        self.paste_in_flight = true;
+        let uploader = self.paste_uploader.clone();
+        let config = self.config.clone();
+        Task::perform(
+            async move {
+                uploader
+                    .upload_png(config, png, chrono::Utc::now())
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::PasteImageUploaded {
+                target_hwnd,
+                result,
+            },
+        )
+    }
+
+    fn finish_image_upload(&mut self, target_hwnd: isize, result: PolishResult) -> Task<Message> {
+        match result {
+            Ok(path) => {
+                logger::info(format!("Clipboard image uploaded path={path}"));
+                self.send_win32(Win32Command::PastePath {
+                    target_hwnd,
+                    text: path,
+                });
+            }
+            Err(error) => {
+                self.paste_in_flight = false;
+                logger::info(format!("Clipboard image upload failed: {error}"));
+            }
+        }
+        Task::none()
     }
 
     fn begin_text_action(

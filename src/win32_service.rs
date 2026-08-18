@@ -35,6 +35,7 @@ const CLEAR_TRANSCRIPT_HOTKEY_ID: i32 = 1004;
 const SUBMIT_HOTKEY_ID: i32 = 1005;
 const FIX_GRAMMAR_HOTKEY_ID: i32 = 1006;
 const ANSWER_QUESTION_HOTKEY_ID: i32 = 1007;
+const PASTE_IMAGE_HOTKEY_ID: i32 = 1008;
 const TIMER_SERVICE: usize = 2001;
 const TIMER_INTERVAL_MS: u32 = 16;
 const CURSOR_OVERLAY_GAP: i32 = 8;
@@ -61,6 +62,7 @@ pub enum Win32Event {
     SubmitRequested,
     FixGrammarRequested { target_hwnd: isize, x: i32, y: i32 },
     AnswerQuestionRequested { target_hwnd: isize, x: i32, y: i32 },
+    PasteImageRequested { target_hwnd: isize },
     PositionChanged { x: i32, y: i32 },
     ReloadConfigRequested,
     OpenLogRequested,
@@ -71,6 +73,7 @@ pub enum Win32Event {
     AboutRequested,
     QuitRequested,
     PasteCompleted(Result<(), String>),
+    PathPasteCompleted(Result<(), String>),
     ServiceStopped,
 }
 
@@ -91,6 +94,10 @@ pub enum Win32Command {
     OpenPath(String),
     CopyText(String),
     PasteText {
+        target_hwnd: isize,
+        text: String,
+    },
+    PastePath {
         target_hwnd: isize,
         text: String,
     },
@@ -267,6 +274,15 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
+            PASTE_IMAGE_HOTKEY_ID => {
+                logger::info("Paste image hotkey pressed");
+                if let Some(state) = state {
+                    let _ = state.event_tx.send(Win32Event::PasteImageRequested {
+                        target_hwnd: target_window(hwnd),
+                    });
+                }
+                return LRESULT(0);
+            }
             _ => {}
         },
         WM_TIMER => {
@@ -362,6 +378,7 @@ unsafe extern "system" fn window_proc(
             let _ = UnregisterHotKey(Some(hwnd), SUBMIT_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), FIX_GRAMMAR_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), ANSWER_QUESTION_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(hwnd), PASTE_IMAGE_HOTKEY_ID);
             if !state_ptr.is_null() {
                 let _ = Box::from_raw(state_ptr);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -429,6 +446,11 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 let result = injector::paste_text_to(hwnd, &text).map_err(|err| format!("{err:#}"));
                 let _ = state.event_tx.send(Win32Event::PasteCompleted(result));
             }
+            Win32Command::PastePath { target_hwnd, text } => {
+                let hwnd = HWND(target_hwnd as *mut c_void);
+                let result = injector::paste_text_to(hwnd, &text).map_err(|err| format!("{err:#}"));
+                let _ = state.event_tx.send(Win32Event::PathPasteCompleted(result));
+            }
             Win32Command::InjectText {
                 target_hwnd,
                 text,
@@ -486,6 +508,14 @@ unsafe fn register_hotkey(hwnd: HWND) {
             "Win+Shift+Q could not be registered. Another app may already be using it.",
             "Ashe Worker",
         );
+    }
+    if let Err(err) = RegisterHotKey(
+        Some(hwnd),
+        PASTE_IMAGE_HOTKEY_ID,
+        MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+        'V' as u32,
+    ) {
+        logger::info(format!("RegisterHotKey (paste image) failed: {err:#}"));
     }
 }
 

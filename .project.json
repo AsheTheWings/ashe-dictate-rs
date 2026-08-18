@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "project": "ashe-worker",
+  "repository": "AsheTheWings/ashe-worker",
+  "primaryBranch": "dev",
+  "primaryCheckout": "ashe-worker",
+  "changeDelivery": {
+    "mode": "direct"
+  }
+}

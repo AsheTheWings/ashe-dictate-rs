@@ -6,6 +6,7 @@ mod deepgram_client;
 mod injector;
 mod llm_client;
 mod overlay_view;
+mod paste_upload;
 mod screen_capture;
 mod ui_app;
 mod util;
