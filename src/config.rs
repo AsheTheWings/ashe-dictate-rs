@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_TERA_API_BASE: &str = "https://tera.asheservices.online/v1";
-const DEFAULT_TERA_MODEL: &str = "cloudcode/chat-gemini-3-flash-paid-tier";
+const DEFAULT_TERA_MODEL: &str = "gemini-latest-paid";
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
 const DEFAULT_ACTIVITY_CAPTURE_INTERVAL: u64 = 10;
 const DEFAULT_ACTIVITY_MAX_FRAME_GAP_S: u64 = 30;
