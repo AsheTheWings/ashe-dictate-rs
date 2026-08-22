@@ -30,11 +30,10 @@ pub struct AppConfig {
     pub output_sample_rate: u32,
     pub tera_api_key: String,
     pub tera_api_base: String,
-    pub polish_model: String,
+    pub dictation_polish_model: String,
     pub grammar_model: String,
     pub question_model: String,
-    pub activity_model: String,
-    pub summary_model: String,
+    pub journal_model: String,
     pub llm_temperature: f32,
     pub llm_reasoning_effort: Option<String>,
     pub activity_enabled: bool,
@@ -96,11 +95,10 @@ impl AppConfig {
             tera_api_base: std::env::var("TERA_API_BASE")
                 .or_else(|_| std::env::var("ASHE_BASE_URL"))
                 .unwrap_or_else(|_| DEFAULT_TERA_API_BASE.to_string()),
-            polish_model: read_llm_model("TERA_POLISH_MODEL"),
+            dictation_polish_model: read_llm_model("TERA_DICTATION_POLISH_MODEL"),
             grammar_model: read_llm_model("TERA_GRAMMAR_MODEL"),
             question_model: read_llm_model("TERA_QUESTION_MODEL"),
-            activity_model: read_llm_model("TERA_ACTIVITY_MODEL"),
-            summary_model: read_llm_model("TERA_SUMMARY_MODEL"),
+            journal_model: read_llm_model("TERA_JOURNAL_MODEL"),
             llm_temperature: read_f32("ASHE_LLM_TEMPERATURE", DEFAULT_LLM_TEMPERATURE),
             llm_reasoning_effort: std::env::var("ASHE_LLM_REASONING_EFFORT")
                 .ok()
@@ -183,7 +181,7 @@ impl AppConfig {
                 "ASHE_OUTPUT_SAMPLE_RATE must be between 8000 and 192000"
             ));
         }
-        self.validate_llm_model(&self.polish_model, "TERA_POLISH_MODEL")
+        self.validate_llm_model(&self.dictation_polish_model, "TERA_DICTATION_POLISH_MODEL")
     }
 
     pub fn validate_for_grammar(&self) -> Result<()> {
@@ -194,12 +192,8 @@ impl AppConfig {
         self.validate_llm_model(&self.question_model, "TERA_QUESTION_MODEL")
     }
 
-    pub fn validate_for_activity(&self) -> Result<()> {
-        self.validate_llm_model(&self.activity_model, "TERA_ACTIVITY_MODEL")
-    }
-
-    pub fn validate_for_summary(&self) -> Result<()> {
-        self.validate_llm_model(&self.summary_model, "TERA_SUMMARY_MODEL")
+    pub fn validate_for_journal(&self) -> Result<()> {
+        self.validate_llm_model(&self.journal_model, "TERA_JOURNAL_MODEL")
     }
 
     fn validate_llm_model(&self, model: &str, name: &str) -> Result<()> {
@@ -256,17 +250,16 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} polish_model={} grammar_model={} question_model={} activity_model={} summary_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} dictation_polish_model={} grammar_model={} question_model={} journal_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
             self.output_sample_rate,
             !self.deepgram_api_key.trim().is_empty(),
-            self.polish_model,
+            self.dictation_polish_model,
             self.grammar_model,
             self.question_model,
-            self.activity_model,
-            self.summary_model,
+            self.journal_model,
             !self.tera_api_key.trim().is_empty(),
             self.llm_reasoning_effort.is_some(),
             self.activity_enabled,

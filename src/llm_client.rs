@@ -24,7 +24,7 @@ pub async fn polish_transcript(
 
     request_response(
         &config,
-        &config.polish_model,
+        &config.dictation_polish_model,
         polish_prompt(transcript, context.as_deref()),
         config.llm_temperature,
     )
@@ -45,7 +45,7 @@ pub async fn describe_activity_block(
     frames: Vec<(String, Vec<u8>)>,
     duration_budget_s: u64,
 ) -> Result<ActivityNarrative> {
-    config.validate_for_activity()?;
+    config.validate_for_journal()?;
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let mut content = vec![json!({ "type": "input_text", "text": context })];
     for (label, bytes) in frames {
@@ -60,7 +60,7 @@ pub async fn describe_activity_block(
     }
     let instructions = activity_instructions(duration_budget_s);
     let mut body = json!({
-        "model": config.activity_model,
+        "model": config.journal_model,
         "instructions": instructions,
         "input": [{ "role": "user", "content": content }]
     });
@@ -108,12 +108,12 @@ pub async fn refresh_activity_summary(
     source: Value,
     max_chars: usize,
 ) -> Result<String> {
-    config.validate_for_summary()?;
+    config.validate_for_journal()?;
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let input = serde_json::to_string_pretty(&source)
         .context("failed to serialize rolling-summary source")?;
     let mut body = json!({
-        "model": config.summary_model,
+        "model": config.journal_model,
         "instructions": format!("{SUMMARY_PROMPT}\n\nThe complete result must contain at most {max_chars} Unicode characters."),
         "input": [{
             "role": "user",

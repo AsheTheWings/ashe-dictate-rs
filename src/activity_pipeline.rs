@@ -899,7 +899,7 @@ fn write_report(
         frames_captured: block.captured,
         frames_sent,
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
-        model: Some(config.activity_model.clone()),
+        model: Some(config.journal_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
@@ -1467,7 +1467,7 @@ mod tests {
         let root = tempfile_directory("unified-learning");
         let mut config = AppConfig::load();
         config.activity_artifacts_dir = root.clone();
-        config.activity_model = "test-model".to_string();
+        config.journal_model = "test-model".to_string();
         let block = Block::new(0, 600);
         let narrative = ActivityNarrative {
             title: "Reviewed Rust ownership".to_string(),
