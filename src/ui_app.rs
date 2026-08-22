@@ -696,7 +696,11 @@ impl UiApp {
             logger::info("Text action ignored; not idle");
             return Task::none();
         }
-        if let Err(err) = self.config.validate_for_llm() {
+        let validation = match kind {
+            TextActionKind::FixGrammar => self.config.validate_for_grammar(),
+            TextActionKind::AnswerQuestion => self.config.validate_for_question(),
+        };
+        if let Err(err) = validation {
             logger::info(format!("LLM config validation failed: {err:#}"));
             self.send_win32(Win32Command::ShowMessageBox {
                 title: "Ashe Worker".to_string(),

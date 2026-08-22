@@ -24,7 +24,7 @@ and older records can be placed in encrypted archives for retention or backup.
    configuration and artifacts.
 2. Copy [.env.example](.env.example) to `.env` beside the executable or at the project root.
 3. Add the credentials for the features you want to use and review the optional paths, privacy
-   exclusions, reporting, and archive settings.
+   exclusions, per-feature LLM models, reporting, and archive settings.
 4. Launch `ashe-worker.exe`.
 
 The app starts in the Windows system tray. Left-click the tray icon to open the artifact

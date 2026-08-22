@@ -899,7 +899,7 @@ fn write_report(
         frames_captured: block.captured,
         frames_sent,
         keyframe: (!keyframe_relative.is_empty()).then_some(keyframe_relative),
-        model: Some(config.tera_model.clone()),
+        model: Some(config.activity_model.clone()),
         title: Some(narrative.title.clone()),
         report: Some(narrative.report.clone()),
         subjects: narrative.subjects.clone(),
@@ -1467,7 +1467,7 @@ mod tests {
         let root = tempfile_directory("unified-learning");
         let mut config = AppConfig::load();
         config.activity_artifacts_dir = root.clone();
-        config.tera_model = "test-model".to_string();
+        config.activity_model = "test-model".to_string();
         let block = Block::new(0, 600);
         let narrative = ActivityNarrative {
             title: "Reviewed Rust ownership".to_string(),
@@ -1506,6 +1506,7 @@ mod tests {
         assert_eq!(artifact.subjects, narrative.subjects);
         assert_eq!(artifact.learning_subjects, narrative.learning_subjects);
         assert_eq!(artifact.frames_sent, 4);
+        assert_eq!(artifact.model.as_deref(), Some("test-model"));
         assert!(!root.join("1970-01-01").join("learning").exists());
         assert_eq!(
             super::load_successful_reports(&root, i64::MAX)

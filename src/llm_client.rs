@@ -20,9 +20,11 @@ pub async fn polish_transcript(
     if transcript.is_empty() {
         return Ok(String::new());
     }
+    config.validate_for_dictation()?;
 
     request_response(
         &config,
+        &config.polish_model,
         polish_prompt(transcript, context.as_deref()),
         config.llm_temperature,
     )
@@ -43,6 +45,7 @@ pub async fn describe_activity_block(
     frames: Vec<(String, Vec<u8>)>,
     duration_budget_s: u64,
 ) -> Result<ActivityNarrative> {
+    config.validate_for_activity()?;
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let mut content = vec![json!({ "type": "input_text", "text": context })];
     for (label, bytes) in frames {
@@ -57,7 +60,7 @@ pub async fn describe_activity_block(
     }
     let instructions = activity_instructions(duration_budget_s);
     let mut body = json!({
-        "model": config.tera_model,
+        "model": config.activity_model,
         "instructions": instructions,
         "input": [{ "role": "user", "content": content }]
     });
@@ -105,11 +108,12 @@ pub async fn refresh_activity_summary(
     source: Value,
     max_chars: usize,
 ) -> Result<String> {
+    config.validate_for_summary()?;
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let input = serde_json::to_string_pretty(&source)
         .context("failed to serialize rolling-summary source")?;
     let mut body = json!({
-        "model": config.tera_model,
+        "model": config.summary_model,
         "instructions": format!("{SUMMARY_PROMPT}\n\nThe complete result must contain at most {max_chars} Unicode characters."),
         "input": [{
             "role": "user",
@@ -173,8 +177,15 @@ pub async fn fix_grammar(config: AppConfig, text: String) -> Result<String> {
     if text.is_empty() {
         return Ok(String::new());
     }
+    config.validate_for_grammar()?;
     let message = format!("{GRAMMAR_PROMPT}\n\n{}", tagged("text", text));
-    request_response(&config, message, config.llm_temperature).await
+    request_response(
+        &config,
+        &config.grammar_model,
+        message,
+        config.llm_temperature,
+    )
+    .await
 }
 
 /// Answer the selected text as a general question and return only the answer.
@@ -185,8 +196,15 @@ pub async fn answer_question(config: AppConfig, question: String) -> Result<Stri
     if question.is_empty() {
         return Ok(String::new());
     }
+    config.validate_for_question()?;
     let message = format!("{QUESTION_PROMPT}\n\n{}", tagged("question", question));
-    request_response(&config, message, QUESTION_TEMPERATURE).await
+    request_response(
+        &config,
+        &config.question_model,
+        message,
+        QUESTION_TEMPERATURE,
+    )
+    .await
 }
 
 /// Shared Open Responses (`/v1/responses`) call: sends a single `role: "user"` message
@@ -194,12 +212,13 @@ pub async fn answer_question(config: AppConfig, question: String) -> Result<Stri
 /// The optional reasoning effort is forwarded when configured.
 async fn request_response(
     config: &AppConfig,
+    model: &str,
     user_content: String,
     temperature: f32,
 ) -> Result<String> {
     let endpoint = format!("{}/responses", config.tera_api_base.trim_end_matches('/'));
     let mut body = json!({
-        "model": config.tera_model,
+        "model": model,
         "input": [
             {
                 "type": "message",

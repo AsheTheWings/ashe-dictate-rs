@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_TERA_API_BASE: &str = "https://tera.asheservices.online/v1";
-const DEFAULT_TERA_MODEL: &str = "gemini-latest-paid";
+const DEFAULT_LLM_MODEL: &str = "gemini-latest";
 const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
 const DEFAULT_ACTIVITY_CAPTURE_INTERVAL: u64 = 10;
 const DEFAULT_ACTIVITY_MAX_FRAME_GAP_S: u64 = 30;
@@ -30,7 +30,11 @@ pub struct AppConfig {
     pub output_sample_rate: u32,
     pub tera_api_key: String,
     pub tera_api_base: String,
-    pub tera_model: String,
+    pub polish_model: String,
+    pub grammar_model: String,
+    pub question_model: String,
+    pub activity_model: String,
+    pub summary_model: String,
     pub llm_temperature: f32,
     pub llm_reasoning_effort: Option<String>,
     pub activity_enabled: bool,
@@ -92,9 +96,11 @@ impl AppConfig {
             tera_api_base: std::env::var("TERA_API_BASE")
                 .or_else(|_| std::env::var("ASHE_BASE_URL"))
                 .unwrap_or_else(|_| DEFAULT_TERA_API_BASE.to_string()),
-            tera_model: std::env::var("TERA_MODEL")
-                .or_else(|_| std::env::var("ASHE_MODEL"))
-                .unwrap_or_else(|_| DEFAULT_TERA_MODEL.to_string()),
+            polish_model: read_llm_model("TERA_POLISH_MODEL"),
+            grammar_model: read_llm_model("TERA_GRAMMAR_MODEL"),
+            question_model: read_llm_model("TERA_QUESTION_MODEL"),
+            activity_model: read_llm_model("TERA_ACTIVITY_MODEL"),
+            summary_model: read_llm_model("TERA_SUMMARY_MODEL"),
             llm_temperature: read_f32("ASHE_LLM_TEMPERATURE", DEFAULT_LLM_TEMPERATURE),
             llm_reasoning_effort: std::env::var("ASHE_LLM_REASONING_EFFORT")
                 .ok()
@@ -177,27 +183,34 @@ impl AppConfig {
                 "ASHE_OUTPUT_SAMPLE_RATE must be between 8000 and 192000"
             ));
         }
-        if self.tera_api_key.trim().is_empty() {
-            return Err(anyhow!("TERA_API_KEY is missing"));
-        }
-        if self.tera_api_base.trim().is_empty() {
-            return Err(anyhow!("TERA_API_BASE is empty"));
-        }
-        if self.tera_model.trim().is_empty() {
-            return Err(anyhow!("TERA_MODEL is empty"));
-        }
-        Ok(())
+        self.validate_llm_model(&self.polish_model, "TERA_POLISH_MODEL")
     }
 
-    pub fn validate_for_llm(&self) -> Result<()> {
+    pub fn validate_for_grammar(&self) -> Result<()> {
+        self.validate_llm_model(&self.grammar_model, "TERA_GRAMMAR_MODEL")
+    }
+
+    pub fn validate_for_question(&self) -> Result<()> {
+        self.validate_llm_model(&self.question_model, "TERA_QUESTION_MODEL")
+    }
+
+    pub fn validate_for_activity(&self) -> Result<()> {
+        self.validate_llm_model(&self.activity_model, "TERA_ACTIVITY_MODEL")
+    }
+
+    pub fn validate_for_summary(&self) -> Result<()> {
+        self.validate_llm_model(&self.summary_model, "TERA_SUMMARY_MODEL")
+    }
+
+    fn validate_llm_model(&self, model: &str, name: &str) -> Result<()> {
         if self.tera_api_key.trim().is_empty() {
             return Err(anyhow!("TERA_API_KEY is missing"));
         }
         if self.tera_api_base.trim().is_empty() {
             return Err(anyhow!("TERA_API_BASE is empty"));
         }
-        if self.tera_model.trim().is_empty() {
-            return Err(anyhow!("TERA_MODEL is empty"));
+        if model.trim().is_empty() {
+            return Err(anyhow!("{name} is empty"));
         }
         Ok(())
     }
@@ -243,13 +256,17 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} tera_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
+            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} polish_model={} grammar_model={} question_model={} activity_model={} summary_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
             self.deepgram_model,
             self.deepgram_language,
             self.deepgram_keyterms.len(),
             self.output_sample_rate,
             !self.deepgram_api_key.trim().is_empty(),
-            self.tera_model,
+            self.polish_model,
+            self.grammar_model,
+            self.question_model,
+            self.activity_model,
+            self.summary_model,
             !self.tera_api_key.trim().is_empty(),
             self.llm_reasoning_effort.is_some(),
             self.activity_enabled,
@@ -268,6 +285,25 @@ impl AppConfig {
                 && !self.paste_remote_dir.trim().is_empty(),
         )
     }
+}
+
+fn read_llm_model(name: &str) -> String {
+    resolve_llm_model(
+        std::env::var(name).ok(),
+        std::env::var("TERA_MODEL").ok(),
+        std::env::var("ASHE_MODEL").ok(),
+    )
+}
+
+fn resolve_llm_model(
+    feature_model: Option<String>,
+    tera_model: Option<String>,
+    ashe_model: Option<String>,
+) -> String {
+    feature_model
+        .or(tera_model)
+        .or(ashe_model)
+        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string())
 }
 
 fn worker_endpoint_url(base_url: &str, route: &str) -> Result<String> {
@@ -397,13 +433,50 @@ fn default_artifacts_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ACTIVITY_CAPTURE_INTERVAL, DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, worker_endpoint_url,
+        DEFAULT_ACTIVITY_CAPTURE_INTERVAL, DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, DEFAULT_LLM_MODEL,
+        resolve_llm_model, worker_endpoint_url,
     };
 
     #[test]
     fn unified_activity_evidence_defaults_to_ten_second_capture() {
         assert_eq!(DEFAULT_ACTIVITY_CAPTURE_INTERVAL, 10);
         assert_eq!(DEFAULT_ACTIVITY_MAX_FRAME_GAP_S, 30);
+    }
+
+    #[test]
+    fn llm_features_prefer_their_model_and_default_to_gemini_latest() {
+        assert_eq!(
+            resolve_llm_model(None, None, None),
+            DEFAULT_LLM_MODEL.to_string()
+        );
+        assert_eq!(DEFAULT_LLM_MODEL, "gemini-latest");
+        assert_eq!(
+            resolve_llm_model(
+                Some("feature-model".to_string()),
+                Some("shared-model".to_string()),
+                None,
+            ),
+            "feature-model"
+        );
+        assert_eq!(
+            resolve_llm_model(None, Some("shared-model".to_string()), None),
+            "shared-model"
+        );
+    }
+
+    #[test]
+    fn llm_feature_validation_is_independent() {
+        let mut config = super::AppConfig::load();
+        config.tera_api_key = "test-key".to_string();
+        config.tera_api_base = "https://example.test/v1".to_string();
+        config.grammar_model = "grammar-model".to_string();
+        config.question_model = String::new();
+
+        assert!(config.validate_for_grammar().is_ok());
+        assert_eq!(
+            config.validate_for_question().unwrap_err().to_string(),
+            "TERA_QUESTION_MODEL is empty"
+        );
     }
 
     #[test]
