@@ -462,7 +462,7 @@ impl UiApp {
         self.visible = true;
         self.position = Some(position);
         self.target_position = Some(position);
-        self.status = "Connecting...".to_string();
+        self.status = "Starting...".to_string();
         self.transcript.clear();
         self.polished = None;
         self.error = None;
@@ -475,7 +475,7 @@ impl UiApp {
         });
         self.send_win32(Win32Command::SetActive(true));
         self.send_win32(Win32Command::SetTooltip(
-            "Ashe Worker - Connecting... - Win+Shift+H".to_string(),
+            "Ashe Worker - Starting... - Win+Shift+H".to_string(),
         ));
         let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let audio = match AudioCapture::start(audio_tx, self.config.output_sample_rate) {
@@ -496,6 +496,11 @@ impl UiApp {
             self.transcript_tx.clone(),
             self.status_tx.clone(),
         );
+        self.state = DictationState::Listening;
+        self.status = "Listening...".to_string();
+        self.send_win32(Win32Command::SetTooltip(
+            "Ashe Worker - Listening... - Win+Shift+H".to_string(),
+        ));
         let dg_audio = deepgram.audio_sender();
         self.bridge_thread = Some(std::thread::spawn(move || {
             while let Some(chunk) = audio_rx.blocking_recv() {

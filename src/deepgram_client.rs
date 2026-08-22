@@ -142,8 +142,6 @@ async fn run(
         sample_rate,
         config.deepgram_keyterms.len()
     ));
-    let _ = status_tx.send("Connecting...".to_string());
-
     let dg = Deepgram::new(config.deepgram_api_key.clone())
         .context("failed to create Deepgram client")?;
     let options = Options::builder()
