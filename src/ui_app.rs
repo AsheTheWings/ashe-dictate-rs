@@ -437,7 +437,7 @@ impl UiApp {
         self.transcript.clear();
         self.polished = None;
         self.error = None;
-        let selected_context = self.capture_selected_context();
+        let selected_context = self.capture_selected_context(target_hwnd);
         self.session = Some(DictationSession {
             target_hwnd,
             selected_context,
@@ -811,8 +811,8 @@ impl UiApp {
         Task::none()
     }
 
-    fn capture_selected_context(&self) -> Option<String> {
-        match injector::capture_selected_text() {
+    fn capture_selected_context(&self, target_hwnd: isize) -> Option<String> {
+        match injector::capture_optional_selected_text(target_hwnd) {
             Ok(context) => context,
             Err(err) => {
                 logger::info(format!("Selection context capture failed: {err:#}"));
