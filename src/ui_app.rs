@@ -1,7 +1,7 @@
 use crate::activity_pipeline::ActivityHandle;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
-use crate::deepgram_client::DeepgramSession;
+use crate::deepgram_client::{DeepgramSession, TranscriptUpdate};
 use crate::injector;
 use crate::llm_client;
 use crate::logger;
@@ -47,6 +47,33 @@ struct DictationSession {
     target_hwnd: isize,
     selected_context: Option<String>,
     raw_transcript: String,
+    interim_transcript: String,
+}
+
+impl DictationSession {
+    fn apply_transcript_update(&mut self, update: TranscriptUpdate) {
+        match update {
+            TranscriptUpdate::Interim(text) => self.interim_transcript = text,
+            TranscriptUpdate::Final(text) => {
+                append_transcript_segment(&mut self.raw_transcript, &text);
+                self.interim_transcript.clear();
+            }
+        }
+    }
+
+    fn displayed_transcript(&self) -> String {
+        joined_transcript(&self.raw_transcript, &self.interim_transcript)
+    }
+
+    fn commit_interim(&mut self) -> bool {
+        if self.interim_transcript.trim().is_empty() {
+            self.interim_transcript.clear();
+            return false;
+        }
+        append_transcript_segment(&mut self.raw_transcript, &self.interim_transcript);
+        self.interim_transcript.clear();
+        true
+    }
 }
 
 pub struct UiApp {
@@ -55,8 +82,8 @@ pub struct UiApp {
     win32_tx: Sender<Win32Command>,
     win32_rx: Receiver<Win32Event>,
     _win32_thread: JoinHandle<()>,
-    transcript_tx: Sender<String>,
-    transcript_rx: Receiver<String>,
+    transcript_tx: Sender<TranscriptUpdate>,
+    transcript_rx: Receiver<TranscriptUpdate>,
     status_tx: Sender<String>,
     status_rx: Receiver<String>,
     audio: Option<AudioCapture>,
@@ -298,15 +325,15 @@ impl UiApp {
 
     fn pump_transcripts_and_statuses(&mut self) -> bool {
         let mut transcript_updated = false;
-        while let Ok(text) = self.transcript_rx.try_recv() {
+        while let Ok(update) = self.transcript_rx.try_recv() {
             if let Some(session) = self.session.as_mut() {
-                session.raw_transcript.push_str(&text);
-                self.transcript = session.raw_transcript.clone();
+                session.apply_transcript_update(update);
+                self.transcript = session.displayed_transcript();
                 self.polished = None;
                 self.error = None;
                 transcript_updated = true;
             } else {
-                logger::info(format!("Transcript without active session: {text}"));
+                logger::info(format!("Transcript without active session: {update:?}"));
             }
         }
         while let Ok(status) = self.status_rx.try_recv() {
@@ -386,7 +413,8 @@ impl UiApp {
         }
         logger::info("Reverted last transcript sentence");
         session.raw_transcript = updated;
-        self.transcript = session.raw_transcript.clone();
+        session.interim_transcript.clear();
+        self.transcript = session.displayed_transcript();
         self.polished = None;
         self.error = None;
         self.send_win32(Win32Command::SetTooltip(
@@ -405,11 +433,12 @@ impl UiApp {
         let Some(session) = self.session.as_mut() else {
             return Task::none();
         };
-        if session.raw_transcript.is_empty() {
+        if session.raw_transcript.is_empty() && session.interim_transcript.is_empty() {
             return Task::none();
         }
         logger::info("Cleared transcript buffer");
         session.raw_transcript.clear();
+        session.interim_transcript.clear();
         self.transcript.clear();
         self.polished = None;
         self.error = None;
@@ -442,6 +471,7 @@ impl UiApp {
             target_hwnd,
             selected_context,
             raw_transcript: String::new(),
+            interim_transcript: String::new(),
         });
         self.send_win32(Win32Command::SetActive(true));
         self.send_win32(Win32Command::SetTooltip(
@@ -501,12 +531,14 @@ impl UiApp {
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
-        if let Some(deepgram) = self.deepgram.as_mut() {
-            deepgram.request_stop();
-        }
     }
 
     fn complete_stop_if_ready(&mut self, tasks: &mut Vec<Task<Message>>) {
+        if self.bridge_thread.is_none()
+            && let Some(deepgram) = self.deepgram.as_mut()
+        {
+            deepgram.request_stop();
+        }
         let deepgram_done = self
             .deepgram
             .as_mut()
@@ -515,6 +547,16 @@ impl UiApp {
             self.deepgram.take();
         }
         if self.bridge_thread.is_none() && deepgram_done {
+            if self.pump_transcripts_and_statuses() {
+                tasks.push(overlay_view::scroll_transcript_to_end());
+            }
+            if self
+                .session
+                .as_mut()
+                .is_some_and(DictationSession::commit_interim)
+            {
+                logger::info("Committed the latest interim transcript after finalization");
+            }
             logger::info("Dictation stopped cleanly");
             tasks.push(self.begin_polishing());
         }
@@ -935,9 +977,72 @@ fn remove_last_sentence(text: &str) -> String {
     String::new()
 }
 
+fn append_transcript_segment(transcript: &mut String, segment: &str) {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        return;
+    }
+    if !transcript.is_empty() && !transcript.ends_with(char::is_whitespace) {
+        transcript.push(' ');
+    }
+    transcript.push_str(segment);
+}
+
+fn joined_transcript(finalized: &str, interim: &str) -> String {
+    let mut transcript = finalized.trim().to_string();
+    append_transcript_segment(&mut transcript, interim);
+    transcript
+}
+
 impl Drop for UiApp {
     fn drop(&mut self) {
         self.request_stop();
         let _ = self.win32_tx.send(Win32Command::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DictationSession, TranscriptUpdate};
+
+    fn session() -> DictationSession {
+        DictationSession {
+            target_hwnd: 0,
+            selected_context: None,
+            raw_transcript: String::new(),
+            interim_transcript: String::new(),
+        }
+    }
+
+    #[test]
+    fn interim_transcripts_replace_the_visible_hypothesis() {
+        let mut session = session();
+        session.apply_transcript_update(TranscriptUpdate::Interim("hello word".to_string()));
+        session.apply_transcript_update(TranscriptUpdate::Interim("Hello world.".to_string()));
+
+        assert_eq!(session.displayed_transcript(), "Hello world.");
+        assert!(session.raw_transcript.is_empty());
+    }
+
+    #[test]
+    fn final_transcripts_commit_before_the_next_interim() {
+        let mut session = session();
+        session.apply_transcript_update(TranscriptUpdate::Interim("hello word".to_string()));
+        session.apply_transcript_update(TranscriptUpdate::Final("Hello world.".to_string()));
+        session.apply_transcript_update(TranscriptUpdate::Interim("how are".to_string()));
+
+        assert_eq!(session.raw_transcript, "Hello world.");
+        assert_eq!(session.displayed_transcript(), "Hello world. how are");
+    }
+
+    #[test]
+    fn latest_interim_is_retained_when_finalization_has_no_final_result() {
+        let mut session = session();
+        session.apply_transcript_update(TranscriptUpdate::Final("Keep this.".to_string()));
+        session.apply_transcript_update(TranscriptUpdate::Interim("And this tail".to_string()));
+
+        assert!(session.commit_interim());
+        assert_eq!(session.raw_transcript, "Keep this. And this tail");
+        assert!(session.interim_transcript.is_empty());
     }
 }

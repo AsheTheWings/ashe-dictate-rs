@@ -10,6 +10,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptUpdate {
+    Interim(String),
+    Final(String),
+}
+
 pub struct DeepgramSession {
     audio_tx: UnboundedSender<Vec<u8>>,
     stop_tx: UnboundedSender<()>,
@@ -21,7 +29,7 @@ impl DeepgramSession {
     pub fn start(
         config: AppConfig,
         sample_rate: u32,
-        transcript_tx: crossbeam_channel::Sender<String>,
+        transcript_tx: crossbeam_channel::Sender<TranscriptUpdate>,
         status_tx: crossbeam_channel::Sender<String>,
     ) -> Self {
         let (audio_tx, audio_rx) = unbounded_channel();
@@ -124,7 +132,7 @@ async fn run(
     sample_rate: u32,
     mut audio_rx: UnboundedReceiver<Vec<u8>>,
     mut stop_rx: UnboundedReceiver<()>,
-    transcript_tx: crossbeam_channel::Sender<String>,
+    transcript_tx: crossbeam_channel::Sender<TranscriptUpdate>,
     status_tx: crossbeam_channel::Sender<String>,
 ) -> Result<()> {
     logger::info(format!(
@@ -160,40 +168,64 @@ async fn run(
     ));
     let _ = status_tx.send("Listening...".to_string());
     let mut sent_chunks: usize = 0;
-    let mut last_final = String::new();
+    let mut finalization_deadline = None;
 
     loop {
-        if stop_rx.try_recv().is_ok() {
+        if finalization_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            logger::info("Deepgram finalization timed out");
+            break;
+        }
+        let stop_requested = finalization_deadline.is_none() && stop_rx.try_recv().is_ok();
+        if stop_requested {
             logger::info("Deepgram stop requested");
+            while let Ok(chunk) = audio_rx.try_recv() {
+                if chunk.is_empty() {
+                    continue;
+                }
+                handle
+                    .send_data(chunk)
+                    .await
+                    .context("failed to send final audio chunk to Deepgram")?;
+                sent_chunks += 1;
+            }
             if let Err(err) = handle.finalize().await {
                 logger::info(format!("Deepgram finalize failed: {err:#}"));
             }
             if let Err(err) = handle.close_stream().await {
                 logger::info(format!("Deepgram close failed: {err:#}"));
             }
-            break;
+            finalization_deadline = Some(tokio::time::Instant::now() + FINALIZATION_TIMEOUT);
         }
 
-        for _ in 0..32 {
-            let Ok(chunk) = audio_rx.try_recv() else {
-                break;
-            };
-            if chunk.is_empty() {
-                continue;
-            }
-            handle
-                .send_data(chunk)
-                .await
-                .context("failed to send audio chunk to Deepgram")?;
-            sent_chunks += 1;
-            if sent_chunks == 1 || sent_chunks.is_multiple_of(100) {
-                logger::info(format!("Deepgram chunks sent={sent_chunks}"));
+        if finalization_deadline.is_none() {
+            for _ in 0..32 {
+                let Ok(chunk) = audio_rx.try_recv() else {
+                    break;
+                };
+                if chunk.is_empty() {
+                    continue;
+                }
+                handle
+                    .send_data(chunk)
+                    .await
+                    .context("failed to send audio chunk to Deepgram")?;
+                sent_chunks += 1;
+                if sent_chunks == 1 || sent_chunks.is_multiple_of(100) {
+                    logger::info(format!("Deepgram chunks sent={sent_chunks}"));
+                }
             }
         }
 
-        match tokio::time::timeout(Duration::from_millis(15), handle.receive()).await {
+        let receive_timeout = if finalization_deadline.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(15)
+        };
+        match tokio::time::timeout(receive_timeout, handle.receive()).await {
             Ok(Some(Ok(response))) => {
-                handle_response(response, &transcript_tx, &status_tx, &mut last_final)
+                if handle_response(response, &transcript_tx, &status_tx) {
+                    break;
+                }
             }
             Ok(Some(Err(err))) => logger::info(format!("Deepgram receive error: {err:#}")),
             Ok(None) => {
@@ -211,42 +243,38 @@ async fn run(
 
 fn handle_response(
     response: StreamResponse,
-    transcript_tx: &crossbeam_channel::Sender<String>,
+    transcript_tx: &crossbeam_channel::Sender<TranscriptUpdate>,
     status_tx: &crossbeam_channel::Sender<String>,
-    last_final: &mut String,
-) {
+) -> bool {
     match response {
         StreamResponse::TranscriptResponse {
-            is_final,
-            speech_final,
-            channel,
-            ..
+            is_final, channel, ..
         } => {
-            if !(is_final || speech_final) {
-                return;
-            }
             let Some(alt) = channel.alternatives.first() else {
-                return;
+                return false;
             };
-            let text = alt.transcript.trim();
-            if text.is_empty() || text == last_final {
-                return;
+            let text = alt.transcript.trim().to_string();
+            if is_final {
+                logger::info(format!("Final transcript: {text}"));
+                let _ = transcript_tx.send(TranscriptUpdate::Final(text));
+            } else {
+                let _ = transcript_tx.send(TranscriptUpdate::Interim(text));
             }
-            *last_final = text.to_string();
-            let text = format!("{text} ");
-            logger::info(format!("Transcript: {text}"));
-            let _ = transcript_tx.send(text);
+            false
         }
         StreamResponse::SpeechStartedResponse { .. } => {
             let _ = status_tx.send("Speech detected".to_string());
+            false
         }
         StreamResponse::UtteranceEndResponse { .. } => {
             let _ = status_tx.send("Listening...".to_string());
+            false
         }
         StreamResponse::TerminalResponse { .. } => {
             logger::info("Deepgram terminal response received");
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -257,4 +285,73 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
         return message.clone();
     }
     "non-string panic payload".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TranscriptUpdate, handle_response};
+    use deepgram::common::stream_response::{
+        Alternatives, Channel, Metadata, ModelInfo, StreamResponse,
+    };
+
+    fn transcript_response(is_final: bool, speech_final: bool, text: &str) -> StreamResponse {
+        StreamResponse::TranscriptResponse {
+            type_field: "Results".to_string(),
+            start: 0.0,
+            duration: 1.0,
+            is_final,
+            speech_final,
+            from_finalize: false,
+            channel: Channel {
+                alternatives: vec![Alternatives {
+                    transcript: text.to_string(),
+                    words: Vec::new(),
+                    confidence: 0.9,
+                    languages: Vec::new(),
+                }],
+            },
+            metadata: Metadata {
+                request_id: "request".to_string(),
+                model_info: ModelInfo {
+                    name: "nova-3".to_string(),
+                    version: "test".to_string(),
+                    arch: "test".to_string(),
+                },
+                model_uuid: "model".to_string(),
+            },
+            channel_index: vec![0, 1],
+        }
+    }
+
+    #[test]
+    fn provisional_nova_results_are_forwarded_as_replacements() {
+        let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+
+        assert!(!handle_response(
+            transcript_response(false, true, "hello word"),
+            &transcript_tx,
+            &status_tx,
+        ));
+        assert_eq!(
+            transcript_rx.try_recv().unwrap(),
+            TranscriptUpdate::Interim("hello word".to_string())
+        );
+    }
+
+    #[test]
+    fn stable_nova_results_are_forwarded_as_final_segments() {
+        let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+
+        assert!(!handle_response(
+            transcript_response(true, true, "Hello world."),
+            &transcript_tx,
+            &status_tx,
+        ));
+        assert_eq!(
+            transcript_rx.try_recv().unwrap(),
+            TranscriptUpdate::Final("Hello world.".to_string())
+        );
+    }
 }
