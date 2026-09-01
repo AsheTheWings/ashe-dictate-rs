@@ -56,7 +56,7 @@ if [[ ! -f "$RUNTIME_ENV_FILE" ]]; then
   echo "$RUNTIME_ENV_FILE is required for Windows runtime configuration; release aborted" >&2
   exit 1
 fi
-for name in ASHE_WORKER_BASE_URL ASHE_PASTE_UPLOAD_TOKEN ASHE_PASTE_REMOTE_DIR; do
+for name in ASHE_WORKER_BASE_URL ASHE_PASTE_UPLOAD_TOKEN; do
   value=""
   read_env "$RUNTIME_ENV_FILE" "$name" value || true
   if [[ -z "$value" ]]; then

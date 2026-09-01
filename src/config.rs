@@ -60,7 +60,6 @@ pub struct AppConfig {
     pub worker_base_url: String,
     pub archive_upload_token: String,
     pub paste_upload_token: String,
-    pub paste_remote_dir: String,
 }
 
 impl AppConfig {
@@ -159,7 +158,6 @@ impl AppConfig {
             worker_base_url: std::env::var("ASHE_WORKER_BASE_URL").unwrap_or_default(),
             archive_upload_token: std::env::var("ASHE_ARCHIVE_UPLOAD_TOKEN").unwrap_or_default(),
             paste_upload_token: std::env::var("ASHE_PASTE_UPLOAD_TOKEN").unwrap_or_default(),
-            paste_remote_dir: std::env::var("ASHE_PASTE_REMOTE_DIR").unwrap_or_default(),
         }
     }
 
@@ -215,20 +213,6 @@ impl AppConfig {
         if self.paste_upload_token.trim().is_empty() {
             return Err(anyhow!("ASHE_PASTE_UPLOAD_TOKEN is missing"));
         }
-        let directory = self.paste_remote_dir.trim().trim_end_matches('/');
-        if directory.len() < 2 || !directory.starts_with('/') {
-            return Err(anyhow!(
-                "ASHE_PASTE_REMOTE_DIR must be an absolute non-root path"
-            ));
-        }
-        if directory
-            .split('/')
-            .any(|part| matches!(part, "." | "..") || !safe_path_part(part))
-        {
-            return Err(anyhow!(
-                "ASHE_PASTE_REMOTE_DIR contains unsafe path characters"
-            ));
-        }
         Ok(())
     }
 
@@ -270,9 +254,7 @@ impl AppConfig {
             !self.archive_recipient_json.trim().is_empty(),
             self.archive_plaintext_days,
             !self.worker_base_url.trim().is_empty() && !self.archive_upload_token.trim().is_empty(),
-            !self.worker_base_url.trim().is_empty()
-                && !self.paste_upload_token.trim().is_empty()
-                && !self.paste_remote_dir.trim().is_empty(),
+            !self.worker_base_url.trim().is_empty() && !self.paste_upload_token.trim().is_empty(),
         )
     }
 }
@@ -311,13 +293,6 @@ fn worker_endpoint_url(base_url: &str, route: &str) -> Result<String> {
         return Err(anyhow!("worker endpoint route must start with '/'"));
     }
     Ok(format!("{base_url}{route}"))
-}
-
-fn safe_path_part(part: &str) -> bool {
-    part.is_empty()
-        || part
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn read_output_sample_rate() -> u32 {

@@ -65,14 +65,44 @@ impl PasteUploader {
             value.bytes == png.len(),
             "paste receiver returned a different byte count"
         );
-        let directory = config.paste_remote_dir.trim().trim_end_matches('/');
-        let expected_path = format!("{directory}/{filename}");
-        ensure!(
-            value.path == expected_path,
-            "paste receiver returned an unexpected path"
-        );
+        validate_remote_path(&value.path, &filename)?;
         Ok(value.path)
     }
+}
+
+fn validate_remote_path(path: &str, expected_filename: &str) -> Result<()> {
+    ensure!(
+        path == path.trim(),
+        "paste receiver returned an unsafe path"
+    );
+    ensure!(
+        !path.contains('\\'),
+        "paste receiver returned an unsafe path"
+    );
+    let (directory, filename) = path
+        .rsplit_once('/')
+        .ok_or_else(|| anyhow::anyhow!("paste receiver returned a relative path"))?;
+    ensure!(
+        directory.starts_with('/') && directory.len() > 1,
+        "paste receiver returned a relative or root-level path"
+    );
+    ensure!(
+        directory.split('/').skip(1).all(safe_remote_component),
+        "paste receiver returned an unsafe path"
+    );
+    ensure!(
+        filename == expected_filename,
+        "paste receiver returned an unexpected filename"
+    );
+    Ok(())
+}
+
+fn safe_remote_component(component: &str) -> bool {
+    !component.is_empty()
+        && !matches!(component, "." | "..")
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn canonical_filename(captured_at: &str, sha256: &str) -> Result<String> {
@@ -91,7 +121,7 @@ fn canonical_filename(captured_at: &str, sha256: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_filename;
+    use super::{canonical_filename, validate_remote_path};
 
     #[test]
     fn canonical_name_uses_utc_milliseconds_and_digest_prefix() {
@@ -100,5 +130,14 @@ mod tests {
             canonical_filename("2026-08-18T20:31:45.217Z", digest).unwrap(),
             "20260818T203145.217Z-4fa8c2d1.png"
         );
+    }
+
+    #[test]
+    fn remote_path_uses_the_server_owned_directory() {
+        let filename = "20260818T203145.217Z-4fa8c2d1.png";
+        assert!(validate_remote_path(&format!("/root/Desktop/paste/{filename}"), filename).is_ok());
+        assert!(validate_remote_path(&format!("relative/paste/{filename}"), filename).is_err());
+        assert!(validate_remote_path(&format!("/paste/../{filename}"), filename).is_err());
+        assert!(validate_remote_path("/root/Desktop/paste/other.png", filename).is_err());
     }
 }
