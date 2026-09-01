@@ -409,11 +409,6 @@ fn load_env_file_near_exe() {
         }
         path = current.parent().map(PathBuf::from);
     }
-
-    let sibling = PathBuf::from(r"e:\Desktop\ashe-worker\.env.local");
-    if sibling.exists() {
-        let _ = dotenvy::from_path_override(sibling);
-    }
 }
 
 fn default_artifacts_dir() -> PathBuf {

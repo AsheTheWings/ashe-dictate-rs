@@ -69,8 +69,6 @@ if [[ -n "${CARGO:-}" ]]; then
   CARGO_BIN="$CARGO"
 elif command -v cargo >/dev/null 2>&1; then
   CARGO_BIN="$(command -v cargo)"
-elif [[ -x /root/.cargo/bin/cargo ]]; then
-  CARGO_BIN="/root/.cargo/bin/cargo"
 else
   echo "cargo was not found" >&2
   exit 1
