@@ -268,7 +268,7 @@ fn run(
         set_status(
             status,
             false,
-            "activity tracking paused: TERA_API_KEY/ASHE_API_KEY is missing".to_string(),
+            "activity tracking paused: TERA_API_KEY is missing".to_string(),
             0,
         );
     }
@@ -307,7 +307,7 @@ fn run(
                     set_status(
                         status,
                         false,
-                        "activity tracking needs TERA_API_KEY/ASHE_API_KEY".to_string(),
+                        "activity tracking needs TERA_API_KEY".to_string(),
                         0,
                     );
                 } else {

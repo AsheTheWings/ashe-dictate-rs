@@ -89,18 +89,15 @@ impl AppConfig {
                 .map(ToOwned::to_owned)
                 .collect(),
             output_sample_rate: read_output_sample_rate(),
-            tera_api_key: std::env::var("TERA_API_KEY")
-                .or_else(|_| std::env::var("ASHE_API_KEY"))
-                .unwrap_or_default(),
+            tera_api_key: std::env::var("TERA_API_KEY").unwrap_or_default(),
             tera_api_base: std::env::var("TERA_API_BASE")
-                .or_else(|_| std::env::var("ASHE_BASE_URL"))
                 .unwrap_or_else(|_| DEFAULT_TERA_API_BASE.to_string()),
             dictation_polish_model: read_llm_model("TERA_DICTATION_POLISH_MODEL"),
             grammar_model: read_llm_model("TERA_GRAMMAR_MODEL"),
             question_model: read_llm_model("TERA_QUESTION_MODEL"),
             journal_model: read_llm_model("TERA_JOURNAL_MODEL"),
             llm_temperature: read_f32("ASHE_LLM_TEMPERATURE", DEFAULT_LLM_TEMPERATURE),
-            llm_reasoning_effort: std::env::var("ASHE_LLM_REASONING_EFFORT")
+            llm_reasoning_effort: std::env::var("TERA_LLM_REASONING_EFFORT")
                 .ok()
                 .filter(|value| !value.is_empty()),
             activity_enabled: read_bool("ASHE_ACTIVITY_ENABLED", true),
@@ -281,21 +278,12 @@ impl AppConfig {
 }
 
 fn read_llm_model(name: &str) -> String {
-    resolve_llm_model(
-        std::env::var(name).ok(),
-        std::env::var("TERA_MODEL").ok(),
-        std::env::var("ASHE_MODEL").ok(),
-    )
+    resolve_llm_model(std::env::var(name).ok(), std::env::var("TERA_MODEL").ok())
 }
 
-fn resolve_llm_model(
-    feature_model: Option<String>,
-    tera_model: Option<String>,
-    ashe_model: Option<String>,
-) -> String {
+fn resolve_llm_model(feature_model: Option<String>, tera_model: Option<String>) -> String {
     feature_model
         .or(tera_model)
-        .or(ashe_model)
         .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string())
 }
 
@@ -433,21 +421,17 @@ mod tests {
 
     #[test]
     fn llm_features_prefer_their_model_and_default_to_gemini_latest() {
-        assert_eq!(
-            resolve_llm_model(None, None, None),
-            DEFAULT_LLM_MODEL.to_string()
-        );
+        assert_eq!(resolve_llm_model(None, None), DEFAULT_LLM_MODEL.to_string());
         assert_eq!(DEFAULT_LLM_MODEL, "gemini-latest");
         assert_eq!(
             resolve_llm_model(
                 Some("feature-model".to_string()),
                 Some("shared-model".to_string()),
-                None,
             ),
             "feature-model"
         );
         assert_eq!(
-            resolve_llm_model(None, Some("shared-model".to_string()), None),
+            resolve_llm_model(None, Some("shared-model".to_string())),
             "shared-model"
         );
     }
