@@ -1,7 +1,7 @@
 use crate::activity_pipeline::ActivityHandle;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
-use crate::deepgram_client::transcribe_pcm;
+use crate::fal_client::transcribe_pcm;
 use crate::injector;
 use crate::llm_client;
 use crate::logger;

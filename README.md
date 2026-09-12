@@ -43,8 +43,11 @@ During dictation, microphone audio is buffered locally while the pill overlay
 shows a live voice spectrum (FFT frequency bands) with a cyan border.
 Transcription runs once when you
 stop, as a single full-utterance request for a better result than streaming
-partials; while it works, the pill shows a calm shimmer. The pill carries no
-text: state and errors are reported through the tray tooltip and the log. Use
+partials; while it works, the pill shows a calm shimmer. Speech-to-text runs
+through the fal.ai queue API (`FAL_STT_MODEL`, default scribe-v2): the worker
+uploads the utterance as WAV, polls the request to completion, and inserts
+the transcript, so dictation needs `FAL_KEY` set. The pill carries no text:
+state and errors are reported through the tray tooltip and the log. Use
 `Enter` to finish and transcribe, or `Esc` to cancel.
 
 ## Activity records

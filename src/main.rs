@@ -2,7 +2,7 @@
 mod activity_pipeline;
 mod activity_telemetry;
 mod audio;
-mod deepgram_client;
+mod fal_client;
 mod injector;
 mod llm_client;
 mod overlay_view;

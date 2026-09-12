@@ -1,0 +1,393 @@
+//! Speech-to-text through fal.ai's queue API (ElevenLabs Scribe v2).
+//!
+//! Dictation buffers microphone audio locally while recording and calls
+//! [`transcribe_pcm`] once on stop: the WAV uploads to fal's CDN, a queue
+//! request runs the model, and polling waits for completion. A single
+//! full-utterance request produces a more accurate result than committing
+//! streaming partials as they arrive.
+
+use crate::config::AppConfig;
+use crate::logger;
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Map, Value};
+use std::time::Duration;
+
+/// fal.ai storage endpoint that mints a one-shot upload URL for the WAV.
+const STORAGE_INITIATE_URL: &str =
+    "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
+/// fal.ai queue gateway; the model id appends as the path.
+const QUEUE_BASE_URL: &str = "https://queue.fal.run";
+/// Pause between queue status polls.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Status polls before giving up (~10 minutes, past any dictation length).
+const POLL_ATTEMPTS: u32 = 300;
+/// Per-request ceiling for upload, submit, status, and result fetches.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const WAV_MIME: &str = "audio/wav";
+const WAV_FILE_NAME: &str = "ashe-dictation.wav";
+
+/// Transcribe a complete recording with one queue request.
+pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -> Result<String> {
+    validate_capture(&pcm, sample_rate)?;
+    let seconds = pcm.len() as f64 / f64::from(sample_rate) / 2.0;
+    logger::info(format!(
+        "fal transcription model={} sample_rate={} bytes={} seconds={:.1} keyterms={}",
+        config.fal_stt_model,
+        sample_rate,
+        pcm.len(),
+        seconds,
+        config.fal_keyterms.len()
+    ));
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("failed to create HTTP client")?;
+    let wav = encode_wav_mono16(&pcm, sample_rate);
+    let audio_url = upload_wav(&client, &config.fal_api_key, wav).await?;
+    let request_id = submit_transcription(&client, &config, &audio_url).await?;
+    wait_completed(&client, &config, &request_id).await?;
+    let transcript = fetch_transcript(&client, &config, &request_id).await?;
+    logger::info(format!("fal transcript chars={}", transcript.len()));
+    Ok(transcript)
+}
+
+fn validate_capture(pcm: &[u8], sample_rate: u32) -> Result<()> {
+    if pcm.is_empty() {
+        return Err(anyhow!("no audio captured"));
+    }
+    if !pcm.len().is_multiple_of(2) {
+        return Err(anyhow!("captured PCM has an odd byte count"));
+    }
+    if sample_rate == 0 {
+        return Err(anyhow!("capture sample rate must be greater than zero"));
+    }
+    Ok(())
+}
+
+fn auth_header(api_key: &str) -> String {
+    format!("Key {}", api_key.trim())
+}
+
+/// Upload the WAV to fal's CDN: initiate for a signed URL, then PUT the
+/// bytes. Returns the public file URL the model downloads.
+async fn upload_wav(client: &reqwest::Client, api_key: &str, wav: Vec<u8>) -> Result<String> {
+    let initiate = client
+        .post(STORAGE_INITIATE_URL)
+        .header("Authorization", auth_header(api_key))
+        .json(&serde_json::json!({"content_type": WAV_MIME, "file_name": WAV_FILE_NAME}))
+        .send()
+        .await
+        .context("fal upload initiate request failed")?
+        .error_for_status()
+        .context("fal upload initiate rejected")?
+        .json::<Value>()
+        .await
+        .context("fal upload initiate returned invalid JSON")?;
+    let (upload_url, file_url) = parse_initiate_response(&initiate)?;
+    client
+        .put(upload_url)
+        .header("Content-Type", WAV_MIME)
+        .body(wav)
+        .send()
+        .await
+        .context("fal audio upload failed")?
+        .error_for_status()
+        .context("fal audio upload rejected")?;
+    Ok(file_url)
+}
+
+/// Queue the transcription and return the request id for polling.
+async fn submit_transcription(
+    client: &reqwest::Client,
+    config: &AppConfig,
+    audio_url: &str,
+) -> Result<String> {
+    let url = format!("{QUEUE_BASE_URL}/{}", config.fal_stt_model.trim());
+    let submit = client
+        .post(url)
+        .header("Authorization", auth_header(&config.fal_api_key))
+        .json(&scribe_input(
+            audio_url,
+            &config.fal_language,
+            &config.fal_keyterms,
+        ))
+        .send()
+        .await
+        .context("fal queue submit request failed")?
+        .error_for_status()
+        .context("fal queue submit rejected")?
+        .json::<Value>()
+        .await
+        .context("fal queue submit returned invalid JSON")?;
+    let request_id = parse_submit_response(&submit)?;
+    logger::info(format!("fal transcription queued request_id={request_id}"));
+    Ok(request_id)
+}
+
+/// Poll the request status until it completes or fails.
+async fn wait_completed(
+    client: &reqwest::Client,
+    config: &AppConfig,
+    request_id: &str,
+) -> Result<()> {
+    let status_url = format!(
+        "{QUEUE_BASE_URL}/{}/requests/{request_id}/status",
+        config.fal_stt_model.trim()
+    );
+    for _ in 1..=POLL_ATTEMPTS {
+        let status = client
+            .get(&status_url)
+            .header("Authorization", auth_header(&config.fal_api_key))
+            .send()
+            .await
+            .context("fal status request failed")?
+            .error_for_status()
+            .context("fal status request rejected")?
+            .json::<Value>()
+            .await
+            .context("fal status returned invalid JSON")?;
+        match parse_status(&status)? {
+            QueueState::Done => return Ok(()),
+            QueueState::Pending => tokio::time::sleep(POLL_INTERVAL).await,
+        }
+    }
+    Err(anyhow!(
+        "fal transcription request {request_id} did not complete in time"
+    ))
+}
+
+/// Fetch the completed output and read its transcript text.
+async fn fetch_transcript(
+    client: &reqwest::Client,
+    config: &AppConfig,
+    request_id: &str,
+) -> Result<String> {
+    let result_url = format!(
+        "{QUEUE_BASE_URL}/{}/requests/{request_id}",
+        config.fal_stt_model.trim()
+    );
+    let response = client
+        .get(&result_url)
+        .header("Authorization", auth_header(&config.fal_api_key))
+        .send()
+        .await
+        .context("fal result request failed")?;
+    if response.status() == reqwest::StatusCode::ACCEPTED {
+        return Err(anyhow!("fal result not ready for request {request_id}"));
+    }
+    let output = response
+        .error_for_status()
+        .context("fal result request rejected")?
+        .json::<Value>()
+        .await
+        .context("fal result returned invalid JSON")?;
+    Ok(extract_transcript(&output))
+}
+
+/// Build the Scribe v2 input. Single-speaker dictation wants clean
+/// insertable text, so diarization and audio-event tags stay off.
+/// Keyterms cost ~30% extra, so they are only sent when configured.
+pub fn scribe_input(audio_url: &str, language: &str, keyterms: &[String]) -> Value {
+    let mut input = Map::new();
+    input.insert(
+        "audio_url".to_string(),
+        Value::String(audio_url.to_string()),
+    );
+    input.insert("diarize".to_string(), Value::Bool(false));
+    input.insert("tag_audio_events".to_string(), Value::Bool(false));
+    if !language.trim().is_empty() {
+        input.insert(
+            "language_code".to_string(),
+            Value::String(language.trim().to_string()),
+        );
+    }
+    if !keyterms.is_empty() {
+        input.insert(
+            "keyterms".to_string(),
+            Value::Array(
+                keyterms
+                    .iter()
+                    .map(|keyterm| Value::String(keyterm.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(input)
+}
+
+fn parse_initiate_response(body: &Value) -> Result<(String, String)> {
+    let upload_url = body
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let file_url = body
+        .get("file_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if upload_url.is_empty() || file_url.is_empty() {
+        return Err(anyhow!(
+            "fal upload initiate response is missing upload_url or file_url"
+        ));
+    }
+    Ok((upload_url.to_string(), file_url.to_string()))
+}
+
+fn parse_submit_response(body: &Value) -> Result<String> {
+    body.get("request_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("fal queue submit response is missing request_id"))
+}
+
+enum QueueState {
+    Pending,
+    Done,
+}
+
+fn parse_status(body: &Value) -> Result<QueueState> {
+    match body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "COMPLETED" => Ok(QueueState::Done),
+        "IN_QUEUE" | "IN_PROGRESS" => Ok(QueueState::Pending),
+        other => {
+            let detail: String = body.to_string().chars().take(300).collect();
+            Err(anyhow!(
+                "fal transcription request failed status={other} detail={detail}"
+            ))
+        }
+    }
+}
+
+/// Read the transcript text from a Scribe v2 output object.
+pub fn extract_transcript(output: &Value) -> String {
+    output
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Wrap little-endian mono 16-bit PCM in a 44-byte WAV header so the
+/// model decodes the buffered capture without extra encoding parameters.
+pub fn encode_wav_mono16(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36u32.wrapping_add(data_len)).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate.wrapping_mul(2)).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_wav_mono16, extract_transcript, parse_status, scribe_input};
+    use super::{parse_initiate_response, parse_submit_response};
+    use serde_json::json;
+
+    #[test]
+    fn wav_header_describes_mono16_capture() {
+        let pcm = vec![0x01, 0x02, 0x03, 0x04];
+        let wav = encode_wav_mono16(&pcm, 48_000);
+        assert_eq!(wav.len(), 48);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            48_000
+        );
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
+        assert_eq!(&wav[44..], &pcm[..]);
+    }
+
+    #[test]
+    fn scribe_input_stays_plain_text_by_default() {
+        let input = scribe_input("https://example.com/a.wav", "", &[]);
+        assert_eq!(input["audio_url"], json!("https://example.com/a.wav"));
+        assert_eq!(input["diarize"], json!(false));
+        assert_eq!(input["tag_audio_events"], json!(false));
+        assert!(input.get("language_code").is_none());
+        assert!(input.get("keyterms").is_none());
+    }
+
+    #[test]
+    fn scribe_input_passes_language_and_keyterms() {
+        let input = scribe_input(
+            "https://example.com/a.wav",
+            "eng",
+            &["Ashe".to_string(), "fal".to_string()],
+        );
+        assert_eq!(input["language_code"], json!("eng"));
+        assert_eq!(input["keyterms"], json!(["Ashe", "fal"]));
+    }
+
+    #[test]
+    fn initiate_response_yields_both_urls() {
+        let (upload_url, file_url) = parse_initiate_response(&json!({
+            "upload_url": "https://example.com/upload?sig=1",
+            "file_url": "https://example.com/file.wav"
+        }))
+        .unwrap();
+        assert_eq!(upload_url, "https://example.com/upload?sig=1");
+        assert_eq!(file_url, "https://example.com/file.wav");
+        assert!(parse_initiate_response(&json!({"file_url": "x"})).is_err());
+    }
+
+    #[test]
+    fn submit_response_yields_the_request_id() {
+        assert_eq!(
+            parse_submit_response(&json!({"request_id": "abc", "status": "IN_QUEUE"})).unwrap(),
+            "abc"
+        );
+        assert!(parse_submit_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn queue_status_maps_lifecycle_to_pending_or_done() {
+        assert!(matches!(
+            parse_status(&json!({"status": "IN_QUEUE"})).unwrap(),
+            super::QueueState::Pending
+        ));
+        assert!(matches!(
+            parse_status(&json!({"status": "IN_PROGRESS"})).unwrap(),
+            super::QueueState::Pending
+        ));
+        assert!(matches!(
+            parse_status(&json!({"status": "COMPLETED"})).unwrap(),
+            super::QueueState::Done
+        ));
+        assert!(parse_status(&json!({"status": "FAILED"})).is_err());
+    }
+
+    #[test]
+    fn transcript_extraction_trims_the_scribe_text() {
+        let output = json!({
+            "text": "  Hey, this is a test.  ",
+            "words": [{"text": "Hey,", "start": 0.079, "end": 0.539}],
+            "language_code": "eng",
+            "language_probability": 1.0
+        });
+        assert_eq!(extract_transcript(&output), "Hey, this is a test.");
+        assert!(extract_transcript(&json!({})).is_empty());
+    }
+}

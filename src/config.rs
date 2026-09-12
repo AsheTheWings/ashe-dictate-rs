@@ -23,10 +23,10 @@ const COMPILED_ARCHIVE_RECIPIENT_JSON: &str = match option_env!("ASHE_ARCHIVE_RE
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub deepgram_api_key: String,
-    pub deepgram_model: String,
-    pub deepgram_language: String,
-    pub deepgram_keyterms: Vec<String>,
+    pub fal_api_key: String,
+    pub fal_stt_model: String,
+    pub fal_language: String,
+    pub fal_keyterms: Vec<String>,
     pub output_sample_rate: u32,
     pub tera_api_key: String,
     pub tera_api_base: String,
@@ -75,12 +75,11 @@ impl AppConfig {
             read_u64("ASHE_CAPTURE_INTERVAL", DEFAULT_ACTIVITY_CAPTURE_INTERVAL).max(1);
 
         Self {
-            deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").unwrap_or_default(),
-            deepgram_model: std::env::var("DEEPGRAM_MODEL")
-                .unwrap_or_else(|_| "nova-3".to_string()),
-            deepgram_language: std::env::var("DEEPGRAM_LANGUAGE")
-                .unwrap_or_else(|_| "en-US".to_string()),
-            deepgram_keyterms: std::env::var("DEEPGRAM_KEYTERMS")
+            fal_api_key: std::env::var("FAL_KEY").unwrap_or_default(),
+            fal_stt_model: std::env::var("FAL_STT_MODEL")
+                .unwrap_or_else(|_| "fal-ai/elevenlabs/speech-to-text/scribe-v2".to_string()),
+            fal_language: std::env::var("FAL_LANGUAGE").unwrap_or_default(),
+            fal_keyterms: std::env::var("FAL_KEYTERMS")
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim)
@@ -162,14 +161,11 @@ impl AppConfig {
     }
 
     pub fn validate_for_dictation(&self) -> Result<()> {
-        if self.deepgram_api_key.trim().is_empty() {
-            return Err(anyhow!("DEEPGRAM_API_KEY is missing"));
+        if self.fal_api_key.trim().is_empty() {
+            return Err(anyhow!("FAL_KEY is missing"));
         }
-        if self.deepgram_model.trim().is_empty() {
-            return Err(anyhow!("DEEPGRAM_MODEL is empty"));
-        }
-        if self.deepgram_language.trim().is_empty() {
-            return Err(anyhow!("DEEPGRAM_LANGUAGE is empty"));
+        if self.fal_stt_model.trim().is_empty() {
+            return Err(anyhow!("FAL_STT_MODEL is empty"));
         }
         if !(8_000..=192_000).contains(&self.output_sample_rate) {
             return Err(anyhow!(
@@ -216,27 +212,18 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn deepgram_query_params(&self) -> Vec<(String, String)> {
-        let mut pairs = vec![
-            ("model".to_string(), self.deepgram_model.clone()),
-            ("language".to_string(), self.deepgram_language.clone()),
-            ("smart_format".to_string(), "true".to_string()),
-            ("mip_opt_out".to_string(), "true".to_string()),
-        ];
-        for keyterm in &self.deepgram_keyterms {
-            pairs.push(("keyterm".to_string(), keyterm.clone()));
-        }
-        pairs
-    }
-
     pub fn log_summary(&self) -> String {
         format!(
-            "deepgram_model={} language={} keyterms={} output_sample_rate={} deepgram_api_key_present={} dictation_polish_model={} grammar_model={} question_model={} journal_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
-            self.deepgram_model,
-            self.deepgram_language,
-            self.deepgram_keyterms.len(),
+            "fal_stt_model={} language={} keyterms={} output_sample_rate={} fal_api_key_present={} dictation_polish_model={} grammar_model={} question_model={} journal_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
+            self.fal_stt_model,
+            if self.fal_language.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                self.fal_language.clone()
+            },
+            self.fal_keyterms.len(),
             self.output_sample_rate,
-            !self.deepgram_api_key.trim().is_empty(),
+            !self.fal_api_key.trim().is_empty(),
             self.dictation_polish_model,
             self.grammar_model,
             self.question_model,
