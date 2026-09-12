@@ -7,6 +7,7 @@ use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
 use crate::paste_upload::PasteUploader;
+use crate::pill_renderer;
 use crate::spectrum::{SpectrumAnalyzer, pcm_chunk_to_mono};
 use crate::win32_service::{self, Win32Command, Win32Event};
 use crossbeam_channel::{Receiver, Sender};
@@ -147,7 +148,6 @@ impl UiApp {
             Message::WindowReady(id) => {
                 logger::info(format!("Iced main WindowReady id={id:?}"));
                 self.window_id = id;
-                overlay_view::apply_native_styles();
                 self.apply_window_state()
             }
             Message::WindowCloseRequested(id) => {
@@ -167,27 +167,25 @@ impl UiApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        // The pill is a text-free state lamp: lifecycle by color and motion,
-        // status words live in the tray tooltip.
-        let state = if self.error.is_some() {
-            overlay_view::PillState::Error
+        overlay_view::view()
+    }
+
+    fn pill_state(&self) -> pill_renderer::PillState {
+        if self.error.is_some() {
+            pill_renderer::PillState::Error
         } else {
             match self.state {
                 DictationState::Starting | DictationState::Listening => {
-                    overlay_view::PillState::Listening
+                    pill_renderer::PillState::Listening
                 }
                 DictationState::Transcribing | DictationState::Inserting => {
-                    overlay_view::PillState::Working
+                    pill_renderer::PillState::Working
                 }
                 DictationState::Idle
                 | DictationState::FixingGrammar
-                | DictationState::AnsweringQuestion => overlay_view::PillState::Idle,
+                | DictationState::AnsweringQuestion => pill_renderer::PillState::Idle,
             }
-        };
-        overlay_view::view(overlay_view::PillContent {
-            bars: self.spectrum.bars(),
-            state,
-        })
+        }
     }
 
     fn pump(&mut self) -> Task<Message> {
@@ -199,8 +197,8 @@ impl UiApp {
             tasks.push(self.handle_win32_event(event));
         }
         self.pump_audio_capture();
-        if self.visible && self.advance_overlay_position() {
-            tasks.push(self.apply_window_state());
+        if self.visible {
+            self.advance_overlay_position();
         }
         let activity = self.activity.status();
         let activity_key = format!(
@@ -213,6 +211,9 @@ impl UiApp {
                 running: activity.running,
                 status: activity.summary,
             });
+        }
+        if self.visible {
+            self.sync_overlay();
         }
         Task::batch(tasks)
     }
@@ -864,10 +865,26 @@ impl UiApp {
     }
 
     fn apply_window_state(&self) -> Task<Message> {
+        self.sync_overlay();
         let Some(id) = self.window_id else {
             return Task::none();
         };
-        overlay_view::apply_window_state(id, self.position, self.visible)
+        overlay_view::keep_helper_hidden(id)
+    }
+
+    fn sync_overlay(&self) {
+        let position = self.position.unwrap_or(Point::new(120.0, 120.0));
+        self.send_win32(Win32Command::UpdateOverlay {
+            x: position.x,
+            y: position.y,
+            visible: self.visible,
+            bars: if self.visible {
+                self.spectrum.bars().to_vec()
+            } else {
+                Vec::new()
+            },
+            state: self.pill_state(),
+        });
     }
 
     fn send_win32(&self, command: Win32Command) {

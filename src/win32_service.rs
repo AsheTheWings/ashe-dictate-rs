@@ -2,7 +2,8 @@
 
 use crate::injector;
 use crate::logger;
-use crate::overlay_view;
+use crate::native_overlay::NativeOverlay;
+use crate::pill_renderer;
 use crate::util::{pcwstr, wide};
 use crossbeam_channel::{Receiver, Sender};
 use std::ffi::c_void;
@@ -106,6 +107,13 @@ pub enum Win32Command {
         text: String,
         append_after_selection: bool,
     },
+    UpdateOverlay {
+        x: f32,
+        y: f32,
+        visible: bool,
+        bars: Vec<f32>,
+        state: pill_renderer::PillState,
+    },
     Shutdown,
 }
 
@@ -121,6 +129,16 @@ struct ServiceState {
     activity_running: bool,
     activity_status: String,
     last_artifacts_open: Option<Instant>,
+    overlay: Option<NativeOverlay>,
+    overlay_error_logged: bool,
+}
+
+struct OverlayUpdate {
+    x: f32,
+    y: f32,
+    visible: bool,
+    bars: Vec<f32>,
+    state: pill_renderer::PillState,
 }
 
 pub fn spawn(
@@ -172,6 +190,13 @@ unsafe fn run_message_loop(
         Some(null_mut()),
     )?;
     set_window_icons(hwnd);
+    let overlay = match NativeOverlay::new(instance) {
+        Ok(overlay) => Some(overlay),
+        Err(error) => {
+            logger::info(format!("Native layered overlay creation failed: {error:#}"));
+            None
+        }
+    };
     let state = Box::new(ServiceState {
         event_tx,
         command_rx,
@@ -184,6 +209,8 @@ unsafe fn run_message_loop(
         activity_running: false,
         activity_status: "activity tracking starting".to_string(),
         last_artifacts_open: None,
+        overlay,
+        overlay_error_logged: false,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     register_hotkey(hwnd);
@@ -392,6 +419,10 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
+    // Visual frames arrive at 60 Hz. Coalesce any backlog so a temporarily
+    // busy service thread always presents the newest frame instead of
+    // replaying stale animation.
+    let mut pending_overlay = None;
     while let Ok(command) = state.command_rx.try_recv() {
         match command {
             Win32Command::SetActive(active) => {
@@ -461,10 +492,43 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                     .map_err(|err| format!("{err:#}"));
                 let _ = state.event_tx.send(Win32Event::PasteCompleted(result));
             }
-            Win32Command::Shutdown => {
-                let _ = DestroyWindow(hwnd);
-                break;
+            Win32Command::UpdateOverlay {
+                x,
+                y,
+                visible,
+                bars,
+                state,
+            } => {
+                pending_overlay = Some(OverlayUpdate {
+                    x,
+                    y,
+                    visible,
+                    bars,
+                    state,
+                });
             }
+            Win32Command::Shutdown => {
+                // Defer destruction until this borrowed service state is no
+                // longer in use by the current timer callback.
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                return;
+            }
+        }
+    }
+    if let (Some(update), Some(overlay)) = (pending_overlay, state.overlay.as_mut()) {
+        match overlay.update(
+            update.x,
+            update.y,
+            update.visible,
+            &update.bars,
+            update.state,
+        ) {
+            Ok(()) => state.overlay_error_logged = false,
+            Err(error) if !state.overlay_error_logged => {
+                logger::info(format!("Native layered overlay update failed: {error:#}"));
+                state.overlay_error_logged = true;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -584,11 +648,11 @@ unsafe fn active_input_position() -> (i32, i32) {
 
     let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     let scale = monitor_scale_factor(monitor);
-    let overlay_width = overlay_view::WIDTH;
-    let overlay_height = overlay_view::HEIGHT;
-    let gap = CURSOR_OVERLAY_GAP as f32;
-    let cursor_x = cursor.x as f32 / scale;
-    let cursor_y = cursor.y as f32 / scale;
+    let overlay_width = pill_renderer::WIDTH * scale;
+    let overlay_height = pill_renderer::HEIGHT * scale;
+    let gap = CURSOR_OVERLAY_GAP as f32 * scale;
+    let cursor_x = cursor.x as f32;
+    let cursor_y = cursor.y as f32;
     let mut x = cursor_x + gap;
     let mut y = cursor_y + gap;
 
@@ -597,10 +661,10 @@ unsafe fn active_input_position() -> (i32, i32) {
         ..Default::default()
     };
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
-        let work_left = info.rcWork.left as f32 / scale;
-        let work_top = info.rcWork.top as f32 / scale;
-        let work_right = info.rcWork.right as f32 / scale;
-        let work_bottom = info.rcWork.bottom as f32 / scale;
+        let work_left = info.rcWork.left as f32;
+        let work_top = info.rcWork.top as f32;
+        let work_right = info.rcWork.right as f32;
+        let work_bottom = info.rcWork.bottom as f32;
         if x + overlay_width > work_right {
             x = cursor_x - overlay_width - gap;
         }

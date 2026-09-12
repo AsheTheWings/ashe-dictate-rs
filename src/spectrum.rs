@@ -3,7 +3,7 @@
 //! Frequency analysis follows the established recipe used by tools like
 //! lookas: Hann window, FFT via [`spectrum_analyzer`], log-spaced voice
 //! bands, a time-domain noise gate, relative normalization, and asymmetric
-//! attack/release smoothing. The pill canvas renders the resulting bands.
+//! attack/release smoothing. The pill renderer draws the resulting bands.
 
 use spectrum_analyzer::scaling::divide_by_N_sqrt;
 use spectrum_analyzer::windows::hann_window;
@@ -12,7 +12,7 @@ use spectrum_analyzer::{FrequencyLimit, samples_fft_to_spectrum};
 /// FFT window in samples. At 48 kHz this is ~85 ms, about 12 Hz per bin,
 /// fine enough to feed every log band with real data.
 pub const FFT_SIZE: usize = 4096;
-/// Frequency bars drawn by the pill canvas.
+/// Frequency bars drawn by the pill overlay.
 pub const BAND_COUNT: usize = 64;
 /// Voice range feeding the bars.
 pub const FMIN: f32 = 80.0;
