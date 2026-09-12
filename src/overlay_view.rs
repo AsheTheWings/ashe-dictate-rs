@@ -13,6 +13,10 @@ use std::mem::size_of;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{COLORREF, HWND};
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Ashe Worker";
@@ -260,8 +264,9 @@ pub fn apply_native_styles() {
             ));
             return;
         }
-        // The OS window stays a transparent rectangle (DONOTROUND) while the
-        // pill shape is drawn by the iced container's rounded border.
+        // The OS window keeps square corners (DONOTROUND); the pill shape
+        // comes from the iced container's rounded border plus the round-rect
+        // region below, which clips the window itself.
         let corner_preference = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -285,6 +290,28 @@ pub fn apply_native_styles() {
         if let Err(err) = SetLayeredWindowAttributes(hwnd, COLORREF(0), u8::MAX, LWA_ALPHA) {
             logger::info(format!(
                 "Overlay native SetLayeredWindowAttributes failed hwnd={:p}: {err:#}",
+                hwnd.0
+            ));
+        }
+        // Layered-window presentation ignores per-pixel alpha, so without a
+        // region the window corners show through around the pill. Clip the
+        // OS window to the pill shape; the size is fixed, so once is enough.
+        let (region_w, region_h, corner) = pill_region_px(GetDpiForWindow(hwnd));
+        let region = CreateRoundRectRgn(0, 0, region_w + 1, region_h + 1, corner, corner);
+        if region.is_invalid() {
+            logger::info(format!(
+                "Overlay native region skipped reason=create_failed hwnd={:p}",
+                hwnd.0
+            ));
+        } else if SetWindowRgn(hwnd, Some(region), true) == 0 {
+            let _ = DeleteObject(region.into());
+            logger::info(format!(
+                "Overlay native SetWindowRgn failed hwnd={:p}",
+                hwnd.0
+            ));
+        } else {
+            logger::info(format!(
+                "Overlay native region applied hwnd={:p} w={region_w} h={region_h}",
                 hwnd.0
             ));
         }
@@ -326,11 +353,28 @@ pub fn apply_window_state<Message: 'static>(
     Task::batch(tasks)
 }
 
+/// Device-pixel round-rect for the pill at the given DPI: width, height,
+/// and corner diameter. The ends stay fully rounded at any scale.
+pub fn pill_region_px(dpi: u32) -> (i32, i32, i32) {
+    let scale = dpi.max(96) as f32 / 96.0;
+    let width = (WIDTH * scale).round() as i32;
+    let height = (HEIGHT * scale).round() as i32;
+    (width, height, height)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn overlay_close_request_does_not_exit_tray_application() {
         assert!(!super::window_settings().exit_on_close_request);
+    }
+
+    #[test]
+    fn pill_region_matches_the_pill_at_any_dpi() {
+        assert_eq!(super::pill_region_px(96), (380, 64, 64));
+        assert_eq!(super::pill_region_px(144), (570, 96, 96));
+        assert_eq!(super::pill_region_px(192), (760, 128, 128));
+        assert_eq!(super::pill_region_px(0), (380, 64, 64));
     }
 
     #[test]
