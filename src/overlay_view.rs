@@ -13,10 +13,6 @@ use std::mem::size_of;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{COLORREF, HWND};
 #[cfg(target_os = "windows")]
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
-#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Ashe Worker";
@@ -24,10 +20,9 @@ pub const WIDTH: f32 = 285.0;
 pub const HEIGHT: f32 = 64.0;
 const CORNER_RADIUS: u32 = 32;
 const BORDER_WIDTH: f32 = 2.0;
-/// Clearance between the window edge and the border stroke's outer edge.
-/// The window region never touches the stroke, so its width renders
-/// uniformly instead of being clipped unevenly by the 1-bit region mask.
-const BORDER_CLEARANCE: f32 = 2.0;
+/// Leave the antialiased pill edge inside the canvas instead of clipping it
+/// against the rectangular window bounds.
+const PILL_EDGE_INSET: f32 = 1.0;
 /// Horizontal margin between the window edge and the bar area. Identical
 /// on both ends by construction.
 const BAR_MARGIN: f32 = 12.0;
@@ -92,8 +87,7 @@ fn platform_specific_settings() -> window::settings::PlatformSpecific {
     window::settings::PlatformSpecific::default()
 }
 
-/// Visual lifecycle of the dictate pill. State is carried by color and
-/// motion; the pill itself renders no text.
+/// Visual lifecycle of the dictate pill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PillState {
     /// Microphone hot. Bars follow the live input level.
@@ -120,7 +114,7 @@ pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
     };
     let visualizer = canvas(program).width(Length::Fill).height(Length::Fill);
     // The container is a transparent pass-through: the canvas paints the
-    // background, the border stroke, and the bars with exact insets, so no
+    // background, the border ring, and the bars with exact insets, so no
     // framework border or padding can drift asymmetrically.
     container(visualizer)
         .width(Length::Fill)
@@ -162,15 +156,23 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
     ) -> Vec<canvas::Geometry> {
         let count = self.bars.len().max(1);
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        // Full-bleed border color: the clearance band between the region
-        // cut and the stroke reads as border on every side, so no dark
-        // rim can appear between the pill edge and the stroke. The region
-        // clips solid border color instead of a painted edge.
         let background = Color::from_rgba(0.025, 0.035, 0.055, 0.95);
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), self.state.border_color());
-        // Dark interior inset to the stroke's inner edge. Concentric
-        // rounding keeps the visible border width uniform into the caps.
-        let inner_inset = BORDER_CLEARANCE + BORDER_WIDTH;
+        // The tiny-skia Windows backend presents RGB pixels, not per-pixel
+        // alpha. Exact black is therefore reserved as the native layered
+        // window color key, while the pill is painted as two concentric
+        // fills. One renderer owns every edge, avoiding the bottom/right
+        // drift caused by combining a canvas stroke with a 1-bit GDI region.
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color::BLACK);
+        let outer = canvas::Path::rounded_rectangle(
+            Point::new(PILL_EDGE_INSET, PILL_EDGE_INSET),
+            Size::new(
+                bounds.width - 2.0 * PILL_EDGE_INSET,
+                bounds.height - 2.0 * PILL_EDGE_INSET,
+            ),
+            (CORNER_RADIUS as f32 - PILL_EDGE_INSET).into(),
+        );
+        frame.fill(&outer, self.state.border_color());
+        let inner_inset = PILL_EDGE_INSET + BORDER_WIDTH;
         let interior = canvas::Path::rounded_rectangle(
             Point::new(inner_inset, inner_inset),
             Size::new(
@@ -180,28 +182,11 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
             (CORNER_RADIUS as f32 - inner_inset).into(),
         );
         frame.fill(&interior, background);
-        // Border stroke centered on the full-bleed fill with uniform width
-        // and antialiased edges on every side, including the caps.
-        let stroke_inset = BORDER_CLEARANCE + BORDER_WIDTH / 2.0;
-        let border = canvas::Path::rounded_rectangle(
-            Point::new(stroke_inset, stroke_inset),
-            Size::new(
-                bounds.width - 2.0 * stroke_inset,
-                bounds.height - 2.0 * stroke_inset,
-            ),
-            (CORNER_RADIUS as f32 - stroke_inset).into(),
-        );
-        frame.stroke(
-            &border,
-            canvas::Stroke::default()
-                .with_color(self.state.border_color())
-                .with_width(BORDER_WIDTH),
-        );
         if self.state == PillState::Working {
             frame.fill_text(canvas::Text {
                 content: "processing...".to_string(),
                 position: Point::new(bounds.width / 2.0, bounds.height / 2.0),
-                color: Color::from_rgba(0.0, 0.88, 1.0, 0.75),
+                color: Color::WHITE,
                 size: Pixels(14.0),
                 align_x: Alignment::Center.into(),
                 align_y: alignment::Vertical::Center,
@@ -298,9 +283,8 @@ pub fn apply_native_styles() {
             ));
             return;
         }
-        // The OS window keeps square corners (DONOTROUND); the pill shape
-        // comes from the iced container's rounded border plus the round-rect
-        // region below, which clips the window itself.
+        // The OS window keeps square corners (DONOTROUND); exact black canvas
+        // pixels are transparent, so the canvas alone defines the pill edge.
         let corner_preference = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -321,38 +305,15 @@ pub fn apply_native_styles() {
                 hwnd.0
             ));
         }
-        if let Err(err) = SetLayeredWindowAttributes(hwnd, COLORREF(0), u8::MAX, LWA_ALPHA) {
-            logger::info(format!(
+        match SetLayeredWindowAttributes(hwnd, COLORREF(0), u8::MAX, LWA_ALPHA | LWA_COLORKEY) {
+            Ok(()) => logger::info(format!(
+                "Overlay native black color key applied hwnd={:p}",
+                hwnd.0
+            )),
+            Err(err) => logger::info(format!(
                 "Overlay native SetLayeredWindowAttributes failed hwnd={:p}: {err:#}",
                 hwnd.0
-            ));
-        }
-        // Layered-window presentation ignores per-pixel alpha, so without a
-        // region the window corners show through around the pill. Clip the
-        // OS window to the pill shape; the size is fixed, so once is enough.
-        // The region is a 1-bit mask with no antialiasing, so it is inset
-        // one pixel: the clip then lands inside the solid border instead of
-        // across its antialiased outer fringe, which reads as a clean edge
-        // rather than speckle.
-        let (region_w, region_h, corner) = pill_region_px(GetDpiForWindow(hwnd));
-        let (x1, y1, x2, y2, corner_w, corner_h) = inset_region_px(region_w, region_h, corner);
-        let region = CreateRoundRectRgn(x1, y1, x2, y2, corner_w, corner_h);
-        if region.is_invalid() {
-            logger::info(format!(
-                "Overlay native region skipped reason=create_failed hwnd={:p}",
-                hwnd.0
-            ));
-        } else if SetWindowRgn(hwnd, Some(region), true) == 0 {
-            let _ = DeleteObject(region.into());
-            logger::info(format!(
-                "Overlay native SetWindowRgn failed hwnd={:p}",
-                hwnd.0
-            ));
-        } else {
-            logger::info(format!(
-                "Overlay native region applied hwnd={:p} w={region_w} h={region_h}",
-                hwnd.0
-            ));
+            )),
         }
         match SetWindowPos(
             hwnd,
@@ -392,49 +353,11 @@ pub fn apply_window_state<Message: 'static>(
     Task::batch(tasks)
 }
 
-/// Device-pixel round-rect for the pill at the given DPI: width, height,
-/// and corner diameter. The ends stay fully rounded at any scale.
-pub fn pill_region_px(dpi: u32) -> (i32, i32, i32) {
-    let scale = dpi.max(96) as f32 / 96.0;
-    let width = (WIDTH * scale).round() as i32;
-    let height = (HEIGHT * scale).round() as i32;
-    (width, height, height)
-}
-
-/// Inset a full-bleed `(width, height, corner)` region one device pixel on
-/// every side so the clip lands inside the solid border. Returns
-/// `(x1, y1, x2, y2, corner_w, corner_h)`; right and bottom edges stay
-/// exclusive, matching GDI region semantics.
-pub fn inset_region_px(
-    region_w: i32,
-    region_h: i32,
-    corner: i32,
-) -> (i32, i32, i32, i32, i32, i32) {
-    (1, 1, region_w - 1, region_h - 1, corner - 2, corner - 2)
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
     fn overlay_close_request_does_not_exit_tray_application() {
         assert!(!super::window_settings().exit_on_close_request);
-    }
-
-    #[test]
-    fn pill_region_matches_the_pill_at_any_dpi() {
-        assert_eq!(super::pill_region_px(96), (285, 64, 64));
-        assert_eq!(super::pill_region_px(144), (428, 96, 96));
-        assert_eq!(super::pill_region_px(192), (570, 128, 128));
-        assert_eq!(super::pill_region_px(0), (285, 64, 64));
-    }
-
-    #[test]
-    fn region_inset_clips_one_pixel_on_every_side() {
-        assert_eq!(super::inset_region_px(285, 64, 64), (1, 1, 284, 63, 62, 62));
-        assert_eq!(
-            super::inset_region_px(570, 128, 128),
-            (1, 1, 569, 127, 126, 126)
-        );
     }
 
     #[test]
