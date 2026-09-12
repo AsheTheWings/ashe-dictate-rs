@@ -9,10 +9,11 @@ use spectrum_analyzer::scaling::divide_by_N_sqrt;
 use spectrum_analyzer::windows::hann_window;
 use spectrum_analyzer::{FrequencyLimit, samples_fft_to_spectrum};
 
-/// FFT window in samples. At 48 kHz this is ~43 ms, about 23 Hz per bin.
-pub const FFT_SIZE: usize = 2048;
+/// FFT window in samples. At 48 kHz this is ~85 ms, about 12 Hz per bin,
+/// fine enough to feed every log band with real data.
+pub const FFT_SIZE: usize = 4096;
 /// Frequency bars drawn by the pill canvas.
-pub const BAND_COUNT: usize = 32;
+pub const BAND_COUNT: usize = 64;
 /// Voice range feeding the bars.
 pub const FMIN: f32 = 80.0;
 /// Voice range feeding the bars.
