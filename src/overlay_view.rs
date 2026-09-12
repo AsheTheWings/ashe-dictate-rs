@@ -164,15 +164,26 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
     ) -> Vec<canvas::Geometry> {
         let count = self.bars.len().max(1);
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        // Square background: the window region provides the pill shape, so
-        // the region clips solid fill instead of a rounded painted edge.
-        frame.fill_rectangle(
-            Point::ORIGIN,
-            bounds.size(),
-            Color::from_rgba(0.025, 0.035, 0.055, 0.95),
+        // Full-bleed border color: the clearance band between the region
+        // cut and the stroke reads as border on every side, so no dark
+        // rim can appear between the pill edge and the stroke. The region
+        // clips solid border color instead of a painted edge.
+        let background = Color::from_rgba(0.025, 0.035, 0.055, 0.95);
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), self.state.border_color());
+        // Dark interior inset to the stroke's inner edge. Concentric
+        // rounding keeps the visible border width uniform into the caps.
+        let inner_inset = BORDER_CLEARANCE + BORDER_WIDTH;
+        let interior = canvas::Path::rounded_rectangle(
+            Point::new(inner_inset, inner_inset),
+            Size::new(
+                bounds.width - 2.0 * inner_inset,
+                bounds.height - 2.0 * inner_inset,
+            ),
+            (CORNER_RADIUS as f32 - inner_inset).into(),
         );
-        // Border stroke fully inside the region with uniform width and
-        // antialiased edges on every side, including the caps.
+        frame.fill(&interior, background);
+        // Border stroke centered on the full-bleed fill with uniform width
+        // and antialiased edges on every side, including the caps.
         let stroke_inset = BORDER_CLEARANCE + BORDER_WIDTH / 2.0;
         let border = canvas::Path::rounded_rectangle(
             Point::new(stroke_inset, stroke_inset),
