@@ -78,7 +78,7 @@ impl AppConfig {
             fal_api_key: std::env::var("FAL_KEY").unwrap_or_default(),
             fal_stt_model: std::env::var("FAL_STT_MODEL")
                 .unwrap_or_else(|_| "fal-ai/elevenlabs/speech-to-text/scribe-v2".to_string()),
-            fal_language: std::env::var("FAL_LANGUAGE").unwrap_or_default(),
+            fal_language: std::env::var("FAL_LANGUAGE").unwrap_or_else(|_| "eng".to_string()),
             fal_keyterms: std::env::var("FAL_KEYTERMS")
                 .unwrap_or_default()
                 .split(',')
