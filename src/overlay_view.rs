@@ -20,7 +20,7 @@ pub const TITLE: &str = "Ashe Worker";
 pub const WIDTH: f32 = 285.0;
 pub const HEIGHT: f32 = 64.0;
 const CORNER_RADIUS: u32 = 32;
-const BORDER_WIDTH: f32 = 4.0;
+const BORDER_WIDTH: f32 = 2.0;
 /// Clearance between the window edge and the border stroke's outer edge.
 /// The window region never touches the stroke, so its width renders
 /// uniformly instead of being clipped unevenly by the 1-bit region mask.
