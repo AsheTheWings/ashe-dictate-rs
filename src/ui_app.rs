@@ -22,6 +22,8 @@ const OVERLAY_TICK_MS: u64 = 16;
 const OVERLAY_SMOOTHING: f32 = 0.28;
 const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
 const TYPING_PREVIEW_CHARACTERS: usize = 256;
+const LINE_BREAK_SYMBOL: &str = "↵";
+const LINE_BREAK_FEEDBACK_DURATION: Duration = Duration::from_millis(1_500);
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub struct UiApp {
     dictation_insertion_count: usize,
     recording_elapsed: Duration,
     recording_started_at: Option<Instant>,
+    line_break_feedback_until: Option<Instant>,
     text_action: Option<TextAction>,
     window_id: Option<window::Id>,
     position: Option<Point>,
@@ -117,6 +120,7 @@ impl UiApp {
             dictation_insertion_count: 0,
             recording_elapsed: Duration::ZERO,
             recording_started_at: None,
+            line_break_feedback_until: None,
             text_action: None,
             window_id: None,
             position: None,
@@ -276,6 +280,7 @@ impl UiApp {
             }
             Win32Event::CancelRequested => self.cancel_operation(),
             Win32Event::SubmitRequested => self.handle_submit(),
+            Win32Event::LineBreakRequested => self.handle_line_break(),
             Win32Event::TypingStarted => self.begin_typing(),
             Win32Event::TextInput(text) => self.capture_typed_text(text),
             Win32Event::BackspaceRequested => self.capture_backspace(),
@@ -436,6 +441,7 @@ impl UiApp {
         self.dictation_insertion_count = 0;
         self.recording_elapsed = Duration::ZERO;
         self.recording_started_at = None;
+        self.line_break_feedback_until = None;
         self.session = Some(CompositionSession::new(
             target_hwnd,
             self.config.output_sample_rate,
@@ -482,6 +488,7 @@ impl UiApp {
             return Task::none();
         }
         self.seal_current_audio();
+        self.line_break_feedback_until = None;
         self.state = DictationState::Typing;
         self.status = "Typing...".to_string();
         self.send_win32(Win32Command::SetTooltip(
@@ -559,11 +566,54 @@ impl UiApp {
         }
     }
 
+    fn handle_line_break(&mut self) -> Task<Message> {
+        if self.state == DictationState::Typing {
+            if let Some(session) = self.session.as_mut() {
+                session.push_typed_line_break();
+            }
+            return Task::none();
+        }
+        if !matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        ) {
+            return Task::none();
+        }
+
+        self.split_current_audio_segment();
+        let Some(session) = self.session.as_mut() else {
+            return Task::none();
+        };
+        session.commit_line_break();
+        let count = session.insertion_count();
+        self.dictation_insertion_count = count;
+        self.line_break_feedback_until = Some(Instant::now() + LINE_BREAK_FEEDBACK_DURATION);
+        logger::info(format!("Dictation line break committed count={count}"));
+        Task::none()
+    }
+
+    fn split_current_audio_segment(&mut self) {
+        self.drain_pending_audio();
+        let sample_rate = self
+            .audio
+            .as_ref()
+            .map_or(self.config.output_sample_rate, AudioCapture::sample_rate);
+        self.commit_current_audio_segment();
+        self.current_audio = Some(SilenceCompactor::new(sample_rate));
+    }
+
     fn seal_current_audio(&mut self) {
         self.stop_recording_timer();
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
+        self.drain_pending_audio();
+        self.audio_rx.take();
+        self.commit_current_audio_segment();
+        self.spectrum.reset();
+    }
+
+    fn drain_pending_audio(&mut self) {
         let mut chunks = Vec::new();
         if let Some(rx) = self.audio_rx.as_mut() {
             while let Ok(chunk) = rx.try_recv() {
@@ -573,7 +623,9 @@ impl UiApp {
         for chunk in chunks {
             self.process_audio_chunk(&chunk);
         }
-        self.audio_rx.take();
+    }
+
+    fn commit_current_audio_segment(&mut self) {
         if let Some(compactor) = self.current_audio.take()
             && let Some(pcm) = compactor.finish()
         {
@@ -582,7 +634,6 @@ impl UiApp {
                 session.push_speech(pcm);
             }
         }
-        self.spectrum.reset();
     }
 
     fn request_stop(&mut self) -> Task<Message> {
@@ -981,6 +1032,7 @@ impl UiApp {
         self.dictation_insertion_count = 0;
         self.recording_elapsed = Duration::ZERO;
         self.recording_started_at = None;
+        self.line_break_feedback_until = None;
     }
 
     fn advance_overlay_position(&mut self) -> bool {
@@ -1075,6 +1127,14 @@ impl UiApp {
             count: format!("{} inserted", self.dictation_insertion_count),
             content,
             alignment,
+            accessory: matches!(
+                self.state,
+                DictationState::Starting | DictationState::Listening
+            )
+            .then(|| self.line_break_feedback_until)
+            .flatten()
+            .filter(|deadline| Instant::now() < *deadline)
+            .map(|_| LINE_BREAK_SYMBOL.to_string()),
         })
     }
 

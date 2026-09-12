@@ -28,6 +28,12 @@ const CLASS_NAME: &str = "AsheWorkerLayeredOverlay";
 const WINDOW_NAME: &str = "Ashe Worker Dictation Overlay";
 const MAIN_FONT_PIXELS: f32 = 14.0;
 const TOP_BAR_FONT_PIXELS: f32 = 13.2;
+/// Line-break marker scale and color. The `↵` renders larger than the
+/// surrounding bar text in the palette cyan, both as listening feedback
+/// and inline in the typing preview.
+const TOP_BAR_LINE_BREAK_SCALE: f32 = 1.5;
+const LINE_BREAK_CYAN: TextColor = TextColor::rgb(0, 224, 255);
+const LINE_BREAK_MARKER: char = '↵';
 
 /// A Win32 layered window whose shape comes exclusively from per-pixel alpha.
 /// No chroma key, clipping region, or opaque backing surface participates.
@@ -314,6 +320,7 @@ impl TextRasterizer {
                 MAIN_FONT_PIXELS * scale,
                 rect,
                 TextAlign::Center,
+                TextColor::rgb(255, 255, 255),
                 u8::MAX,
             );
         }
@@ -334,6 +341,7 @@ impl TextRasterizer {
                 TOP_BAR_FONT_PIXELS * scale,
                 count_rect,
                 TextAlign::Left,
+                TextColor::rgb(255, 255, 255),
                 204,
             );
             // Both centered status (timer, silence notice) and trailing typed
@@ -375,16 +383,57 @@ impl TextRasterizer {
                     )
                 }
             };
-            self.draw_text(
-                rgba,
-                width,
-                height,
-                &content.content,
-                TOP_BAR_FONT_PIXELS * scale,
-                content_rect,
-                alignment,
-                204,
-            );
+            // The typing preview keeps `↵` markers inline as larger cyan
+            // spans with a space of padding on each side. The padding is
+            // display-only; the committed insertion still holds `\n`.
+            if content.alignment == TopBarAlignment::Trailing
+                && content.content.contains(LINE_BREAK_MARKER)
+            {
+                self.draw_line_break_preview(
+                    rgba,
+                    width,
+                    height,
+                    &content.content,
+                    TOP_BAR_FONT_PIXELS * scale,
+                    content_rect,
+                    alignment,
+                    204,
+                );
+            } else {
+                self.draw_text(
+                    rgba,
+                    width,
+                    height,
+                    &content.content,
+                    TOP_BAR_FONT_PIXELS * scale,
+                    content_rect,
+                    alignment,
+                    TextColor::rgb(255, 255, 255),
+                    204,
+                );
+            }
+            if let Some(accessory) = content.accessory.as_deref() {
+                let accessory_right = pill_renderer::TOP_BAR_X + pill_renderer::TOP_BAR_WIDTH
+                    - pill_renderer::TOP_BAR_TEXT_INSET;
+                let accessory_rect = PixelRect::from_logical(
+                    accessory_right - pill_renderer::TOP_BAR_ACCESSORY_WIDTH,
+                    pill_renderer::TOP_BAR_Y,
+                    pill_renderer::TOP_BAR_ACCESSORY_WIDTH,
+                    pill_renderer::TOP_BAR_HEIGHT,
+                    scale,
+                );
+                self.draw_text(
+                    rgba,
+                    width,
+                    height,
+                    accessory,
+                    TOP_BAR_FONT_PIXELS * TOP_BAR_LINE_BREAK_SCALE * scale,
+                    accessory_rect,
+                    TextAlign::Center,
+                    LINE_BREAK_CYAN,
+                    204,
+                );
+            }
         }
     }
 
@@ -398,6 +447,7 @@ impl TextRasterizer {
         font_size: f32,
         clip: PixelRect,
         alignment: TextAlign,
+        color: TextColor,
         opacity: u8,
     ) {
         if text.is_empty() || clip.width <= 0 || clip.height <= 0 {
@@ -418,7 +468,7 @@ impl TextRasterizer {
         buffer.draw(
             &mut self.fonts,
             &mut self.cache,
-            TextColor::rgb(255, 255, 255),
+            color,
             |x, y, pixel_width, pixel_height, color| {
                 raster.push(RasterPixel {
                     x,
@@ -429,7 +479,102 @@ impl TextRasterizer {
                 });
             },
         );
-        let Some(bounds) = RasterBounds::for_pixels(&raster) else {
+        Self::blit(rgba, width, height, &raster, clip, alignment, opacity);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_line_break_preview(
+        &mut self,
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        preview: &str,
+        font_size: f32,
+        clip: PixelRect,
+        alignment: TextAlign,
+        opacity: u8,
+    ) {
+        let spans = line_break_spans(preview, font_size);
+        let refs: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|(text, attrs)| (text.as_str(), attrs.clone()))
+            .collect();
+        self.draw_rich_text(
+            rgba,
+            width,
+            height,
+            &refs,
+            font_size,
+            clip,
+            alignment,
+            TextColor::rgb(255, 255, 255),
+            opacity,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rich_text(
+        &mut self,
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        spans: &[(&str, Attrs)],
+        base_font_size: f32,
+        clip: PixelRect,
+        alignment: TextAlign,
+        default_color: TextColor,
+        opacity: u8,
+    ) {
+        if spans.is_empty() || clip.width <= 0 || clip.height <= 0 {
+            return;
+        }
+        // The buffer line must clear the enlarged marker, not just the
+        // base text, or the marker clips vertically.
+        let line_height = (base_font_size * TOP_BAR_LINE_BREAK_SCALE * 1.35).max(1.0);
+        let mut buffer = Buffer::new(
+            &mut self.fonts,
+            Metrics::new(base_font_size.max(1.0), line_height),
+        );
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, Some(clip.height as f32));
+        let default_attrs = Attrs::new().family(Family::Name("Segoe UI"));
+        buffer.set_rich_text(
+            &mut self.fonts,
+            spans.iter().map(|(text, attrs)| (*text, attrs.clone())),
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.fonts, false);
+
+        let mut raster = Vec::new();
+        buffer.draw(
+            &mut self.fonts,
+            &mut self.cache,
+            default_color,
+            |x, y, pixel_width, pixel_height, color| {
+                raster.push(RasterPixel {
+                    x,
+                    y,
+                    width: pixel_width,
+                    height: pixel_height,
+                    color,
+                });
+            },
+        );
+        Self::blit(rgba, width, height, &raster, clip, alignment, opacity);
+    }
+
+    fn blit(
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        raster: &[RasterPixel],
+        clip: PixelRect,
+        alignment: TextAlign,
+        opacity: u8,
+    ) {
+        let Some(bounds) = RasterBounds::for_pixels(raster) else {
             return;
         };
         let origin_x = match alignment {
@@ -451,6 +596,30 @@ impl TextRasterizer {
             }
         }
     }
+}
+
+/// Split a typing preview into render spans. Base text keeps the default
+/// style; each `↵` becomes a larger cyan span wrapped in one space of
+/// horizontal padding on each side.
+fn line_break_spans(preview: &str, base_font_size: f32) -> Vec<(String, Attrs<'_>)> {
+    let base = Attrs::new().family(Family::Name("Segoe UI"));
+    let marker_font = (base_font_size * TOP_BAR_LINE_BREAK_SCALE).max(1.0);
+    let marker = Attrs::new()
+        .family(Family::Name("Segoe UI"))
+        .color(LINE_BREAK_CYAN)
+        .metrics(Metrics::new(marker_font, (marker_font * 1.35).max(1.0)));
+    let mut spans = Vec::new();
+    for (index, segment) in preview.split(LINE_BREAK_MARKER).enumerate() {
+        if index > 0 {
+            spans.push((" ".to_string(), base.clone()));
+            spans.push((LINE_BREAK_MARKER.to_string(), marker.clone()));
+            spans.push((" ".to_string(), base.clone()));
+        }
+        if !segment.is_empty() {
+            spans.push((segment.to_string(), base.clone()));
+        }
+    }
+    spans
 }
 
 #[derive(Clone, Copy)]
@@ -593,7 +762,7 @@ unsafe extern "system" fn window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::composite_pixel;
+    use super::{LINE_BREAK_CYAN, composite_pixel, line_break_spans};
     use cosmic_text::Color;
 
     #[test]
@@ -608,5 +777,16 @@ mod tests {
         let mut rgba = [0_u8; 4];
         composite_pixel(&mut rgba, 1, 1, 1, 0, Color::rgb(255, 255, 255), 255);
         assert_eq!(rgba, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn line_break_preview_pads_the_marker_and_marks_it_cyan() {
+        let spans = line_break_spans("ab↵cd", 13.2);
+        let texts: Vec<&str> = spans.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, ["ab", " ", "↵", " ", "cd"]);
+        assert!(spans[0].1.color_opt.is_none());
+        assert!(spans[0].1.metrics_opt.is_none());
+        assert_eq!(spans[2].1.color_opt, Some(LINE_BREAK_CYAN));
+        assert!(spans[2].1.metrics_opt.is_some());
     }
 }

@@ -46,11 +46,15 @@ always rendered above the pill as one connected body, with no border across
 the contact surface. Its left side always shows the insertion count. While
 typing with content it shows a trailing preview, representing clipboard
 spans as `[pasted]`; otherwise it shows a centered recording timer.
-`Backspace` edits the buffer. Press `Enter` with content to commit it and
-resume listening. Press `Enter` with an empty buffer to finish, or `Esc` to
-cancel the whole session. Navigation and unrelated system shortcuts continue
-to work normally. Direct IME and emoji-panel composition is not captured;
-use `Ctrl+V` for that content.
+`Shift+Enter` inserts a line break without ending the session. While
+listening, the bar shows `↵` at its right edge for 1.5 seconds; while typing,
+`↵` stays inline in the editable preview and one `Backspace` removes it. The
+marker renders larger in cyan, with horizontal padding in the typing preview.
+Press `Enter` with content to commit it and resume listening. Press `Enter`
+with an empty buffer to finish, or `Esc` to cancel the whole session.
+Navigation and unrelated system shortcuts continue to work normally. Direct
+IME and emoji-panel composition is not captured; use `Ctrl+V` for that
+content.
 
 Natural pauses remain intact. Once silence reaches five seconds, dead air is
 compacted locally and the bar shows `silence skipped` instead of the timer;

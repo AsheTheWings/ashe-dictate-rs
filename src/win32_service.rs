@@ -58,6 +58,7 @@ pub enum Win32Event {
     ToggleRequested { target_hwnd: isize, x: i32, y: i32 },
     CancelRequested,
     SubmitRequested,
+    LineBreakRequested,
     TypingStarted,
     TextInput(String),
     BackspaceRequested,
@@ -720,6 +721,14 @@ impl KeyboardHookState {
                 }
                 true
             }
+            CaptureAction::LineBreak => {
+                self.captured[index] = true;
+                if !was_down {
+                    self.clear_dead_key_state();
+                    let _ = self.event_tx.send(Win32Event::LineBreakRequested);
+                }
+                true
+            }
             CaptureAction::Cancel => {
                 self.captured[index] = true;
                 if !was_down {
@@ -856,6 +865,7 @@ impl KeyboardHookState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModifierState {
+    shift: bool,
     control: bool,
     alt: bool,
     right_alt: bool,
@@ -866,6 +876,7 @@ impl ModifierState {
     fn from_keyboard_state(state: &[u8; 256]) -> Self {
         let down = |key: u16| state[key as usize] & 0x80 != 0;
         Self {
+            shift: down(VK_SHIFT.0),
             control: down(VK_CONTROL.0),
             alt: down(VK_MENU.0),
             right_alt: down(VK_RMENU.0),
@@ -881,6 +892,7 @@ enum CaptureAction {
     Paste,
     Backspace,
     Submit,
+    LineBreak,
     Cancel,
 }
 
@@ -889,7 +901,11 @@ fn classify_key(vk: u32, modifiers: ModifierState, typing: bool) -> CaptureActio
         return CaptureAction::Cancel;
     }
     if vk == VK_RETURN.0 as u32 && !modifiers.control && !modifiers.alt && !modifiers.windows {
-        return CaptureAction::Submit;
+        return if modifiers.shift {
+            CaptureAction::LineBreak
+        } else {
+            CaptureAction::Submit
+        };
     }
     if vk == VK_BACK.0 as u32
         && typing
@@ -1289,11 +1305,12 @@ fn message_box(hwnd: HWND, text: &str, title: &str) {
 #[cfg(test)]
 mod tests {
     use super::{CaptureAction, KeyboardHookState, ModifierState, Win32Event, classify_key};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_BACK, VK_ESCAPE, VK_RETURN};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_BACK, VK_ESCAPE, VK_LSHIFT, VK_RETURN};
     use windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT;
 
     fn modifiers() -> ModifierState {
         ModifierState {
+            shift: false,
             control: false,
             alt: false,
             right_alt: false,
@@ -1360,6 +1377,17 @@ mod tests {
             CaptureAction::Submit
         );
         assert_eq!(
+            classify_key(
+                VK_RETURN.0 as u32,
+                ModifierState {
+                    shift: true,
+                    ..modifiers()
+                },
+                false,
+            ),
+            CaptureAction::LineBreak
+        );
+        assert_eq!(
             classify_key(VK_ESCAPE.0 as u32, modifiers(), false),
             CaptureAction::Cancel
         );
@@ -1389,6 +1417,37 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(Win32Event::SubmitRequested)
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shift_enter_auto_repeat_emits_only_one_line_break() {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut state = KeyboardHookState {
+            event_tx,
+            keyboard_state: [0; 256],
+            physical_down: [false; 256],
+            captured: [false; 256],
+            accepting: true,
+            typing: false,
+            dead_key_pending: false,
+        };
+        let shift = KBDLLHOOKSTRUCT {
+            vkCode: VK_LSHIFT.0 as u32,
+            ..Default::default()
+        };
+        let enter = KBDLLHOOKSTRUCT {
+            vkCode: VK_RETURN.0 as u32,
+            ..Default::default()
+        };
+        assert!(!unsafe { state.handle_key(&shift, true) });
+        assert!(unsafe { state.handle_key(&enter, true) });
+        assert!(unsafe { state.handle_key(&enter, true) });
+        assert!(unsafe { state.handle_key(&enter, false) });
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Win32Event::LineBreakRequested)
         ));
         assert!(event_rx.try_recv().is_err());
     }

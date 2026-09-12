@@ -16,6 +16,7 @@ const LONG_SILENCE_SECONDS: usize = 5;
 const GAP_EDGE_MILLISECONDS: usize = 250;
 const SPEECH_SEPARATOR_MILLISECONDS: usize = 500;
 const PASTE_MARKER: &str = "[pasted]";
+const LINE_BREAK_MARKER: char = '↵';
 
 /// Retains natural pauses exactly and compacts only proven five-second gaps.
 pub struct SilenceCompactor {
@@ -144,6 +145,7 @@ enum CompositionEntry {
 enum TypingAtom {
     Character(char),
     Paste(String),
+    LineBreak,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -166,6 +168,10 @@ impl TypingBuffer {
         }
     }
 
+    fn push_line_break(&mut self) {
+        self.atoms.push(TypingAtom::LineBreak);
+    }
+
     fn backspace(&mut self) -> bool {
         self.atoms.pop().is_some()
     }
@@ -180,6 +186,7 @@ impl TypingBuffer {
             match atom {
                 TypingAtom::Character(character) => actual.push(character),
                 TypingAtom::Paste(text) => actual.push_str(&text),
+                TypingAtom::LineBreak => actual.push('\n'),
             }
         }
         actual
@@ -204,6 +211,12 @@ impl TypingBuffer {
                         break;
                     }
                     reverse.extend(marker.into_iter().rev());
+                }
+                TypingAtom::LineBreak => {
+                    if reverse.len() == max_characters {
+                        break;
+                    }
+                    reverse.push(LINE_BREAK_MARKER);
                 }
             }
         }
@@ -261,6 +274,10 @@ impl CompositionSession {
         self.typing.push_paste(text);
     }
 
+    pub fn push_typed_line_break(&mut self) {
+        self.typing.push_line_break();
+    }
+
     pub fn backspace(&mut self) -> bool {
         self.typing.backspace()
     }
@@ -281,6 +298,12 @@ impl CompositionSession {
         self.entries.push(CompositionEntry::Insertion(text));
         self.insertion_count += 1;
         true
+    }
+
+    pub fn commit_line_break(&mut self) {
+        self.entries
+            .push(CompositionEntry::Insertion("\n".to_string()));
+        self.insertion_count += 1;
     }
 
     pub fn insertion_count(&self) -> usize {
@@ -602,6 +625,29 @@ mod tests {
         assert!(buffer.backspace());
         assert_eq!(buffer.preview_tail(64), "alpha ");
         assert_eq!(buffer.take_actual(), "alpha ");
+    }
+
+    #[test]
+    fn line_break_is_one_editable_typing_atom() {
+        let mut buffer = TypingBuffer::default();
+        buffer.push_text("alpha");
+        buffer.push_line_break();
+        assert_eq!(buffer.preview_tail(64), "alpha↵");
+        assert!(buffer.backspace());
+        assert_eq!(buffer.preview_tail(64), "alpha");
+        assert_eq!(buffer.take_actual(), "alpha");
+    }
+
+    #[test]
+    fn typed_and_listening_line_breaks_emit_exact_newlines() {
+        let mut session = CompositionSession::new(0, 100);
+        session.push_typed_text("alpha");
+        session.push_typed_line_break();
+        session.push_typed_text("beta");
+        assert!(session.commit_insertion());
+        session.commit_line_break();
+        assert_eq!(session.insertion_count(), 2);
+        assert_eq!(session.finish().assemble(None).unwrap(), "alpha\nbeta\n");
     }
 
     #[test]

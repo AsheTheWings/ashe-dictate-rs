@@ -11,6 +11,7 @@ pub const TOP_BAR_HEIGHT: f32 = 31.2;
 pub const TOP_BAR_TEXT_INSET: f32 = 12.0;
 pub const TOP_BAR_COUNT_WIDTH: f32 = 96.0;
 pub const TOP_BAR_CONTENT_GAP: f32 = 2.0;
+pub const TOP_BAR_ACCESSORY_WIDTH: f32 = 20.0;
 const BORDER_WIDTH: f32 = 2.0;
 const TOP_BAR_CORNER_RADIUS: f32 = 10.0;
 const TOP_BAR_SHOULDER_RADIUS: f32 = 10.0;
@@ -54,6 +55,7 @@ pub struct TopBarContent {
     pub count: String,
     pub content: String,
     pub alignment: TopBarAlignment,
+    pub accessory: Option<String>,
 }
 
 impl PillState {
