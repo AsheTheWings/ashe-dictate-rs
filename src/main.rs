@@ -7,6 +7,7 @@ mod fal_client;
 mod injector;
 mod llm_client;
 mod native_overlay;
+mod overlay_text;
 mod overlay_view;
 mod paste_upload;
 mod pill_renderer;
