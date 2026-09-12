@@ -44,9 +44,9 @@ pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -
         .context("failed to create HTTP client")?;
     let wav = encode_wav_mono16(&pcm, sample_rate);
     let audio_url = upload_wav(&client, &config.fal_api_key, wav).await?;
-    let request_id = submit_transcription(&client, &config, &audio_url).await?;
-    wait_completed(&client, &config, &request_id).await?;
-    let transcript = fetch_transcript(&client, &config, &request_id).await?;
+    let queued = submit_transcription(&client, &config, &audio_url).await?;
+    wait_completed(&client, &config.fal_api_key, &queued).await?;
+    let transcript = fetch_transcript(&client, &config.fal_api_key, &queued).await?;
     logger::info(format!("fal transcript chars={}", transcript.len()));
     Ok(transcript)
 }
@@ -96,12 +96,22 @@ async fn upload_wav(client: &reqwest::Client, api_key: &str, wav: Vec<u8>) -> Re
     Ok(file_url)
 }
 
-/// Queue the transcription and return the request id for polling.
+/// A queued request with the follow-up URLs the queue assigns it. The
+/// queue answers under its canonical app route, which can differ from
+/// the submitted model alias, so polling and fetching must use these
+/// URLs instead of rebuilding routes from the model id.
+struct QueuedRequest {
+    request_id: String,
+    status_url: String,
+    response_url: String,
+}
+
+/// Queue the transcription and return its follow-up URLs for polling.
 async fn submit_transcription(
     client: &reqwest::Client,
     config: &AppConfig,
     audio_url: &str,
-) -> Result<String> {
+) -> Result<QueuedRequest> {
     let url = format!("{QUEUE_BASE_URL}/{}", config.fal_stt_model.trim());
     let submit = client
         .post(url)
@@ -119,25 +129,24 @@ async fn submit_transcription(
         .json::<Value>()
         .await
         .context("fal queue submit returned invalid JSON")?;
-    let request_id = parse_submit_response(&submit)?;
-    logger::info(format!("fal transcription queued request_id={request_id}"));
-    Ok(request_id)
+    let queued = parse_submit_response(&submit)?;
+    logger::info(format!(
+        "fal transcription queued request_id={}",
+        queued.request_id
+    ));
+    Ok(queued)
 }
 
 /// Poll the request status until it completes or fails.
 async fn wait_completed(
     client: &reqwest::Client,
-    config: &AppConfig,
-    request_id: &str,
+    api_key: &str,
+    queued: &QueuedRequest,
 ) -> Result<()> {
-    let status_url = format!(
-        "{QUEUE_BASE_URL}/{}/requests/{request_id}/status",
-        config.fal_stt_model.trim()
-    );
     for _ in 1..=POLL_ATTEMPTS {
         let status = client
-            .get(&status_url)
-            .header("Authorization", auth_header(&config.fal_api_key))
+            .get(&queued.status_url)
+            .header("Authorization", auth_header(api_key))
             .send()
             .await
             .context("fal status request failed")?
@@ -152,28 +161,28 @@ async fn wait_completed(
         }
     }
     Err(anyhow!(
-        "fal transcription request {request_id} did not complete in time"
+        "fal transcription request {} did not complete in time",
+        queued.request_id
     ))
 }
 
 /// Fetch the completed output and read its transcript text.
 async fn fetch_transcript(
     client: &reqwest::Client,
-    config: &AppConfig,
-    request_id: &str,
+    api_key: &str,
+    queued: &QueuedRequest,
 ) -> Result<String> {
-    let result_url = format!(
-        "{QUEUE_BASE_URL}/{}/requests/{request_id}",
-        config.fal_stt_model.trim()
-    );
     let response = client
-        .get(&result_url)
-        .header("Authorization", auth_header(&config.fal_api_key))
+        .get(&queued.response_url)
+        .header("Authorization", auth_header(api_key))
         .send()
         .await
         .context("fal result request failed")?;
     if response.status() == reqwest::StatusCode::ACCEPTED {
-        return Err(anyhow!("fal result not ready for request {request_id}"));
+        return Err(anyhow!(
+            "fal result not ready for request {}",
+            queued.request_id
+        ));
     }
     let output = response
         .error_for_status()
@@ -232,12 +241,27 @@ fn parse_initiate_response(body: &Value) -> Result<(String, String)> {
     Ok((upload_url.to_string(), file_url.to_string()))
 }
 
-fn parse_submit_response(body: &Value) -> Result<String> {
-    body.get("request_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| anyhow!("fal queue submit response is missing request_id"))
+fn parse_submit_response(body: &Value) -> Result<QueuedRequest> {
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+    };
+    match (
+        field("request_id"),
+        field("status_url"),
+        field("response_url"),
+    ) {
+        (Some(request_id), Some(status_url), Some(response_url)) => Ok(QueuedRequest {
+            request_id,
+            status_url,
+            response_url,
+        }),
+        _ => Err(anyhow!(
+            "fal queue submit response is missing request_id, status_url, or response_url"
+        )),
+    }
 }
 
 enum QueueState {
@@ -354,12 +378,25 @@ mod tests {
     }
 
     #[test]
-    fn submit_response_yields_the_request_id() {
+    fn submit_response_yields_the_canonical_follow_up_urls() {
+        let queued = parse_submit_response(&json!({
+            "status": "IN_QUEUE",
+            "request_id": "abc",
+            "response_url": "https://queue.fal.run/fal-ai/elevenlabs/requests/abc",
+            "status_url": "https://queue.fal.run/fal-ai/elevenlabs/requests/abc/status",
+        }))
+        .unwrap();
+        assert_eq!(queued.request_id, "abc");
         assert_eq!(
-            parse_submit_response(&json!({"request_id": "abc", "status": "IN_QUEUE"})).unwrap(),
-            "abc"
+            queued.status_url,
+            "https://queue.fal.run/fal-ai/elevenlabs/requests/abc/status"
+        );
+        assert_eq!(
+            queued.response_url,
+            "https://queue.fal.run/fal-ai/elevenlabs/requests/abc"
         );
         assert!(parse_submit_response(&json!({})).is_err());
+        assert!(parse_submit_response(&json!({"request_id": "abc"})).is_err());
     }
 
     #[test]
