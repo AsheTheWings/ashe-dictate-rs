@@ -20,10 +20,10 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Ashe Worker";
-pub const WIDTH: f32 = 380.0;
+pub const WIDTH: f32 = 285.0;
 pub const HEIGHT: f32 = 64.0;
 const CORNER_RADIUS: u32 = 32;
-const BORDER_WIDTH: f32 = 1.5;
+const BORDER_WIDTH: f32 = 3.0;
 const _: () = assert!(HEIGHT <= 96.0, "dictate overlay stays pill height");
 const _: () = assert!(WIDTH <= 480.0, "dictate overlay stays compact");
 const _: () = assert!(
@@ -212,7 +212,9 @@ pub fn bar_specs(values: &[f32], area_width: f32, bar_count: usize) -> Vec<BarSp
         return Vec::new();
     }
     let pitch = area_width / bar_count as f32;
-    let width = (pitch * 0.55).clamp(2.0, 4.0);
+    // Thin lines for dense spectra: half the pitch, never below one device
+    // pixel so adjacent bars cannot bleed into each other.
+    let width = (pitch * 0.5).clamp(1.0, 4.0);
     let start = values.len().saturating_sub(bar_count);
     let window = &values[start..];
     let pad = bar_count.saturating_sub(window.len());
@@ -371,10 +373,10 @@ mod tests {
 
     #[test]
     fn pill_region_matches_the_pill_at_any_dpi() {
-        assert_eq!(super::pill_region_px(96), (380, 64, 64));
-        assert_eq!(super::pill_region_px(144), (570, 96, 96));
-        assert_eq!(super::pill_region_px(192), (760, 128, 128));
-        assert_eq!(super::pill_region_px(0), (380, 64, 64));
+        assert_eq!(super::pill_region_px(96), (285, 64, 64));
+        assert_eq!(super::pill_region_px(144), (428, 96, 96));
+        assert_eq!(super::pill_region_px(192), (570, 128, 128));
+        assert_eq!(super::pill_region_px(0), (285, 64, 64));
     }
 
     #[test]

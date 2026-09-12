@@ -13,7 +13,7 @@ use spectrum_analyzer::{FrequencyLimit, samples_fft_to_spectrum};
 /// fine enough to feed every log band with real data.
 pub const FFT_SIZE: usize = 4096;
 /// Frequency bars drawn by the pill canvas.
-pub const BAND_COUNT: usize = 64;
+pub const BAND_COUNT: usize = 128;
 /// Voice range feeding the bars.
 pub const FMIN: f32 = 80.0;
 /// Voice range feeding the bars.
