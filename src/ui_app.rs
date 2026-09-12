@@ -1079,15 +1079,6 @@ impl UiApp {
 
     fn sync_overlay(&self) {
         let position = self.position.unwrap_or(Point::new(120.0, 120.0));
-        let main_text = match self.state {
-            DictationState::Transcribing | DictationState::Inserting => {
-                Some("processing...".to_string())
-            }
-            DictationState::Typing | DictationState::Listening | DictationState::Starting => None,
-            DictationState::Idle
-            | DictationState::FixingGrammar
-            | DictationState::AnsweringQuestion => None,
-        };
         let top_bar = self.top_bar_content();
         self.send_win32(Win32Command::UpdateOverlay {
             x: position.x,
@@ -1099,7 +1090,7 @@ impl UiApp {
                 Vec::new()
             },
             state: self.pill_state(),
-            main_text,
+            main_text: None,
             top_bar,
         });
     }
@@ -1115,6 +1106,14 @@ impl UiApp {
             .unwrap_or_default();
         let (content, alignment) = if self.state == DictationState::Typing && !preview.is_empty() {
             (preview, pill_renderer::TopBarAlignment::Trailing)
+        } else if matches!(
+            self.state,
+            DictationState::Transcribing | DictationState::Inserting
+        ) {
+            (
+                "processing...".to_string(),
+                pill_renderer::TopBarAlignment::Center,
+            )
         } else if matches!(
             self.state,
             DictationState::Starting | DictationState::Listening
