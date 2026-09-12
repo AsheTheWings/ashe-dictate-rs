@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
-    VK_BACK, VK_ESCAPE, VK_RETURN,
+    VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -564,40 +564,16 @@ unsafe fn set_submit_hotkey(hwnd: HWND, state: &mut ServiceState, active: bool) 
 }
 
 unsafe fn set_transcript_edit_hotkeys(hwnd: HWND, state: &mut ServiceState, active: bool) {
-    if active == state.revert_sentence_hotkey_registered
-        && active == state.clear_transcript_hotkey_registered
-    {
-        return;
-    }
-    if active {
-        match RegisterHotKey(
-            Some(hwnd),
-            REVERT_SENTENCE_HOTKEY_ID,
-            MOD_NOREPEAT,
-            VK_BACK.0 as u32,
-        ) {
-            Ok(()) => state.revert_sentence_hotkey_registered = true,
-            Err(err) => logger::info(format!(
-                "Backspace revert hotkey registration failed: {err:#}"
-            )),
-        }
-        match RegisterHotKey(
-            Some(hwnd),
-            CLEAR_TRANSCRIPT_HOTKEY_ID,
-            MOD_SHIFT | MOD_NOREPEAT,
-            VK_BACK.0 as u32,
-        ) {
-            Ok(()) => state.clear_transcript_hotkey_registered = true,
-            Err(err) => logger::info(format!(
-                "Shift+Backspace clear hotkey registration failed: {err:#}"
-            )),
-        }
-    } else {
-        let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
-        let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
-        state.revert_sentence_hotkey_registered = false;
-        state.clear_transcript_hotkey_registered = false;
-    }
+    // Completion-mode dictation has no live transcript to edit while
+    // recording, so Backspace must never be hijacked from other apps.
+    // Keep both edit hotkeys unregistered; the event handlers stay as
+    // harmless no-ops.
+    let _ = active;
+    let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
+    let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
+    state.revert_sentence_hotkey_registered = false;
+    state.clear_transcript_hotkey_registered = false;
+    logger::info("Transcript edit hotkeys stay unregistered (completion mode)");
 }
 
 unsafe fn active_input_position() -> (i32, i32) {

@@ -1,7 +1,7 @@
 use crate::activity_pipeline::ActivityHandle;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
-use crate::deepgram_client::{DeepgramSession, TranscriptUpdate};
+use crate::deepgram_client::transcribe_pcm;
 use crate::injector;
 use crate::llm_client;
 use crate::logger;
@@ -11,13 +11,14 @@ use crate::win32_service::{self, Win32Command, Win32Event};
 use crossbeam_channel::{Receiver, Sender};
 use iced::{Element, Point, Subscription, Task, window};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = env!("ASHE_BUILD_ID");
 const OVERLAY_TICK_MS: u64 = 16;
 const OVERLAY_SMOOTHING: f32 = 0.28;
 const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
+const VISUALIZER_HISTORY_LEN: usize = 24;
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,7 +26,7 @@ enum DictationState {
     Idle,
     Starting,
     Listening,
-    Stopping,
+    Transcribing,
     Polishing,
     Inserting,
     FixingGrammar,
@@ -47,32 +48,11 @@ struct DictationSession {
     target_hwnd: isize,
     selected_context: Option<String>,
     raw_transcript: String,
-    interim_transcript: String,
 }
 
 impl DictationSession {
-    fn apply_transcript_update(&mut self, update: TranscriptUpdate) {
-        match update {
-            TranscriptUpdate::Interim(text) => self.interim_transcript = text,
-            TranscriptUpdate::Final(text) => {
-                append_transcript_segment(&mut self.raw_transcript, &text);
-                self.interim_transcript.clear();
-            }
-        }
-    }
-
     fn displayed_transcript(&self) -> String {
-        joined_transcript(&self.raw_transcript, &self.interim_transcript)
-    }
-
-    fn commit_interim(&mut self) -> bool {
-        if self.interim_transcript.trim().is_empty() {
-            self.interim_transcript.clear();
-            return false;
-        }
-        append_transcript_segment(&mut self.raw_transcript, &self.interim_transcript);
-        self.interim_transcript.clear();
-        true
+        self.raw_transcript.clone()
     }
 }
 
@@ -82,13 +62,14 @@ pub struct UiApp {
     win32_tx: Sender<Win32Command>,
     win32_rx: Receiver<Win32Event>,
     _win32_thread: JoinHandle<()>,
-    transcript_tx: Sender<TranscriptUpdate>,
-    transcript_rx: Receiver<TranscriptUpdate>,
-    status_tx: Sender<String>,
-    status_rx: Receiver<String>,
     audio: Option<AudioCapture>,
-    deepgram: Option<DeepgramSession>,
-    bridge_thread: Option<JoinHandle<()>>,
+    audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    recorded_pcm: Vec<u8>,
+    record_sample_rate: u32,
+    record_started: Option<Instant>,
+    record_elapsed_secs: u64,
+    audio_level: f32,
+    level_history: Vec<f32>,
     session: Option<DictationSession>,
     text_action: Option<TextAction>,
     window_id: Option<window::Id>,
@@ -110,6 +91,7 @@ pub enum Message {
     Tick,
     WindowReady(Option<window::Id>),
     WindowCloseRequested(window::Id),
+    TranscriptionCompleted(Result<String, String>),
     PolishCompleted(PolishResult),
     TextActionCompleted(PolishResult),
     PasteImageUploaded {
@@ -125,8 +107,6 @@ impl UiApp {
         let (event_tx, win32_rx) = crossbeam_channel::unbounded();
         let (win32_tx, command_rx) = crossbeam_channel::unbounded();
         let win32_thread = win32_service::spawn(event_tx, command_rx);
-        let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
-        let (status_tx, status_rx) = crossbeam_channel::unbounded();
         let activity = ActivityHandle::spawn(config.clone());
         let app = Self {
             config,
@@ -134,13 +114,14 @@ impl UiApp {
             win32_tx,
             win32_rx,
             _win32_thread: win32_thread,
-            transcript_tx,
-            transcript_rx,
-            status_tx,
-            status_rx,
             audio: None,
-            deepgram: None,
-            bridge_thread: None,
+            audio_rx: None,
+            recorded_pcm: Vec::new(),
+            record_sample_rate: 0,
+            record_started: None,
+            record_elapsed_secs: 0,
+            audio_level: 0.0,
+            level_history: Vec::new(),
             session: None,
             text_action: None,
             window_id: None,
@@ -184,6 +165,7 @@ impl UiApp {
                 Task::none()
             }
             Message::Tick => self.pump(),
+            Message::TranscriptionCompleted(result) => self.finish_transcription(result),
             Message::PolishCompleted(result) => self.finish_polishing(result),
             Message::TextActionCompleted(result) => self.finish_text_action(result),
             Message::PasteImageUploaded {
@@ -194,12 +176,20 @@ impl UiApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        overlay_view::view(
-            &self.status,
-            &self.transcript,
-            self.polished.as_deref(),
-            self.error.as_deref(),
-        )
+        let recording = matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        );
+        overlay_view::view(&overlay_view::DictateContent {
+            status: &self.status,
+            transcript: &self.transcript,
+            polished: self.polished.as_deref(),
+            error: self.error.as_deref(),
+            audio_level: self.audio_level,
+            level_history: &self.level_history,
+            recording,
+            elapsed_secs: self.record_elapsed_secs,
+        })
     }
 
     fn pump(&mut self) -> Task<Message> {
@@ -210,15 +200,9 @@ impl UiApp {
         while let Ok(event) = self.win32_rx.try_recv() {
             tasks.push(self.handle_win32_event(event));
         }
-        if self.pump_transcripts_and_statuses() {
-            tasks.push(overlay_view::scroll_transcript_to_end());
-        }
-        self.join_finished_threads();
+        self.pump_audio_capture();
         if self.visible && self.advance_overlay_position() {
             tasks.push(self.apply_window_state());
-        }
-        if self.state == DictationState::Stopping {
-            self.complete_stop_if_ready(&mut tasks);
         }
         let activity = self.activity.status();
         let activity_key = format!(
@@ -235,6 +219,44 @@ impl UiApp {
         Task::batch(tasks)
     }
 
+    /// Drain captured PCM into the recording buffer while updating the voice
+    /// visualizer level. Transcription happens once on stop, not streaming.
+    fn pump_audio_capture(&mut self) {
+        if !matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        ) {
+            return;
+        }
+        if let Some(started) = self.record_started {
+            self.record_elapsed_secs = started.elapsed().as_secs();
+        }
+        let mut peak: f32 = 0.0;
+        let mut drained = false;
+        if let Some(rx) = self.audio_rx.as_mut() {
+            while let Ok(chunk) = rx.try_recv() {
+                if chunk.is_empty() {
+                    continue;
+                }
+                drained = true;
+                peak = peak.max(chunk_peak(&chunk));
+                self.recorded_pcm.extend_from_slice(&chunk);
+            }
+        }
+        if drained {
+            self.audio_level = peak.max(self.audio_level * 0.55);
+        } else {
+            self.audio_level *= 0.90;
+            if self.audio_level < 0.001 {
+                self.audio_level = 0.0;
+            }
+        }
+        self.level_history.push(self.audio_level);
+        while self.level_history.len() > VISUALIZER_HISTORY_LEN {
+            self.level_history.remove(0);
+        }
+    }
+
     fn handle_win32_event(&mut self, event: Win32Event) -> Task<Message> {
         match event {
             Win32Event::ToggleRequested { target_hwnd, x, y } => {
@@ -248,7 +270,7 @@ impl UiApp {
                     self.state,
                     DictationState::Starting | DictationState::Listening
                 ) {
-                    self.request_stop();
+                    return self.request_stop();
                 }
                 Task::none()
             }
@@ -323,48 +345,14 @@ impl UiApp {
         }
     }
 
-    fn pump_transcripts_and_statuses(&mut self) -> bool {
-        let mut transcript_updated = false;
-        while let Ok(update) = self.transcript_rx.try_recv() {
-            if let Some(session) = self.session.as_mut() {
-                session.apply_transcript_update(update);
-                self.transcript = session.displayed_transcript();
-                self.polished = None;
-                self.error = None;
-                transcript_updated = true;
-            } else {
-                logger::info(format!("Transcript without active session: {update:?}"));
-            }
-        }
-        while let Ok(status) = self.status_rx.try_recv() {
-            logger::info(format!("Status: {status}"));
-            self.status = status.clone();
-            if !(self.state == DictationState::Stopping && status == "Idle") {
-                self.send_win32(Win32Command::SetTooltip(format!(
-                    "Ashe Worker - {status} - Win+Shift+H"
-                )));
-            }
-            if (status.starts_with("Listening") || status == "Speech detected")
-                && self.state == DictationState::Starting
-            {
-                self.state = DictationState::Listening;
-            }
-            if status.starts_with("Error:") {
-                self.request_stop();
-            }
-        }
-        transcript_updated
-    }
-
     fn toggle(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
         match self.state {
             DictationState::Idle => self.start(target_hwnd, position),
             DictationState::Starting | DictationState::Listening => {
-                self.request_stop();
-                Task::none()
+                self.request_stop()
             }
-            DictationState::Stopping => {
-                logger::info("Stop already in progress");
+            DictationState::Transcribing => {
+                logger::info("Transcription already in progress");
                 Task::none()
             }
             DictationState::Polishing | DictationState::Inserting => {
@@ -383,7 +371,15 @@ impl UiApp {
             return Task::none();
         }
         logger::info("Cancel operation requested");
-        self.stop_workers_for_cancel();
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop();
+        }
+        self.audio_rx.take();
+        self.recorded_pcm.clear();
+        self.record_started = None;
+        self.record_elapsed_secs = 0;
+        self.audio_level = 0.0;
+        self.level_history.clear();
         self.session = None;
         self.state = DictationState::Idle;
         self.visible = false;
@@ -413,7 +409,6 @@ impl UiApp {
         }
         logger::info("Reverted last transcript sentence");
         session.raw_transcript = updated;
-        session.interim_transcript.clear();
         self.transcript = session.displayed_transcript();
         self.polished = None;
         self.error = None;
@@ -433,12 +428,11 @@ impl UiApp {
         let Some(session) = self.session.as_mut() else {
             return Task::none();
         };
-        if session.raw_transcript.is_empty() && session.interim_transcript.is_empty() {
+        if session.raw_transcript.is_empty() {
             return Task::none();
         }
         logger::info("Cleared transcript buffer");
         session.raw_transcript.clear();
-        session.interim_transcript.clear();
         self.transcript.clear();
         self.polished = None;
         self.error = None;
@@ -471,13 +465,15 @@ impl UiApp {
             target_hwnd,
             selected_context,
             raw_transcript: String::new(),
-            interim_transcript: String::new(),
         });
         self.send_win32(Win32Command::SetActive(true));
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Starting... - Win+Shift+H".to_string(),
         ));
-        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        // Audio is buffered locally while recording. One pre-recorded
+        // transcription request runs on stop for a better result than
+        // committing streaming partials.
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let audio = match AudioCapture::start(audio_tx, self.config.output_sample_rate) {
             Ok(audio) => audio,
             Err(err) => {
@@ -490,80 +486,102 @@ impl UiApp {
                 return hide_task;
             }
         };
-        let deepgram = DeepgramSession::start(
-            self.config.clone(),
-            audio.sample_rate(),
-            self.transcript_tx.clone(),
-            self.status_tx.clone(),
-        );
+        self.record_sample_rate = audio.sample_rate();
+        self.recorded_pcm.clear();
+        self.audio_rx = Some(audio_rx);
+        self.record_started = Some(Instant::now());
+        self.record_elapsed_secs = 0;
+        self.audio_level = 0.0;
+        self.level_history.clear();
+        self.audio = Some(audio);
         self.state = DictationState::Listening;
         self.status = "Listening...".to_string();
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Listening... - Win+Shift+H".to_string(),
         ));
-        let dg_audio = deepgram.audio_sender();
-        self.bridge_thread = Some(std::thread::spawn(move || {
-            while let Some(chunk) = audio_rx.blocking_recv() {
-                if dg_audio.send(chunk).is_err() {
-                    logger::info("Deepgram audio channel closed");
-                    break;
-                }
-            }
-            logger::info("Audio bridge thread exited");
-        }));
-        self.audio = Some(audio);
-        self.deepgram = Some(deepgram);
         self.apply_window_state()
     }
 
-    fn request_stop(&mut self) {
+    fn request_stop(&mut self) -> Task<Message> {
         if matches!(
             self.state,
             DictationState::Idle
+                | DictationState::Transcribing
                 | DictationState::Polishing
                 | DictationState::Inserting
                 | DictationState::FixingGrammar
                 | DictationState::AnsweringQuestion
         ) {
-            return;
+            return Task::none();
         }
-        logger::info("Stop dictation requested");
-        self.state = DictationState::Stopping;
-        self.status = "Finalizing transcript...".to_string();
-        self.send_win32(Win32Command::SetTooltip(
-            "Ashe Worker - Stopping... - Win+Shift+H".to_string(),
+        logger::info(format!(
+            "Stop dictation requested bytes={}",
+            self.recorded_pcm.len()
         ));
+        // Drain anything captured between the last tick and the mic stop so
+        // the tail of the utterance is not lost.
+        if let Some(rx) = self.audio_rx.as_mut() {
+            while let Ok(chunk) = rx.try_recv() {
+                if !chunk.is_empty() {
+                    self.recorded_pcm.extend_from_slice(&chunk);
+                }
+            }
+        }
+        self.audio_rx.take();
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
+        self.state = DictationState::Transcribing;
+        self.status = "Transcribing...".to_string();
+        self.send_win32(Win32Command::SetTooltip(
+            "Ashe Worker - Transcribing... - Win+Shift+H".to_string(),
+        ));
+        self.audio_level = 0.0;
+        let pcm = std::mem::take(&mut self.recorded_pcm);
+        let sample_rate = self.record_sample_rate;
+        let config = self.config.clone();
+        Task::perform(
+            async move {
+                transcribe_pcm(config, sample_rate, pcm)
+                    .await
+                    .map_err(|err| format!("{err:#}"))
+            },
+            Message::TranscriptionCompleted,
+        )
     }
 
-    fn complete_stop_if_ready(&mut self, tasks: &mut Vec<Task<Message>>) {
-        if self.bridge_thread.is_none()
-            && let Some(deepgram) = self.deepgram.as_mut()
-        {
-            deepgram.request_stop();
+    fn finish_transcription(&mut self, result: Result<String, String>) -> Task<Message> {
+        if self.state != DictationState::Transcribing {
+            return Task::none();
         }
-        let deepgram_done = self
-            .deepgram
-            .as_mut()
-            .is_none_or(DeepgramSession::join_if_finished);
-        if deepgram_done {
-            self.deepgram.take();
-        }
-        if self.bridge_thread.is_none() && deepgram_done {
-            if self.pump_transcripts_and_statuses() {
-                tasks.push(overlay_view::scroll_transcript_to_end());
+        match result {
+            Ok(text) => {
+                let transcript = text.trim().to_string();
+                if transcript.is_empty() {
+                    logger::info("Transcription returned no speech");
+                    return self.finish_without_transcript();
+                }
+                logger::info(format!(
+                    "Transcription completed chars={}",
+                    transcript.len()
+                ));
+                if let Some(session) = self.session.as_mut() {
+                    session.raw_transcript = transcript.clone();
+                }
+                self.transcript = transcript;
+                self.polished = None;
+                self.error = None;
+                self.begin_polishing()
             }
-            if self
-                .session
-                .as_mut()
-                .is_some_and(DictationSession::commit_interim)
-            {
-                logger::info("Committed the latest interim transcript after finalization");
+            Err(err) => {
+                logger::info(format!("Transcription failed: {err}"));
+                self.error = Some("Transcription failed".to_string());
+                self.status = "Transcription failed".to_string();
+                self.send_win32(Win32Command::SetTooltip(
+                    "Ashe Worker - Transcription error - Win+Shift+H".to_string(),
+                ));
+                self.hide_overlay_after_session()
             }
-            logger::info("Dictation stopped cleanly");
-            tasks.push(self.begin_polishing());
         }
     }
 
@@ -875,7 +893,10 @@ impl UiApp {
     fn quit(&mut self) -> Task<Message> {
         logger::info("Quit requested");
         self.activity.shutdown();
-        self.request_stop();
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop();
+        }
+        self.audio_rx.take();
         self.send_win32(Win32Command::Shutdown);
         if let Some(id) = self.window_id {
             window::close(id)
@@ -884,38 +905,16 @@ impl UiApp {
         }
     }
 
-    fn join_finished_threads(&mut self) {
-        if self
-            .bridge_thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-            && let Some(thread) = self.bridge_thread.take()
-        {
-            match thread.join() {
-                Ok(()) => logger::info("Audio bridge thread joined"),
-                Err(_) => logger::info("Audio bridge thread panicked"),
-            }
-        }
-    }
-
     fn hide_overlay_after_session(&mut self) -> Task<Message> {
         self.session = None;
         self.text_action = None;
         self.state = DictationState::Idle;
         self.visible = false;
+        self.record_started = None;
         self.target_position = self.position;
         self.send_win32(Win32Command::SetActive(false));
         self.send_win32(Win32Command::SetFollowCursor(false));
         self.apply_window_state()
-    }
-
-    fn stop_workers_for_cancel(&mut self) {
-        if let Some(mut audio) = self.audio.take() {
-            audio.stop();
-        }
-        if let Some(mut deepgram) = self.deepgram.take() {
-            deepgram.request_stop();
-        }
     }
 
     fn advance_overlay_position(&mut self) -> bool {
@@ -982,72 +981,58 @@ fn remove_last_sentence(text: &str) -> String {
     String::new()
 }
 
-fn append_transcript_segment(transcript: &mut String, segment: &str) {
-    let segment = segment.trim();
-    if segment.is_empty() {
-        return;
+/// Peak normalized amplitude (0.0..=1.0) of a little-endian mono 16-bit PCM
+/// chunk. Feeds the overlay voice visualizer while recording.
+fn chunk_peak(chunk: &[u8]) -> f32 {
+    let (pairs, _) = chunk.as_chunks::<2>();
+    let mut peak: f32 = 0.0;
+    for pair in pairs {
+        let value = i16::from_le_bytes(*pair) as f32 / 32768.0;
+        peak = peak.max(value.abs());
     }
-    if !transcript.is_empty() && !transcript.ends_with(char::is_whitespace) {
-        transcript.push(' ');
-    }
-    transcript.push_str(segment);
-}
-
-fn joined_transcript(finalized: &str, interim: &str) -> String {
-    let mut transcript = finalized.trim().to_string();
-    append_transcript_segment(&mut transcript, interim);
-    transcript
+    peak.clamp(0.0, 1.0)
 }
 
 impl Drop for UiApp {
     fn drop(&mut self) {
-        self.request_stop();
+        if let Some(mut audio) = self.audio.take() {
+            audio.stop();
+        }
         let _ = self.win32_tx.send(Win32Command::Shutdown);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DictationSession, TranscriptUpdate};
+    use super::{DictationSession, chunk_peak};
 
     fn session() -> DictationSession {
         DictationSession {
             target_hwnd: 0,
             selected_context: None,
             raw_transcript: String::new(),
-            interim_transcript: String::new(),
         }
     }
 
     #[test]
-    fn interim_transcripts_replace_the_visible_hypothesis() {
+    fn completed_transcript_is_shown_verbatim() {
         let mut session = session();
-        session.apply_transcript_update(TranscriptUpdate::Interim("hello word".to_string()));
-        session.apply_transcript_update(TranscriptUpdate::Interim("Hello world.".to_string()));
-
+        session.raw_transcript = "Hello world.".to_string();
         assert_eq!(session.displayed_transcript(), "Hello world.");
-        assert!(session.raw_transcript.is_empty());
     }
 
     #[test]
-    fn final_transcripts_commit_before_the_next_interim() {
-        let mut session = session();
-        session.apply_transcript_update(TranscriptUpdate::Interim("hello word".to_string()));
-        session.apply_transcript_update(TranscriptUpdate::Final("Hello world.".to_string()));
-        session.apply_transcript_update(TranscriptUpdate::Interim("how are".to_string()));
-
-        assert_eq!(session.raw_transcript, "Hello world.");
-        assert_eq!(session.displayed_transcript(), "Hello world. how are");
+    fn chunk_peak_measures_silence_and_full_scale() {
+        assert_eq!(chunk_peak(&[0, 0, 0, 0]), 0.0);
+        assert_eq!(chunk_peak(&[]), 0.0);
+        let full_scale = chunk_peak(&[0xFF, 0x7F]);
+        assert!(full_scale > 0.99 && full_scale <= 1.0);
+        assert_eq!(chunk_peak(&[0x00, 0x80]), 1.0);
     }
 
     #[test]
-    fn latest_interim_is_retained_when_finalization_has_no_final_result() {
-        let mut session = session();
-        session.apply_transcript_update(TranscriptUpdate::Final("Keep this.".to_string()));
-        session.apply_transcript_update(TranscriptUpdate::Interim("And this tail".to_string()));
-
-        assert!(session.commit_interim());
-        assert_eq!(session.raw_transcript, "Keep this. And this tail");
-        assert!(session.interim_transcript.is_empty());
+    fn chunk_peak_ignores_a_trailing_odd_byte() {
+        assert_eq!(chunk_peak(&[0xFF]), 0.0);
+        assert_eq!(chunk_peak(&[0, 0, 0xFF]), 0.0);
     }
 }

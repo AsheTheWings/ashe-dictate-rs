@@ -1,355 +1,180 @@
 use crate::config::AppConfig;
 use crate::logger;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use deepgram::Deepgram;
-use deepgram::common::options::{Encoding, Endpointing, Options};
-use deepgram::common::stream_response::StreamResponse;
-use std::any::Any;
-use std::panic::{self, AssertUnwindSafe};
-use std::thread::JoinHandle;
-use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use deepgram::common::audio_source::AudioSource;
+use deepgram::common::batch_response::Response;
+use deepgram::common::options::Options;
 
-const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptUpdate {
-    Interim(String),
-    Final(String),
-}
-
-pub struct DeepgramSession {
-    audio_tx: UnboundedSender<Vec<u8>>,
-    stop_tx: UnboundedSender<()>,
-    thread: Option<JoinHandle<()>>,
-    stop_requested: bool,
-}
-
-impl DeepgramSession {
-    pub fn start(
-        config: AppConfig,
-        sample_rate: u32,
-        transcript_tx: crossbeam_channel::Sender<TranscriptUpdate>,
-        status_tx: crossbeam_channel::Sender<String>,
-    ) -> Self {
-        let (audio_tx, audio_rx) = unbounded_channel();
-        let (stop_tx, stop_rx) = unbounded_channel();
-        let thread = std::thread::spawn(move || {
-            let panic_status_tx = status_tx.clone();
-            let result = panic::catch_unwind(AssertUnwindSafe(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
-                        logger::info(format!("Tokio runtime creation failed: {err:#}"));
-                        let _ = status_tx.send(format!("Error: Tokio runtime failed: {err}"));
-                        return;
-                    }
-                };
-
-                runtime.block_on(async move {
-                    if let Err(err) = run(
-                        config,
-                        sample_rate,
-                        audio_rx,
-                        stop_rx,
-                        transcript_tx,
-                        status_tx.clone(),
-                    )
-                    .await
-                    {
-                        logger::info(format!("Deepgram error: {err:#}"));
-                        let _ = status_tx.send(format!("Error: Deepgram: {err}"));
-                    }
-                });
-            }));
-            if let Err(payload) = result {
-                let message = panic_payload_message(payload.as_ref());
-                logger::info(format!("Deepgram worker panic: {message}"));
-                let _ = panic_status_tx.send(format!("Error: Deepgram worker panic: {message}"));
-            }
-        });
-
-        Self {
-            audio_tx,
-            stop_tx,
-            thread: Some(thread),
-            stop_requested: false,
-        }
-    }
-
-    pub fn audio_sender(&self) -> UnboundedSender<Vec<u8>> {
-        self.audio_tx.clone()
-    }
-
-    pub fn request_stop(&mut self) {
-        if !self.stop_requested {
-            self.stop_requested = true;
-            let _ = self.stop_tx.send(());
-            logger::info("Deepgram stop signal sent");
-        }
-    }
-
-    pub fn join_if_finished(&mut self) -> bool {
-        let Some(thread) = self.thread.as_ref() else {
-            return true;
-        };
-        if !thread.is_finished() {
-            return false;
-        }
-        if let Some(thread) = self.thread.take() {
-            match thread.join() {
-                Ok(()) => logger::info("Deepgram worker joined"),
-                Err(payload) => {
-                    logger::info(format!(
-                        "Deepgram worker panicked: {}",
-                        panic_payload_message(payload.as_ref())
-                    ));
-                }
-            }
-        }
-        true
-    }
-}
-
-impl Drop for DeepgramSession {
-    fn drop(&mut self) {
-        self.request_stop();
-        if self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-        {
-            let _ = self.join_if_finished();
-        }
-    }
-}
-
-async fn run(
+/// Transcribe a complete recording with one pre-recorded request.
+///
+/// Dictation buffers microphone audio locally while recording and calls this
+/// once on stop. A single full-utterance request produces a more accurate
+/// result than committing streaming partials as they arrive.
+pub async fn transcribe_pcm(
     config: AppConfig,
     sample_rate: u32,
-    mut audio_rx: UnboundedReceiver<Vec<u8>>,
-    mut stop_rx: UnboundedReceiver<()>,
-    transcript_tx: crossbeam_channel::Sender<TranscriptUpdate>,
-    status_tx: crossbeam_channel::Sender<String>,
-) -> Result<()> {
+    pcm: Vec<u8>,
+) -> Result<String> {
+    if pcm.is_empty() {
+        return Err(anyhow!("no audio captured"));
+    }
+    if !pcm.len().is_multiple_of(2) {
+        return Err(anyhow!("captured PCM has an odd byte count"));
+    }
+    if sample_rate == 0 {
+        return Err(anyhow!("capture sample rate must be greater than zero"));
+    }
+    let seconds = pcm.len() as f64 / f64::from(sample_rate) / 2.0;
     logger::info(format!(
-        "Deepgram connecting model={} language={} sample_rate={} keyterms={}",
+        "Deepgram pre-recorded request model={} language={} sample_rate={} bytes={} seconds={:.1} keyterms={}",
         config.deepgram_model,
         config.deepgram_language,
         sample_rate,
+        pcm.len(),
+        seconds,
         config.deepgram_keyterms.len()
     ));
-    let dg = Deepgram::new(config.deepgram_api_key.clone())
-        .context("failed to create Deepgram client")?;
-    let options = Options::builder()
+    let dg =
+        Deepgram::new(config.deepgram_api_key.clone()).context("failed to create Deepgram client")?;
+    let options: Options = Options::builder()
         .query_params(config.deepgram_query_params())
+        .punctuate(true)
         .build();
-    let mut handle = dg
+    let wav = encode_wav_mono16(&pcm, sample_rate);
+    let source = AudioSource::from_buffer_with_mime_type(wav, "audio/wav");
+    let response = dg
         .transcription()
-        .stream_request_with_options(options)
-        .encoding(Encoding::Linear16)
-        .sample_rate(sample_rate)
-        .channels(1)
-        .endpointing(Endpointing::CustomDurationMs(300))
-        .interim_results(true)
-        .keep_alive()
-        .handle()
+        .prerecorded(source, &options)
         .await
-        .context("failed to open Deepgram streaming handle")?;
-
+        .context("Deepgram pre-recorded transcription failed")?;
+    let transcript = extract_transcript(&response);
     logger::info(format!(
-        "Deepgram connected request_id={}",
-        handle.request_id()
+        "Deepgram pre-recorded transcript chars={}",
+        transcript.len()
     ));
-    let _ = status_tx.send("Listening...".to_string());
-    let mut sent_chunks: usize = 0;
-    let mut finalization_deadline = None;
-
-    loop {
-        if finalization_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            logger::info("Deepgram finalization timed out");
-            break;
-        }
-        let stop_requested = finalization_deadline.is_none() && stop_rx.try_recv().is_ok();
-        if stop_requested {
-            logger::info("Deepgram stop requested");
-            while let Ok(chunk) = audio_rx.try_recv() {
-                if chunk.is_empty() {
-                    continue;
-                }
-                handle
-                    .send_data(chunk)
-                    .await
-                    .context("failed to send final audio chunk to Deepgram")?;
-                sent_chunks += 1;
-            }
-            if let Err(err) = handle.finalize().await {
-                logger::info(format!("Deepgram finalize failed: {err:#}"));
-            }
-            if let Err(err) = handle.close_stream().await {
-                logger::info(format!("Deepgram close failed: {err:#}"));
-            }
-            finalization_deadline = Some(tokio::time::Instant::now() + FINALIZATION_TIMEOUT);
-        }
-
-        if finalization_deadline.is_none() {
-            for _ in 0..32 {
-                let Ok(chunk) = audio_rx.try_recv() else {
-                    break;
-                };
-                if chunk.is_empty() {
-                    continue;
-                }
-                handle
-                    .send_data(chunk)
-                    .await
-                    .context("failed to send audio chunk to Deepgram")?;
-                sent_chunks += 1;
-                if sent_chunks == 1 || sent_chunks.is_multiple_of(100) {
-                    logger::info(format!("Deepgram chunks sent={sent_chunks}"));
-                }
-            }
-        }
-
-        let receive_timeout = if finalization_deadline.is_some() {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_millis(15)
-        };
-        match tokio::time::timeout(receive_timeout, handle.receive()).await {
-            Ok(Some(Ok(response))) => {
-                if handle_response(response, &transcript_tx, &status_tx) {
-                    break;
-                }
-            }
-            Ok(Some(Err(err))) => logger::info(format!("Deepgram receive error: {err:#}")),
-            Ok(None) => {
-                logger::info("Deepgram stream ended by remote");
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
-        }
-    }
-
-    let _ = status_tx.send("Idle".to_string());
-    logger::info(format!("Deepgram run loop ended chunks_sent={sent_chunks}"));
-    Ok(())
+    Ok(transcript)
 }
 
-fn handle_response(
-    response: StreamResponse,
-    transcript_tx: &crossbeam_channel::Sender<TranscriptUpdate>,
-    status_tx: &crossbeam_channel::Sender<String>,
-) -> bool {
-    match response {
-        StreamResponse::TranscriptResponse {
-            is_final, channel, ..
-        } => {
-            let Some(alt) = channel.alternatives.first() else {
-                return false;
-            };
-            let text = alt.transcript.trim().to_string();
-            if is_final {
-                logger::info(format!("Final transcript: {text}"));
-                let _ = transcript_tx.send(TranscriptUpdate::Final(text));
-            } else {
-                let _ = transcript_tx.send(TranscriptUpdate::Interim(text));
-            }
-            false
-        }
-        StreamResponse::SpeechStartedResponse { .. } => {
-            let _ = status_tx.send("Speech detected".to_string());
-            false
-        }
-        StreamResponse::UtteranceEndResponse { .. } => {
-            let _ = status_tx.send("Listening...".to_string());
-            false
-        }
-        StreamResponse::TerminalResponse { .. } => {
-            logger::info("Deepgram terminal response received");
-            true
-        }
-        _ => false,
-    }
+/// Wrap little-endian mono 16-bit PCM in a 44-byte WAV header so the
+/// pre-recorded endpoint decodes the buffered capture without extra
+/// encoding parameters.
+pub fn encode_wav_mono16(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36u32.wrapping_add(data_len)).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate.wrapping_mul(2)).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
 }
-fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_string()
+
+/// Read the top transcript alternative from a pre-recorded response.
+pub fn extract_transcript(response: &Response) -> String {
+    response
+        .results
+        .channels
+        .first()
+        .and_then(|channel| channel.alternatives.first())
+        .map(|alternative| alternative.transcript.trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptUpdate, handle_response};
-    use deepgram::common::stream_response::{
-        Alternatives, Channel, Metadata, ModelInfo, StreamResponse,
-    };
+    use super::{encode_wav_mono16, extract_transcript};
+    use deepgram::common::batch_response::Response;
 
-    fn transcript_response(is_final: bool, speech_final: bool, text: &str) -> StreamResponse {
-        StreamResponse::TranscriptResponse {
-            type_field: "Results".to_string(),
-            start: 0.0,
-            duration: 1.0,
-            is_final,
-            speech_final,
-            from_finalize: false,
-            channel: Channel {
-                alternatives: vec![Alternatives {
-                    transcript: text.to_string(),
-                    words: Vec::new(),
-                    confidence: 0.9,
-                    languages: Vec::new(),
-                }],
+    #[test]
+    fn wav_header_describes_mono16_capture() {
+        let pcm = vec![0x01, 0x02, 0x03, 0x04];
+        let wav = encode_wav_mono16(&pcm, 48_000);
+        assert_eq!(wav.len(), 48);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 48_000);
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+            4
+        );
+        assert_eq!(&wav[44..], &pcm[..]);
+    }
+
+    #[test]
+    fn empty_pcm_still_produces_a_valid_header() {
+        let wav = encode_wav_mono16(&[], 16_000);
+        assert_eq!(wav.len(), 44);
+        assert_eq!(
+            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+            0
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_trims_the_top_alternative() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "request_id": "00000000-0000-0000-0000-000000000000",
+                "transaction_key": "test",
+                "sha256": "test",
+                "created": "2026-09-12T00:00:00.000Z",
+                "duration": 1.0,
+                "channels": 1
             },
-            metadata: Metadata {
-                request_id: "request".to_string(),
-                model_info: ModelInfo {
-                    name: "nova-3".to_string(),
-                    version: "test".to_string(),
-                    arch: "test".to_string(),
+            "results": {
+                "channels": [{
+                    "search": null,
+                    "detected_language": null,
+                    "alternatives": [{
+                        "transcript": "  Hello world.  ",
+                        "confidence": 0.9,
+                        "words": []
+                    }]
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(extract_transcript(&response), "Hello world.");
+    }
+
+    #[test]
+    fn transcript_extraction_defaults_to_empty_without_alternatives() {
+        for channels in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "search": null,
+                "detected_language": null,
+                "alternatives": []
+            }]),
+        ] {
+            let response: Response = serde_json::from_value(serde_json::json!({
+                "metadata": {
+                    "request_id": "00000000-0000-0000-0000-000000000000",
+                    "transaction_key": "test",
+                    "sha256": "test",
+                    "created": "2026-09-12T00:00:00.000Z",
+                    "duration": 0.0,
+                    "channels": 0
                 },
-                model_uuid: "model".to_string(),
-            },
-            channel_index: vec![0, 1],
+                "results": { "channels": channels }
+            }))
+            .unwrap();
+            assert!(extract_transcript(&response).is_empty());
         }
-    }
-
-    #[test]
-    fn provisional_nova_results_are_forwarded_as_replacements() {
-        let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
-        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
-
-        assert!(!handle_response(
-            transcript_response(false, true, "hello word"),
-            &transcript_tx,
-            &status_tx,
-        ));
-        assert_eq!(
-            transcript_rx.try_recv().unwrap(),
-            TranscriptUpdate::Interim("hello word".to_string())
-        );
-    }
-
-    #[test]
-    fn stable_nova_results_are_forwarded_as_final_segments() {
-        let (transcript_tx, transcript_rx) = crossbeam_channel::unbounded();
-        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
-
-        assert!(!handle_response(
-            transcript_response(true, true, "Hello world."),
-            &transcript_tx,
-            &status_tx,
-        ));
-        assert_eq!(
-            transcript_rx.try_recv().unwrap(),
-            TranscriptUpdate::Final("Hello world.".to_string())
-        );
     }
 }

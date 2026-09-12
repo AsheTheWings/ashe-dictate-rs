@@ -39,9 +39,10 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Win+Shift+Q` | Ask a question using selected text |
 | `Ctrl+Alt+V` | Upload a clipboard image and paste its remote path |
 
-During dictation, Nova-3 continuously revises the provisional text as more speech arrives. Use
-`Enter` to finish, `Esc` to cancel, `Backspace` to remove the latest sentence, or
-`Shift+Backspace` to clear the transcript.
+During dictation, microphone audio is buffered locally while a voice visualizer
+in the pill overlay shows the input level. Transcription runs once when you
+stop, as a single full-utterance request for a better result than streaming
+partials. Use `Enter` to finish and transcribe, or `Esc` to cancel.
 
 ## Activity records
 
