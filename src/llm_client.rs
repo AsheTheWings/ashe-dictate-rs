@@ -4,33 +4,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use serde_json::{Value, json};
 
-const SYSTEM_PROMPT: &str = "Rewrite dictated speech into clear text as fast as possible. Do not reason. Do not explain. Correct grammar, punctuation, casing, and formatting. Remove filler words, false starts, repeated phrases, and disfluencies. Preserve intent and meaning. Do not add facts. Return only the final rewritten text.";
-
-/// Polish a dictated transcript through the tera gateway's Open Responses API.
-///
-/// The prompt and the target text are sent together as a single `role: "user"` message,
-/// with the dictated text (and any selected context) wrapped in XML-style tags to focus
-/// the model's attention. The assistant `output_text` is read back out.
-pub async fn polish_transcript(
-    config: AppConfig,
-    transcript: String,
-    context: Option<String>,
-) -> Result<String> {
-    let transcript = transcript.trim();
-    if transcript.is_empty() {
-        return Ok(String::new());
-    }
-    config.validate_for_dictation()?;
-
-    request_response(
-        &config,
-        &config.dictation_polish_model,
-        polish_prompt(transcript, context.as_deref()),
-        config.llm_temperature,
-    )
-    .await
-}
-
 const GRAMMAR_PROMPT: &str = "Fix grammar, spelling, punctuation, and casing in the user's text. Preserve the original meaning, tone, intent, and language. Do not add or remove information. Do not explain. Return only the corrected text.";
 const QUESTION_PROMPT: &str = "You are a helpful assistant. Answer the user's question directly and concisely. Do not restate the question. Reply in the same language as the question. Return only the answer.";
 const QUESTION_TEMPERATURE: f32 = 0.7;
@@ -314,17 +287,6 @@ fn extract_output_text(payload: &Value) -> String {
         }
     }
     out
-}
-
-fn polish_prompt(transcript: &str, context: Option<&str>) -> String {
-    match context.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(context) => format!(
-            "{SYSTEM_PROMPT}\n\nUse the selected context only for terminology, style, and local reference. Rewrite only the dictated text. Do not include the selected context unless the dictated text explicitly asks for it.\n\n{}\n\n{}",
-            tagged("context", context),
-            tagged("dictation", transcript),
-        ),
-        None => format!("{SYSTEM_PROMPT}\n\n{}", tagged("dictation", transcript)),
-    }
 }
 
 /// Wrap `body` in XML-style tags to delimit the target text from the prompt and focus

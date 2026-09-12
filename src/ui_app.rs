@@ -27,7 +27,6 @@ enum DictationState {
     Starting,
     Listening,
     Transcribing,
-    Polishing,
     Inserting,
     FixingGrammar,
     AnsweringQuestion,
@@ -46,7 +45,6 @@ struct TextAction {
 
 struct DictationSession {
     target_hwnd: isize,
-    selected_context: Option<String>,
     raw_transcript: String,
 }
 
@@ -67,7 +65,6 @@ pub struct UiApp {
     recorded_pcm: Vec<u8>,
     record_sample_rate: u32,
     spectrum: SpectrumAnalyzer,
-    anim_frame: u64,
     session: Option<DictationSession>,
     text_action: Option<TextAction>,
     window_id: Option<window::Id>,
@@ -90,7 +87,6 @@ pub enum Message {
     WindowReady(Option<window::Id>),
     WindowCloseRequested(window::Id),
     TranscriptionCompleted(Result<String, String>),
-    PolishCompleted(PolishResult),
     TextActionCompleted(PolishResult),
     PasteImageUploaded {
         target_hwnd: isize,
@@ -118,7 +114,6 @@ impl UiApp {
             recorded_pcm: Vec::new(),
             record_sample_rate: 0,
             spectrum: SpectrumAnalyzer::new(output_sample_rate),
-            anim_frame: 0,
             session: None,
             text_action: None,
             window_id: None,
@@ -163,7 +158,6 @@ impl UiApp {
             }
             Message::Tick => self.pump(),
             Message::TranscriptionCompleted(result) => self.finish_transcription(result),
-            Message::PolishCompleted(result) => self.finish_polishing(result),
             Message::TextActionCompleted(result) => self.finish_text_action(result),
             Message::PasteImageUploaded {
                 target_hwnd,
@@ -182,9 +176,9 @@ impl UiApp {
                 DictationState::Starting | DictationState::Listening => {
                     overlay_view::PillState::Listening
                 }
-                DictationState::Transcribing
-                | DictationState::Polishing
-                | DictationState::Inserting => overlay_view::PillState::Working,
+                DictationState::Transcribing | DictationState::Inserting => {
+                    overlay_view::PillState::Working
+                }
                 DictationState::Idle
                 | DictationState::FixingGrammar
                 | DictationState::AnsweringQuestion => overlay_view::PillState::Idle,
@@ -193,7 +187,6 @@ impl UiApp {
         overlay_view::view(overlay_view::PillContent {
             bars: self.spectrum.bars(),
             state,
-            frame: self.anim_frame,
         })
     }
 
@@ -206,9 +199,6 @@ impl UiApp {
             tasks.push(self.handle_win32_event(event));
         }
         self.pump_audio_capture();
-        if self.visible {
-            self.anim_frame = self.anim_frame.wrapping_add(1);
-        }
         if self.visible && self.advance_overlay_position() {
             tasks.push(self.apply_window_state());
         }
@@ -344,8 +334,8 @@ impl UiApp {
                 logger::info("Transcription already in progress");
                 Task::none()
             }
-            DictationState::Polishing | DictationState::Inserting => {
-                logger::info("Polishing/inserting already in progress");
+            DictationState::Inserting => {
+                logger::info("Insert already in progress");
                 Task::none()
             }
             DictationState::FixingGrammar | DictationState::AnsweringQuestion => {
@@ -446,10 +436,8 @@ impl UiApp {
         self.transcript.clear();
         self.polished = None;
         self.error = None;
-        let selected_context = self.capture_selected_context(target_hwnd);
         self.session = Some(DictationSession {
             target_hwnd,
-            selected_context,
             raw_transcript: String::new(),
         });
         self.send_win32(Win32Command::SetActive(true));
@@ -490,7 +478,6 @@ impl UiApp {
             self.state,
             DictationState::Idle
                 | DictationState::Transcribing
-                | DictationState::Polishing
                 | DictationState::Inserting
                 | DictationState::FixingGrammar
                 | DictationState::AnsweringQuestion
@@ -553,7 +540,7 @@ impl UiApp {
                 self.transcript = transcript;
                 self.polished = None;
                 self.error = None;
-                self.begin_polishing()
+                self.insert_raw_transcript()
             }
             Err(err) => {
                 logger::info(format!("Transcription failed: {err}"));
@@ -567,58 +554,22 @@ impl UiApp {
         }
     }
 
-    fn begin_polishing(&mut self) -> Task<Message> {
-        let Some(session) = self.session.as_ref() else {
-            return self.finish_without_transcript();
+    /// Insert the transcribed text verbatim, without LLM polishing.
+    fn insert_raw_transcript(&mut self) -> Task<Message> {
+        let (target_hwnd, text) = match self.session.as_ref() {
+            Some(session) => (
+                session.target_hwnd,
+                session.displayed_transcript().trim().to_string(),
+            ),
+            None => return self.finish_without_transcript(),
         };
-        let raw = session.raw_transcript.trim().to_string();
-        if raw.is_empty() {
-            logger::info("No transcript captured");
+        if text.is_empty() {
             return self.finish_without_transcript();
         }
-        self.state = DictationState::Polishing;
-        self.status = "Polishing with Gemini...".to_string();
-        self.send_win32(Win32Command::SetTooltip(
-            "Ashe Worker - Polishing... - Win+Shift+H".to_string(),
-        ));
-        let config = self.config.clone();
-        let context = session.selected_context.clone();
-        Task::perform(
-            async move {
-                llm_client::polish_transcript(config, raw, context)
-                    .await
-                    .map_err(|err| format!("{err:#}"))
-            },
-            Message::PolishCompleted,
-        )
-    }
-
-    fn finish_polishing(&mut self, result: PolishResult) -> Task<Message> {
-        if self.state != DictationState::Polishing {
-            return Task::none();
-        }
-        let Some(session) = self.session.as_ref() else {
-            return self.finish_without_transcript();
-        };
-        let raw = session.raw_transcript.trim().to_string();
-        let text = match result {
-            Ok(text) => {
-                logger::info("LLM polishing completed");
-                text
-            }
-            Err(err) => {
-                logger::info(format!("LLM polishing failed: {err}"));
-                self.error = Some("LLM failed; inserting raw transcript".to_string());
-                raw
-            }
-        };
+        logger::info(format!("Inserting raw transcript chars={}", text.len()));
         self.state = DictationState::Inserting;
-        self.polished = Some(text.clone());
         self.status = "Inserting...".to_string();
-        self.send_win32(Win32Command::PasteText {
-            target_hwnd: session.target_hwnd,
-            text,
-        });
+        self.send_win32(Win32Command::PasteText { target_hwnd, text });
         Task::none()
     }
 
@@ -862,16 +813,6 @@ impl UiApp {
         Task::none()
     }
 
-    fn capture_selected_context(&self, target_hwnd: isize) -> Option<String> {
-        match injector::capture_optional_selected_text(target_hwnd) {
-            Ok(context) => context,
-            Err(err) => {
-                logger::info(format!("Selection context capture failed: {err:#}"));
-                None
-            }
-        }
-    }
-
     fn quit(&mut self) -> Task<Message> {
         logger::info("Quit requested");
         self.activity.shutdown();
@@ -978,7 +919,6 @@ mod tests {
     fn session() -> DictationSession {
         DictationSession {
             target_hwnd: 0,
-            selected_context: None,
             raw_transcript: String::new(),
         }
     }

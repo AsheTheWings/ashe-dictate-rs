@@ -30,7 +30,6 @@ pub struct AppConfig {
     pub output_sample_rate: u32,
     pub tera_api_key: String,
     pub tera_api_base: String,
-    pub dictation_polish_model: String,
     pub grammar_model: String,
     pub question_model: String,
     pub journal_model: String,
@@ -90,7 +89,6 @@ impl AppConfig {
             tera_api_key: std::env::var("TERA_API_KEY").unwrap_or_default(),
             tera_api_base: std::env::var("TERA_API_BASE")
                 .unwrap_or_else(|_| DEFAULT_TERA_API_BASE.to_string()),
-            dictation_polish_model: read_llm_model("TERA_DICTATION_POLISH_MODEL"),
             grammar_model: read_llm_model("TERA_GRAMMAR_MODEL"),
             question_model: read_llm_model("TERA_QUESTION_MODEL"),
             journal_model: read_llm_model("TERA_JOURNAL_MODEL"),
@@ -172,7 +170,7 @@ impl AppConfig {
                 "ASHE_OUTPUT_SAMPLE_RATE must be between 8000 and 192000"
             ));
         }
-        self.validate_llm_model(&self.dictation_polish_model, "TERA_DICTATION_POLISH_MODEL")
+        Ok(())
     }
 
     pub fn validate_for_grammar(&self) -> Result<()> {
@@ -214,7 +212,7 @@ impl AppConfig {
 
     pub fn log_summary(&self) -> String {
         format!(
-            "fal_stt_model={} language={} keyterms={} output_sample_rate={} fal_api_key_present={} dictation_polish_model={} grammar_model={} question_model={} journal_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
+            "fal_stt_model={} language={} keyterms={} output_sample_rate={} fal_api_key_present={} grammar_model={} question_model={} journal_model={} tera_api_key_present={} reasoning_effort_present={} activity_enabled={} activity_artifacts={} activity_capture_interval={}s activity_max_frame_gap={}s context_blocks={} summary_max_chars={} daily_report_enabled={} daily_grace_minutes={} archive_recipient_present={} archive_plaintext_days={} archive_upload_configured={} paste_upload_configured={}",
             self.fal_stt_model,
             if self.fal_language.trim().is_empty() {
                 "auto".to_string()
@@ -224,7 +222,6 @@ impl AppConfig {
             self.fal_keyterms.len(),
             self.output_sample_rate,
             !self.fal_api_key.trim().is_empty(),
-            self.dictation_polish_model,
             self.grammar_model,
             self.question_model,
             self.journal_model,

@@ -4,7 +4,10 @@ use crate::logger;
 use crate::util::{pcwstr, wide};
 use iced::widget::{canvas, container};
 use iced::window;
-use iced::{Color, Element, Length, Point, Rectangle, Renderer, Size, Task, Theme, mouse};
+use iced::{
+    Alignment, Color, Element, Length, Pixels, Point, Rectangle, Renderer, Size, Task, Theme,
+    alignment, mouse,
+};
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
@@ -39,8 +42,6 @@ const _: () = assert!(
 const _: () = assert!(HEIGHT < WIDTH, "pill stays wider than tall");
 const BAR_MIN_HEIGHT: f32 = 3.0;
 const IDLE_BAR_VALUE: f32 = 0.06;
-const SHIMMER_SPEED: f32 = 0.12;
-const SHIMMER_SPREAD: f32 = 0.55;
 #[cfg(target_os = "windows")]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 #[cfg(target_os = "windows")]
@@ -97,7 +98,7 @@ fn platform_specific_settings() -> window::settings::PlatformSpecific {
 pub enum PillState {
     /// Microphone hot. Bars follow the live input level.
     Listening,
-    /// Transcribing or polishing. Calm shimmer, distinct from listening.
+    /// Transcribing or inserting. Static status text, distinct from listening.
     Working,
     /// Last operation failed.
     Error,
@@ -105,19 +106,17 @@ pub enum PillState {
     Idle,
 }
 
-/// Everything the dictate pill renders: live spectrum bars, the lifecycle
-/// state, and an animation frame counter.
+/// Everything the dictate pill renders: live spectrum bars and the
+/// lifecycle state.
 pub struct PillContent<'a> {
     pub bars: &'a [f32],
     pub state: PillState,
-    pub frame: u64,
 }
 
 pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
     let program = VoiceProgram {
         bars: content.bars.to_vec(),
         state: content.state,
-        frame: content.frame,
     };
     let visualizer = canvas(program).width(Length::Fill).height(Length::Fill);
     // The container is a transparent pass-through: the canvas paints the
@@ -142,13 +141,12 @@ impl PillState {
 }
 
 /// Canvas program drawing the voice waveform: center-mirrored rounded bars
-/// whose height and alpha follow the live voice spectrum while listening, a
-/// slow traveling shimmer while working, and red bars on error.
+/// whose height and alpha follow the live voice spectrum while listening,
+/// static status text while working, and red bars on error.
 #[derive(Debug, Clone)]
 struct VoiceProgram {
     bars: Vec<f32>,
     state: PillState,
-    frame: u64,
 }
 
 impl<Message> canvas::Program<Message> for VoiceProgram {
@@ -199,22 +197,31 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
                 .with_color(self.state.border_color())
                 .with_width(BORDER_WIDTH),
         );
+        if self.state == PillState::Working {
+            frame.fill_text(canvas::Text {
+                content: "processing...".to_string(),
+                position: Point::new(bounds.width / 2.0, bounds.height / 2.0),
+                color: Color::from_rgba(0.0, 0.88, 1.0, 0.75),
+                size: Pixels(14.0),
+                align_x: Alignment::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..Default::default()
+            });
+            return vec![frame.into_geometry()];
+        }
         let (bars_x, bars_width) = bars_area(bounds.width);
         let specs = bar_specs(&self.bars, bars_width, count);
         let bars_height = bounds.height - 2.0 * BAR_VERTICAL_INSET;
-        for (index, spec) in specs.iter().enumerate() {
+        for spec in specs.iter() {
             let value = match self.state {
                 PillState::Listening | PillState::Error => spec.value,
-                PillState::Working => 0.16 + 0.30 * work_shimmer(index, count, self.frame),
-                PillState::Idle => IDLE_BAR_VALUE,
+                PillState::Working | PillState::Idle => IDLE_BAR_VALUE,
             };
             let height = BAR_MIN_HEIGHT + value * (bars_height - BAR_MIN_HEIGHT);
             let color = match self.state {
-                PillState::Listening | PillState::Working => {
-                    Color::from_rgba(0.0, 0.88, 1.0, 0.30 + 0.65 * value)
-                }
+                PillState::Listening => Color::from_rgba(0.0, 0.88, 1.0, 0.30 + 0.65 * value),
                 PillState::Error => Color::from_rgba(1.0, 0.32, 0.28, 0.35 + 0.55 * value),
-                PillState::Idle => Color::from_rgba(0.86, 0.95, 1.0, 0.22),
+                PillState::Working | PillState::Idle => Color::from_rgba(0.86, 0.95, 1.0, 0.22),
             };
             let bar = canvas::Path::rounded_rectangle(
                 Point::new(bars_x + spec.x, (bounds.height - height) / 2.0),
@@ -269,16 +276,6 @@ pub fn bar_specs(values: &[f32], area_width: f32, bar_count: usize) -> Vec<BarSp
             }
         })
         .collect()
-}
-
-/// Slow traveling wave driving the [`PillState::Working`] shimmer. Pure and
-/// deterministic in bar index and animation frame.
-pub fn work_shimmer(bar: usize, bar_count: usize, frame: u64) -> f32 {
-    if bar_count == 0 {
-        return 0.0;
-    }
-    let phase = frame as f32 * SHIMMER_SPEED + bar as f32 * SHIMMER_SPREAD;
-    0.5 + 0.5 * phase.sin()
 }
 
 pub fn apply_native_styles() {
@@ -484,14 +481,5 @@ mod tests {
         assert!((specs[1].value - 0.3).abs() < 0.0001);
         assert!((specs[2].value - 0.6).abs() < 0.0001);
         assert!((specs[3].value - 0.8).abs() < 0.0001);
-    }
-
-    #[test]
-    fn work_shimmer_stays_unit_and_moves_with_frame() {
-        let first = super::work_shimmer(3, 8, 10);
-        assert!((0.0..=1.0).contains(&first));
-        assert_eq!(first, super::work_shimmer(3, 8, 10));
-        assert_ne!(first, super::work_shimmer(3, 8, 11));
-        assert_eq!(super::work_shimmer(0, 0, 10), 0.0);
     }
 }

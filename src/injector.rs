@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
     HBITMAP, HGDIOBJ, ReleaseDC,
@@ -21,17 +21,11 @@ use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{CF_BITMAP, CF_UNICODETEXT};
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_CONTROL, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-};
-use windows::core::PWSTR;
+use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 const CLIPBOARD_RETRIES: usize = 12;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -41,43 +35,6 @@ const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(1000);
 const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PASTE_PNG_BYTES: usize = 20 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-
-/// Window classes that host a console or terminal emulator. Terminals only treat Ctrl+C as
-/// "copy" while a selection exists; with an empty selection the same chord is delivered to the
-/// attached program as an interrupt (SIGINT / cancel current line), so a synthesized Ctrl+C
-/// there kills whatever the user is running.
-const TERMINAL_WINDOW_CLASSES: &[&str] = &[
-    "ConsoleWindowClass",
-    "CASCADIA_HOSTING_WINDOW_CLASS",
-    "PseudoConsoleWindow",
-    "VirtualConsoleClass",
-    "mintty",
-    "PuTTY",
-    "Alacritty",
-    "org.wezfurlong.wezterm",
-];
-
-/// Executables that own a terminal window, used as a fallback when the window class is generic
-/// (for example Electron-based terminals that report `Chrome_WidgetWin_1`).
-const TERMINAL_PROCESS_NAMES: &[&str] = &[
-    "windowsterminal.exe",
-    "openconsole.exe",
-    "conhost.exe",
-    "cmd.exe",
-    "powershell.exe",
-    "pwsh.exe",
-    "wt.exe",
-    "conemu.exe",
-    "conemu64.exe",
-    "mintty.exe",
-    "putty.exe",
-    "kitty.exe",
-    "alacritty.exe",
-    "wezterm-gui.exe",
-    "hyper.exe",
-    "tabby.exe",
-    "fluentterminal.app.exe",
-];
 
 pub fn copy_text(text: &str) -> Result<()> {
     set_clipboard_text(text).context("failed to set clipboard text")?;
@@ -203,82 +160,6 @@ unsafe fn read_native_clipboard_png() -> Result<Option<Vec<u8>>> {
         return Err(anyhow!("native clipboard PNG has an invalid signature"));
     }
     Ok(Some(png))
-}
-
-/// Returns true when `hwnd` (or the foreground window, when `hwnd` is null) belongs to a
-/// console host or terminal emulator.
-pub fn is_terminal_window(hwnd: HWND) -> bool {
-    let hwnd = if hwnd.0.is_null() {
-        unsafe { GetForegroundWindow() }
-    } else {
-        hwnd
-    };
-    if hwnd.0.is_null() {
-        return false;
-    }
-    if let Some(class) = window_class_name(hwnd)
-        && TERMINAL_WINDOW_CLASSES
-            .iter()
-            .any(|candidate| class.eq_ignore_ascii_case(candidate))
-    {
-        return true;
-    }
-    match window_process_name(hwnd) {
-        Some(exe) => TERMINAL_PROCESS_NAMES
-            .iter()
-            .any(|candidate| exe.eq_ignore_ascii_case(candidate)),
-        None => false,
-    }
-}
-
-fn window_class_name(hwnd: HWND) -> Option<String> {
-    let mut buffer = [0_u16; 256];
-    let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
-    if length <= 0 {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&buffer[..length as usize]))
-}
-
-fn window_process_name(hwnd: HWND) -> Option<String> {
-    let mut pid = 0_u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid == 0 {
-        return None;
-    }
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buffer = vec![0_u16; 1024];
-        let mut length = buffer.len() as u32;
-        let query = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buffer.as_mut_ptr()),
-            &mut length,
-        );
-        let _ = CloseHandle(handle);
-        query.ok()?;
-        let path = String::from_utf16_lossy(&buffer[..length as usize]);
-        Some(
-            path.rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(path.as_str())
-                .to_string(),
-        )
-    }
-}
-
-/// Best-effort selection capture used only to enrich dictation with surrounding context.
-/// Terminals are skipped without touching the keyboard: a console treats Ctrl+C as "copy" only
-/// while a selection exists, and otherwise forwards it to the attached program as an interrupt,
-/// which would cancel whatever the user is running. Optional context is not worth that.
-pub fn capture_optional_selected_text(target_hwnd: isize) -> Result<Option<String>> {
-    let hwnd = HWND(target_hwnd as *mut c_void);
-    if is_terminal_window(hwnd) {
-        logger::info("Selection context capture skipped for a terminal window");
-        return Ok(None);
-    }
-    capture_selected_text()
 }
 
 pub fn capture_selected_text() -> Result<Option<String>> {
