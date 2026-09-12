@@ -2,10 +2,11 @@
 
 use crate::injector;
 use crate::logger;
-use crate::native_overlay::NativeOverlay;
-use crate::pill_renderer;
+use crate::native_overlay::{NativeOverlay, OverlayFrame};
+use crate::pill_renderer::{self, TypingBarContent};
 use crate::util::{pcwstr, wide};
 use crossbeam_channel::{Receiver, Sender};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,8 +21,10 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
-    VK_ESCAPE, VK_RETURN,
+    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    MOD_SHIFT, MOD_WIN, RegisterHotKey, ToUnicodeEx, UnregisterHotKey, VK_BACK, VK_CONTROL,
+    VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -30,10 +33,6 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const TOGGLE_HOTKEY_ID: i32 = 1001;
-const CANCEL_HOTKEY_ID: i32 = 1002;
-const REVERT_SENTENCE_HOTKEY_ID: i32 = 1003;
-const CLEAR_TRANSCRIPT_HOTKEY_ID: i32 = 1004;
-const SUBMIT_HOTKEY_ID: i32 = 1005;
 const FIX_GRAMMAR_HOTKEY_ID: i32 = 1006;
 const ANSWER_QUESTION_HOTKEY_ID: i32 = 1007;
 const PASTE_IMAGE_HOTKEY_ID: i32 = 1008;
@@ -58,9 +57,12 @@ const APP_ICON_RESOURCE_ID: u16 = 1;
 pub enum Win32Event {
     ToggleRequested { target_hwnd: isize, x: i32, y: i32 },
     CancelRequested,
-    RevertLastSentenceRequested,
-    ClearTranscriptRequested,
     SubmitRequested,
+    TypingStarted,
+    TextInput(String),
+    BackspaceRequested,
+    PasteTextRequested,
+    KeyboardCaptureFailed(String),
     FixGrammarRequested { target_hwnd: isize, x: i32, y: i32 },
     AnswerQuestionRequested { target_hwnd: isize, x: i32, y: i32 },
     PasteImageRequested { target_hwnd: isize },
@@ -81,6 +83,7 @@ pub enum Win32Event {
 #[derive(Debug, Clone)]
 pub enum Win32Command {
     SetActive(bool),
+    SetKeyboardCapture(bool),
     SetFollowCursor(bool),
     SetTooltip(String),
     SetActivityStatus {
@@ -113,6 +116,8 @@ pub enum Win32Command {
         visible: bool,
         bars: Vec<f32>,
         state: pill_renderer::PillState,
+        main_text: Option<String>,
+        typing_bar: Option<TypingBarContent>,
     },
     Shutdown,
 }
@@ -122,15 +127,12 @@ struct ServiceState {
     command_rx: Receiver<Win32Command>,
     active: bool,
     follow_cursor: bool,
-    cancel_hotkey_registered: bool,
-    revert_sentence_hotkey_registered: bool,
-    clear_transcript_hotkey_registered: bool,
-    submit_hotkey_registered: bool,
     activity_running: bool,
     activity_status: String,
     last_artifacts_open: Option<Instant>,
     overlay: Option<NativeOverlay>,
     overlay_error_logged: bool,
+    keyboard_hook: Option<HHOOK>,
 }
 
 struct OverlayUpdate {
@@ -139,6 +141,22 @@ struct OverlayUpdate {
     visible: bool,
     bars: Vec<f32>,
     state: pill_renderer::PillState,
+    main_text: Option<String>,
+    typing_bar: Option<TypingBarContent>,
+}
+
+thread_local! {
+    static KEYBOARD_HOOK_STATE: RefCell<Option<KeyboardHookState>> = const { RefCell::new(None) };
+}
+
+struct KeyboardHookState {
+    event_tx: Sender<Win32Event>,
+    keyboard_state: [u8; 256],
+    physical_down: [bool; 256],
+    captured: [bool; 256],
+    accepting: bool,
+    typing: bool,
+    dead_key_pending: bool,
 }
 
 pub fn spawn(
@@ -202,15 +220,12 @@ unsafe fn run_message_loop(
         command_rx,
         active: false,
         follow_cursor: false,
-        cancel_hotkey_registered: false,
-        revert_sentence_hotkey_registered: false,
-        clear_transcript_hotkey_registered: false,
-        submit_hotkey_registered: false,
         activity_running: false,
         activity_status: "activity tracking starting".to_string(),
         last_artifacts_open: None,
         overlay,
         overlay_error_logged: false,
+        keyboard_hook: None,
     });
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     register_hotkey(hwnd);
@@ -245,34 +260,6 @@ unsafe extern "system" fn window_proc(
                     let _ = state
                         .event_tx
                         .send(Win32Event::ToggleRequested { target_hwnd, x, y });
-                }
-                return LRESULT(0);
-            }
-            CANCEL_HOTKEY_ID => {
-                logger::info("Cancel hotkey pressed");
-                if let Some(state) = state {
-                    let _ = state.event_tx.send(Win32Event::CancelRequested);
-                }
-                return LRESULT(0);
-            }
-            REVERT_SENTENCE_HOTKEY_ID => {
-                logger::info("Revert sentence hotkey pressed");
-                if let Some(state) = state {
-                    let _ = state.event_tx.send(Win32Event::RevertLastSentenceRequested);
-                }
-                return LRESULT(0);
-            }
-            CLEAR_TRANSCRIPT_HOTKEY_ID => {
-                logger::info("Clear transcript hotkey pressed");
-                if let Some(state) = state {
-                    let _ = state.event_tx.send(Win32Event::ClearTranscriptRequested);
-                }
-                return LRESULT(0);
-            }
-            SUBMIT_HOTKEY_ID => {
-                logger::info("Submit hotkey pressed");
-                if let Some(state) = state {
-                    let _ = state.event_tx.send(Win32Event::SubmitRequested);
                 }
                 return LRESULT(0);
             }
@@ -315,6 +302,7 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             if let Some(state) = state {
                 drain_commands(hwnd, state);
+                finish_keyboard_capture_if_drained(state);
                 if state.active || state.follow_cursor {
                     let (x, y) = active_input_position();
                     let _ = state.event_tx.send(Win32Event::PositionChanged { x, y });
@@ -398,11 +386,10 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             remove_tray(hwnd);
+            if let Some(state) = state {
+                force_remove_keyboard_capture(state);
+            }
             let _ = UnregisterHotKey(Some(hwnd), TOGGLE_HOTKEY_ID);
-            let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
-            let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
-            let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
-            let _ = UnregisterHotKey(Some(hwnd), SUBMIT_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), FIX_GRAMMAR_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), ANSWER_QUESTION_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(hwnd), PASTE_IMAGE_HOTKEY_ID);
@@ -427,9 +414,9 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
         match command {
             Win32Command::SetActive(active) => {
                 state.active = active;
-                set_cancel_hotkey(hwnd, state, active);
-                set_transcript_edit_hotkeys(hwnd, state, active);
-                set_submit_hotkey(hwnd, state, active);
+            }
+            Win32Command::SetKeyboardCapture(active) => {
+                set_keyboard_capture(state, active);
             }
             Win32Command::SetFollowCursor(follow) => {
                 state.follow_cursor = follow;
@@ -498,6 +485,8 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 visible,
                 bars,
                 state,
+                main_text,
+                typing_bar,
             } => {
                 pending_overlay = Some(OverlayUpdate {
                     x,
@@ -505,6 +494,8 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                     visible,
                     bars,
                     state,
+                    main_text,
+                    typing_bar,
                 });
             }
             Win32Command::Shutdown => {
@@ -516,13 +507,15 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
         }
     }
     if let (Some(update), Some(overlay)) = (pending_overlay, state.overlay.as_mut()) {
-        match overlay.update(
-            update.x,
-            update.y,
-            update.visible,
-            &update.bars,
-            update.state,
-        ) {
+        match overlay.update(OverlayFrame {
+            x: update.x,
+            y: update.y,
+            visible: update.visible,
+            bars: &update.bars,
+            state: update.state,
+            main_text: update.main_text.as_deref(),
+            typing_bar: update.typing_bar.as_ref(),
+        }) {
             Ok(()) => state.overlay_error_logged = false,
             Err(error) if !state.overlay_error_logged => {
                 logger::info(format!("Native layered overlay update failed: {error:#}"));
@@ -531,6 +524,409 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
             Err(_) => {}
         }
     }
+}
+
+unsafe fn set_keyboard_capture(state: &mut ServiceState, active: bool) {
+    if active && state.keyboard_hook.is_some() {
+        KEYBOARD_HOOK_STATE.with(|hook_state| {
+            if let Some(hook_state) = hook_state.borrow_mut().as_mut() {
+                hook_state.accepting = true;
+            }
+        });
+        return;
+    }
+    if !active {
+        KEYBOARD_HOOK_STATE.with(|hook_state| {
+            let mut hook_state = hook_state.borrow_mut();
+            if let Some(state) = hook_state.as_mut() {
+                state.accepting = false;
+                state.typing = false;
+                unsafe { state.clear_dead_key_state() };
+            }
+        });
+        finish_keyboard_capture_if_drained(state);
+        return;
+    }
+
+    let mut keyboard_state = [0_u8; 256];
+    let _ = GetKeyboardState(&mut keyboard_state);
+    let mut physical_down = [false; 256];
+    for (index, value) in keyboard_state.iter_mut().enumerate() {
+        let down = GetAsyncKeyState(index as i32) < 0;
+        physical_down[index] = down;
+        if down {
+            *value |= 0x80;
+        } else {
+            *value &= 0x7f;
+        }
+    }
+    KEYBOARD_HOOK_STATE.with(|hook_state| {
+        *hook_state.borrow_mut() = Some(KeyboardHookState {
+            event_tx: state.event_tx.clone(),
+            keyboard_state,
+            physical_down,
+            captured: [false; 256],
+            accepting: true,
+            typing: false,
+            dead_key_pending: false,
+        });
+    });
+
+    let module = match GetModuleHandleW(None) {
+        Ok(module) => module,
+        Err(error) => {
+            KEYBOARD_HOOK_STATE.with(|hook_state| *hook_state.borrow_mut() = None);
+            let message = format!("Could not initialize dictation keyboard capture: {error}");
+            logger::info(&message);
+            let _ = state
+                .event_tx
+                .send(Win32Event::KeyboardCaptureFailed(message));
+            return;
+        }
+    };
+    match SetWindowsHookExW(
+        WH_KEYBOARD_LL,
+        Some(dictation_keyboard_proc),
+        Some(module.into()),
+        0,
+    ) {
+        Ok(hook) => {
+            state.keyboard_hook = Some(hook);
+            logger::info("Dictation keyboard capture enabled");
+        }
+        Err(error) => {
+            KEYBOARD_HOOK_STATE.with(|hook_state| *hook_state.borrow_mut() = None);
+            let message = format!("Could not install dictation keyboard capture: {error}");
+            logger::info(&message);
+            let _ = state
+                .event_tx
+                .send(Win32Event::KeyboardCaptureFailed(message));
+        }
+    }
+}
+
+unsafe fn finish_keyboard_capture_if_drained(state: &mut ServiceState) {
+    if state.keyboard_hook.is_none() {
+        return;
+    }
+    let drained = KEYBOARD_HOOK_STATE.with(|hook_state| {
+        hook_state.borrow().as_ref().is_none_or(|hook_state| {
+            !hook_state.accepting && hook_state.captured.iter().all(|captured| !captured)
+        })
+    });
+    if !drained {
+        return;
+    }
+    force_remove_keyboard_capture(state);
+}
+
+unsafe fn force_remove_keyboard_capture(state: &mut ServiceState) {
+    KEYBOARD_HOOK_STATE.with(|hook_state| {
+        if let Some(hook_state) = hook_state.borrow_mut().as_mut() {
+            unsafe { hook_state.clear_dead_key_state() };
+        }
+    });
+    if let Some(hook) = state.keyboard_hook.take()
+        && let Err(error) = UnhookWindowsHookEx(hook)
+    {
+        logger::info(format!("Keyboard capture hook removal failed: {error:#}"));
+    }
+    KEYBOARD_HOOK_STATE.with(|hook_state| *hook_state.borrow_mut() = None);
+    logger::info("Dictation keyboard capture disabled");
+}
+
+unsafe extern "system" fn dictation_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code != HC_ACTION as i32 {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    let message = wparam.0 as u32;
+    let is_down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let is_up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
+    if !is_down && !is_up {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    let Some(key) = (lparam.0 as *const KBDLLHOOKSTRUCT).as_ref() else {
+        return CallNextHookEx(None, code, wparam, lparam);
+    };
+    if key.flags.contains(LLKHF_INJECTED) || key.dwExtraInfo == injector::ASHE_INJECTED_EXTRA_INFO {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let captured = KEYBOARD_HOOK_STATE.with(|hook_state| {
+        hook_state
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|state| unsafe { state.handle_key(key, is_down) })
+    });
+    if captured {
+        LRESULT(1)
+    } else {
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+impl KeyboardHookState {
+    unsafe fn handle_key(&mut self, key: &KBDLLHOOKSTRUCT, is_down: bool) -> bool {
+        let Some(index) = usize::try_from(key.vkCode)
+            .ok()
+            .filter(|index| *index < self.keyboard_state.len())
+        else {
+            return false;
+        };
+        let was_down = self.physical_down[index];
+        self.update_key_state(key.vkCode, is_down, was_down);
+
+        if !is_down {
+            let captured = self.captured[index];
+            self.captured[index] = false;
+            return captured;
+        }
+        if !self.accepting {
+            return self.captured[index];
+        }
+
+        let modifiers = ModifierState::from_keyboard_state(&self.keyboard_state);
+        let action = classify_key(key.vkCode, modifiers, self.typing);
+        match action {
+            CaptureAction::Pass => false,
+            CaptureAction::Backspace => {
+                self.captured[index] = true;
+                if self.dead_key_pending {
+                    self.clear_dead_key_state();
+                } else {
+                    let _ = self.event_tx.send(Win32Event::BackspaceRequested);
+                }
+                true
+            }
+            CaptureAction::Paste => {
+                self.captured[index] = true;
+                if !was_down {
+                    self.clear_dead_key_state();
+                    self.start_typing();
+                    let _ = self.event_tx.send(Win32Event::PasteTextRequested);
+                }
+                true
+            }
+            CaptureAction::Submit => {
+                self.captured[index] = true;
+                if !was_down {
+                    self.clear_dead_key_state();
+                    self.typing = false;
+                    let _ = self.event_tx.send(Win32Event::SubmitRequested);
+                }
+                true
+            }
+            CaptureAction::Cancel => {
+                self.captured[index] = true;
+                if !was_down {
+                    self.clear_dead_key_state();
+                    self.typing = false;
+                    let _ = self.event_tx.send(Win32Event::CancelRequested);
+                }
+                true
+            }
+            CaptureAction::Text => match self.translate_text(key) {
+                Translation::None => false,
+                Translation::DeadKey => {
+                    self.captured[index] = true;
+                    self.dead_key_pending = true;
+                    self.start_typing();
+                    true
+                }
+                Translation::Text(text) => {
+                    self.captured[index] = true;
+                    self.dead_key_pending = false;
+                    self.start_typing();
+                    if !text.is_empty() {
+                        let _ = self.event_tx.send(Win32Event::TextInput(text));
+                    }
+                    true
+                }
+            },
+        }
+    }
+
+    fn start_typing(&mut self) {
+        if !self.typing {
+            self.typing = true;
+            let _ = self.event_tx.send(Win32Event::TypingStarted);
+        }
+    }
+
+    fn update_key_state(&mut self, vk: u32, is_down: bool, was_down: bool) {
+        let index = vk as usize;
+        if is_down {
+            self.keyboard_state[index] |= 0x80;
+            if !was_down && matches!(vk, 0x14 | 0x90 | 0x91) {
+                self.keyboard_state[index] ^= 0x01;
+            }
+        } else {
+            self.keyboard_state[index] &= 0x7f;
+        }
+        self.physical_down[index] = is_down;
+
+        let sync_generic = |state: &mut [u8; 256], generic: u16, down: bool| {
+            if down {
+                state[generic as usize] |= 0x80;
+            } else {
+                state[generic as usize] &= 0x7f;
+            }
+        };
+        match vk as u16 {
+            value if value == VK_LSHIFT.0 || value == VK_RSHIFT.0 => sync_generic(
+                &mut self.keyboard_state,
+                VK_SHIFT.0,
+                self.physical_down[VK_LSHIFT.0 as usize]
+                    || self.physical_down[VK_RSHIFT.0 as usize],
+            ),
+            value if value == VK_LCONTROL.0 || value == VK_RCONTROL.0 => sync_generic(
+                &mut self.keyboard_state,
+                VK_CONTROL.0,
+                self.physical_down[VK_LCONTROL.0 as usize]
+                    || self.physical_down[VK_RCONTROL.0 as usize],
+            ),
+            value if value == VK_LMENU.0 || value == VK_RMENU.0 => sync_generic(
+                &mut self.keyboard_state,
+                VK_MENU.0,
+                self.physical_down[VK_LMENU.0 as usize] || self.physical_down[VK_RMENU.0 as usize],
+            ),
+            _ => {}
+        }
+    }
+
+    unsafe fn translate_text(&self, key: &KBDLLHOOKSTRUCT) -> Translation {
+        let foreground = GetForegroundWindow();
+        let thread_id = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let layout = GetKeyboardLayout(thread_id);
+        let mut output = [0_u16; 8];
+        let count = ToUnicodeEx(
+            key.vkCode,
+            key.scanCode,
+            &self.keyboard_state,
+            &mut output,
+            0,
+            Some(layout),
+        );
+        if count < 0 {
+            return Translation::DeadKey;
+        }
+        if count == 0 {
+            return Translation::None;
+        }
+        let text: String = String::from_utf16_lossy(&output[..count as usize])
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if text.is_empty() {
+            Translation::None
+        } else {
+            Translation::Text(text)
+        }
+    }
+
+    unsafe fn clear_dead_key_state(&mut self) {
+        if !self.dead_key_pending {
+            return;
+        }
+        let foreground = GetForegroundWindow();
+        let thread_id = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let layout = GetKeyboardLayout(thread_id);
+        let mut output = [0_u16; 8];
+        let neutral_state = [0_u8; 256];
+        for _ in 0..4 {
+            if ToUnicodeEx(0x20, 0, &neutral_state, &mut output, 0, Some(layout)) >= 0 {
+                break;
+            }
+        }
+        self.dead_key_pending = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModifierState {
+    control: bool,
+    alt: bool,
+    right_alt: bool,
+    windows: bool,
+}
+
+impl ModifierState {
+    fn from_keyboard_state(state: &[u8; 256]) -> Self {
+        let down = |key: u16| state[key as usize] & 0x80 != 0;
+        Self {
+            control: down(VK_CONTROL.0),
+            alt: down(VK_MENU.0),
+            right_alt: down(VK_RMENU.0),
+            windows: down(VK_LWIN.0) || down(VK_RWIN.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureAction {
+    Pass,
+    Text,
+    Paste,
+    Backspace,
+    Submit,
+    Cancel,
+}
+
+fn classify_key(vk: u32, modifiers: ModifierState, typing: bool) -> CaptureAction {
+    if vk == VK_ESCAPE.0 as u32 && !modifiers.control && !modifiers.alt && !modifiers.windows {
+        return CaptureAction::Cancel;
+    }
+    if vk == VK_RETURN.0 as u32 && !modifiers.control && !modifiers.alt && !modifiers.windows {
+        return CaptureAction::Submit;
+    }
+    if vk == VK_BACK.0 as u32
+        && typing
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.windows
+    {
+        return CaptureAction::Backspace;
+    }
+    if vk == 'V' as u32 && modifiers.control && !modifiers.alt && !modifiers.windows {
+        return CaptureAction::Paste;
+    }
+
+    let alt_gr = modifiers.right_alt && !modifiers.windows;
+    if is_text_candidate(vk)
+        && ((!modifiers.control && !modifiers.alt && !modifiers.windows) || alt_gr)
+    {
+        CaptureAction::Text
+    } else {
+        CaptureAction::Pass
+    }
+}
+
+fn is_text_candidate(vk: u32) -> bool {
+    vk == 0x20
+        || (0x30..=0x5a).contains(&vk)
+        || (0x60..=0x6f).contains(&vk)
+        || (0xba..=0xc0).contains(&vk)
+        || (0xdb..=0xdf).contains(&vk)
+        || vk == 0xe2
+        || vk == 0xe7
+}
+
+enum Translation {
+    None,
+    DeadKey,
+    Text(String),
 }
 
 unsafe fn register_hotkey(hwnd: HWND) {
@@ -587,59 +983,6 @@ unsafe fn register_hotkey(hwnd: HWND) {
     }
 }
 
-unsafe fn set_cancel_hotkey(hwnd: HWND, state: &mut ServiceState, active: bool) {
-    if active == state.cancel_hotkey_registered {
-        return;
-    }
-    if active {
-        match RegisterHotKey(
-            Some(hwnd),
-            CANCEL_HOTKEY_ID,
-            MOD_NOREPEAT,
-            VK_ESCAPE.0 as u32,
-        ) {
-            Ok(()) => state.cancel_hotkey_registered = true,
-            Err(err) => logger::info(format!("Escape cancel hotkey registration failed: {err:#}")),
-        }
-    } else {
-        let _ = UnregisterHotKey(Some(hwnd), CANCEL_HOTKEY_ID);
-        state.cancel_hotkey_registered = false;
-    }
-}
-
-unsafe fn set_submit_hotkey(hwnd: HWND, state: &mut ServiceState, active: bool) {
-    if active == state.submit_hotkey_registered {
-        return;
-    }
-    if active {
-        match RegisterHotKey(
-            Some(hwnd),
-            SUBMIT_HOTKEY_ID,
-            MOD_NOREPEAT,
-            VK_RETURN.0 as u32,
-        ) {
-            Ok(()) => state.submit_hotkey_registered = true,
-            Err(err) => logger::info(format!("Enter submit hotkey registration failed: {err:#}")),
-        }
-    } else {
-        let _ = UnregisterHotKey(Some(hwnd), SUBMIT_HOTKEY_ID);
-        state.submit_hotkey_registered = false;
-    }
-}
-
-unsafe fn set_transcript_edit_hotkeys(hwnd: HWND, state: &mut ServiceState, active: bool) {
-    // Completion-mode dictation has no live transcript to edit while
-    // recording, so Backspace must never be hijacked from other apps.
-    // Keep both edit hotkeys unregistered; the event handlers stay as
-    // harmless no-ops.
-    let _ = active;
-    let _ = UnregisterHotKey(Some(hwnd), REVERT_SENTENCE_HOTKEY_ID);
-    let _ = UnregisterHotKey(Some(hwnd), CLEAR_TRANSCRIPT_HOTKEY_ID);
-    state.revert_sentence_hotkey_registered = false;
-    state.clear_transcript_hotkey_registered = false;
-    logger::info("Transcript edit hotkeys stay unregistered (completion mode)");
-}
-
 unsafe fn active_input_position() -> (i32, i32) {
     let mut cursor = POINT::default();
     if GetCursorPos(&mut cursor).is_err() {
@@ -649,7 +992,8 @@ unsafe fn active_input_position() -> (i32, i32) {
     let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     let scale = monitor_scale_factor(monitor);
     let overlay_width = pill_renderer::WIDTH * scale;
-    let overlay_height = pill_renderer::HEIGHT * scale;
+    let pill_height = pill_renderer::PILL_HEIGHT * scale;
+    let top_extent = pill_renderer::MAIN_TOP * scale;
     let gap = CURSOR_OVERLAY_GAP as f32 * scale;
     let cursor_x = cursor.x as f32;
     let cursor_y = cursor.y as f32;
@@ -668,11 +1012,11 @@ unsafe fn active_input_position() -> (i32, i32) {
         if x + overlay_width > work_right {
             x = cursor_x - overlay_width - gap;
         }
-        if y + overlay_height > work_bottom {
-            y = cursor_y - overlay_height - gap;
+        if y + pill_height > work_bottom {
+            y = cursor_y - pill_height - gap;
         }
         x = clamp_to_work_area(x, work_left, work_right - overlay_width);
-        y = clamp_to_work_area(y, work_top, work_bottom - overlay_height);
+        y = clamp_to_work_area(y, work_top + top_extent, work_bottom - pill_height);
     }
 
     (x.round() as i32, y.round() as i32)
@@ -939,5 +1283,113 @@ fn message_box(hwnd: HWND, text: &str, title: &str) {
             pcwstr(&wide(title)),
             MB_OK | MB_ICONWARNING,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureAction, KeyboardHookState, ModifierState, Win32Event, classify_key};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_BACK, VK_ESCAPE, VK_RETURN};
+    use windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT;
+
+    fn modifiers() -> ModifierState {
+        ModifierState {
+            control: false,
+            alt: false,
+            right_alt: false,
+            windows: false,
+        }
+    }
+
+    #[test]
+    fn printable_keys_and_paste_are_captured_without_blocking_shortcuts() {
+        assert_eq!(
+            classify_key('A' as u32, modifiers(), false),
+            CaptureAction::Text
+        );
+        assert_eq!(
+            classify_key(
+                'V' as u32,
+                ModifierState {
+                    control: true,
+                    ..modifiers()
+                },
+                false,
+            ),
+            CaptureAction::Paste
+        );
+        for (vk, state) in [
+            (
+                'C' as u32,
+                ModifierState {
+                    control: true,
+                    ..modifiers()
+                },
+            ),
+            (
+                'A' as u32,
+                ModifierState {
+                    alt: true,
+                    ..modifiers()
+                },
+            ),
+            (
+                'D' as u32,
+                ModifierState {
+                    windows: true,
+                    ..modifiers()
+                },
+            ),
+        ] {
+            assert_eq!(classify_key(vk, state, true), CaptureAction::Pass);
+        }
+    }
+
+    #[test]
+    fn editing_and_session_keys_are_scoped_to_dictation() {
+        assert_eq!(
+            classify_key(VK_BACK.0 as u32, modifiers(), false),
+            CaptureAction::Pass
+        );
+        assert_eq!(
+            classify_key(VK_BACK.0 as u32, modifiers(), true),
+            CaptureAction::Backspace
+        );
+        assert_eq!(
+            classify_key(VK_RETURN.0 as u32, modifiers(), false),
+            CaptureAction::Submit
+        );
+        assert_eq!(
+            classify_key(VK_ESCAPE.0 as u32, modifiers(), false),
+            CaptureAction::Cancel
+        );
+    }
+
+    #[test]
+    fn enter_auto_repeat_emits_only_one_submit() {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut state = KeyboardHookState {
+            event_tx,
+            keyboard_state: [0; 256],
+            physical_down: [false; 256],
+            captured: [false; 256],
+            accepting: true,
+            typing: true,
+            dead_key_pending: false,
+        };
+        let key = KBDLLHOOKSTRUCT {
+            vkCode: VK_RETURN.0 as u32,
+            ..Default::default()
+        };
+        assert!(unsafe { state.handle_key(&key, true) });
+        state.accepting = false;
+        assert!(unsafe { state.handle_key(&key, true) });
+        assert!(unsafe { state.handle_key(&key, false) });
+        assert!(state.captured.iter().all(|captured| !captured));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Win32Event::SubmitRequested)
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 }

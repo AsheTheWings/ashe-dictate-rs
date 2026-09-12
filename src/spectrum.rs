@@ -19,7 +19,7 @@ pub const FMIN: f32 = 80.0;
 /// Voice range feeding the bars.
 pub const FMAX: f32 = 8000.0;
 /// Time-domain peak below which a frame counts as silence.
-const SILENCE_GATE: f32 = 0.015;
+pub const SILENCE_GATE: f32 = 0.015;
 /// Per-tick decay of displayed energy at ~60 fps. Attacks are instant.
 const RELEASE: f32 = 0.80;
 
@@ -27,6 +27,7 @@ pub struct SpectrumAnalyzer {
     sample_rate: u32,
     ring: Vec<f32>,
     displayed: Vec<f32>,
+    signal_active: bool,
 }
 
 impl SpectrumAnalyzer {
@@ -35,20 +36,24 @@ impl SpectrumAnalyzer {
             sample_rate,
             ring: Vec::new(),
             displayed: vec![0.0; BAND_COUNT],
+            signal_active: false,
         }
     }
 
     pub fn reset(&mut self) {
         self.ring.clear();
         self.displayed.fill(0.0);
+        self.signal_active = false;
     }
 
     /// Append mono samples in -1.0..=1.0. Only the latest window matters.
-    pub fn push_samples(&mut self, samples: &[f32]) {
+    pub fn push_samples(&mut self, samples: &[f32]) -> bool {
+        self.signal_active = raw_signal_active(samples);
         self.ring.extend_from_slice(samples);
         if self.ring.len() > FFT_SIZE {
             self.ring.drain(..self.ring.len() - FFT_SIZE);
         }
+        self.signal_active
     }
 
     /// Recompute the displayed bands from the latest window.
@@ -56,11 +61,8 @@ impl SpectrumAnalyzer {
         let mut window = vec![0.0f32; FFT_SIZE];
         let len = self.ring.len().min(FFT_SIZE);
         window[FFT_SIZE - len..].copy_from_slice(&self.ring[self.ring.len() - len..]);
-        let peak = window
-            .iter()
-            .fold(0.0f32, |max, sample| max.max(sample.abs()));
         let fmax = FMAX.min(self.sample_rate as f32 / 2.0 - 1.0);
-        let target = if peak < SILENCE_GATE || fmax <= FMIN {
+        let target = if !self.signal_active || fmax <= FMIN {
             vec![0.0; BAND_COUNT]
         } else {
             match samples_fft_to_spectrum(
@@ -90,6 +92,11 @@ impl SpectrumAnalyzer {
     pub fn bars(&self) -> &[f32] {
         &self.displayed
     }
+}
+
+/// Raw time-domain gate shared by recording compaction and visualization.
+pub fn raw_signal_active(samples: &[f32]) -> bool {
+    samples.iter().any(|sample| sample.abs() >= SILENCE_GATE)
 }
 
 /// Log-spaced `(low, high)` band edges in Hertz, matching how pitch is
@@ -168,7 +175,8 @@ pub fn pcm_chunk_to_mono(chunk: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        log_band_edges, map_bins_to_bands, normalize_relative, pcm_chunk_to_mono, smooth_bands,
+        log_band_edges, map_bins_to_bands, normalize_relative, pcm_chunk_to_mono,
+        raw_signal_active, smooth_bands,
     };
 
     #[test]
@@ -230,5 +238,11 @@ mod tests {
         assert!(full_scale > 0.99 && full_scale <= 1.0);
         assert_eq!(pcm_chunk_to_mono(&[0x00, 0x80])[0], -1.0);
         assert_eq!(pcm_chunk_to_mono(&[0, 0, 0xFF]), vec![0.0]);
+    }
+
+    #[test]
+    fn raw_signal_gate_is_shared_at_the_documented_threshold() {
+        assert!(!raw_signal_active(&[0.0, super::SILENCE_GATE - 0.0001]));
+        assert!(raw_signal_active(&[0.0, super::SILENCE_GATE]));
     }
 }

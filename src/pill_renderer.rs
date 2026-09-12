@@ -1,8 +1,17 @@
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Transform};
 
-pub const WIDTH: f32 = 285.0;
-pub const HEIGHT: f32 = 64.0;
+pub const WIDTH: f32 = 428.0;
+pub const PILL_HEIGHT: f32 = 64.0;
+pub const MAIN_TOP: f32 = 20.0;
+pub const HEIGHT: f32 = MAIN_TOP + PILL_HEIGHT;
+pub const TOP_BAR_X: f32 = 34.0;
+pub const TOP_BAR_Y: f32 = 0.0;
+pub const TOP_BAR_WIDTH: f32 = WIDTH - 2.0 * TOP_BAR_X;
+pub const TOP_BAR_HEIGHT: f32 = 26.0;
+pub const TOP_BAR_TEXT_INSET: f32 = 10.0;
+pub const TOP_BAR_COUNT_WIDTH: f32 = 76.0;
 const BORDER_WIDTH: f32 = 2.0;
+const TOP_BAR_BORDER_WIDTH: f32 = 1.5;
 /// Keep the antialiased edge inside the layered bitmap.
 const PILL_EDGE_INSET: f32 = 1.0;
 /// Horizontal margin between the pill edge and the bar area. Identical on
@@ -15,9 +24,9 @@ const BACKGROUND: [u8; 4] = [6, 19, 25, 255];
 const LISTENING_BORDER: [u8; 4] = [0, 197, 224, 255];
 const WORKING_BORDER: [u8; 4] = [0, 101, 115, 255];
 const ERROR_BORDER: [u8; 4] = [217, 69, 61, 255];
-const _: () = assert!(HEIGHT <= 96.0, "dictate overlay stays pill height");
+const _: () = assert!(HEIGHT <= 96.0, "dictate overlay stays compact");
 const _: () = assert!(WIDTH <= 480.0, "dictate overlay stays compact");
-const _: () = assert!(HEIGHT < WIDTH, "pill stays wider than tall");
+const _: () = assert!(PILL_HEIGHT < WIDTH, "pill stays wider than tall");
 
 /// Visual lifecycle of the dictate pill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +39,12 @@ pub enum PillState {
     Error,
     /// Text actions and other quiet states.
     Idle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypingBarContent {
+    pub count: String,
+    pub preview: String,
 }
 
 impl PillState {
@@ -52,9 +67,62 @@ pub fn render_rgba(
     pixel_height: u32,
     bars: &[f32],
     state: PillState,
+    show_visualizer: bool,
+    show_typing_bar: bool,
 ) -> Option<Vec<u8>> {
     let mut pixmap = Pixmap::new(pixel_width, pixel_height)?;
-    let transform = Transform::from_scale(pixel_width as f32 / WIDTH, pixel_height as f32 / HEIGHT);
+    let scale = pixel_width as f32 / WIDTH;
+    let transform = Transform::from_scale(scale, scale);
+
+    if show_typing_bar {
+        fill_capsule(
+            &mut pixmap,
+            capsule_path(TOP_BAR_X, TOP_BAR_Y, TOP_BAR_WIDTH, TOP_BAR_HEIGHT)?,
+            LISTENING_BORDER,
+            transform,
+        );
+        let inset = TOP_BAR_BORDER_WIDTH;
+        fill_capsule(
+            &mut pixmap,
+            capsule_path(
+                TOP_BAR_X + inset,
+                TOP_BAR_Y + inset,
+                TOP_BAR_WIDTH - 2.0 * inset,
+                TOP_BAR_HEIGHT - 2.0 * inset,
+            )?,
+            BACKGROUND,
+            transform,
+        );
+    }
+
+    let main_height = (PILL_HEIGHT * scale).round().max(1.0) as u32;
+    let main = render_main_rgba(pixel_width, main_height, bars, state, show_visualizer)?;
+    let main_top = (MAIN_TOP * scale).round().max(0.0) as usize;
+    let row_bytes = pixel_width as usize * 4;
+    for (row, source) in main.chunks_exact(row_bytes).enumerate() {
+        let destination_start = (main_top + row) * row_bytes;
+        let destination_end = destination_start + row_bytes;
+        if destination_end <= pixmap.data().len() {
+            pixmap.data_mut()[destination_start..destination_end].copy_from_slice(source);
+        }
+    }
+    symmetrize_horizontal(&mut pixmap);
+
+    Some(pixmap.take())
+}
+
+fn render_main_rgba(
+    pixel_width: u32,
+    pixel_height: u32,
+    bars: &[f32],
+    state: PillState,
+    show_visualizer: bool,
+) -> Option<Vec<u8>> {
+    let mut pixmap = Pixmap::new(pixel_width, pixel_height)?;
+    let transform = Transform::from_scale(
+        pixel_width as f32 / WIDTH,
+        pixel_height as f32 / PILL_HEIGHT,
+    );
 
     fill_capsule(
         &mut pixmap,
@@ -62,7 +130,7 @@ pub fn render_rgba(
             PILL_EDGE_INSET,
             PILL_EDGE_INSET,
             WIDTH - 2.0 * PILL_EDGE_INSET,
-            HEIGHT - 2.0 * PILL_EDGE_INSET,
+            PILL_HEIGHT - 2.0 * PILL_EDGE_INSET,
         )?,
         state.border(),
         transform,
@@ -75,7 +143,7 @@ pub fn render_rgba(
             inner_inset,
             inner_inset,
             WIDTH - 2.0 * inner_inset,
-            HEIGHT - 2.0 * inner_inset,
+            PILL_HEIGHT - 2.0 * inner_inset,
         )?,
         BACKGROUND,
         transform,
@@ -83,11 +151,11 @@ pub fn render_rgba(
     symmetrize_horizontal(&mut pixmap);
     symmetrize_vertical(&mut pixmap);
 
-    if state != PillState::Working {
+    if state != PillState::Working && show_visualizer {
         let (bars_x, bars_width) = bars_area(WIDTH);
         let count = bars.len().max(1);
         let specs = bar_specs(bars, bars_width, count);
-        let bars_height = HEIGHT - 2.0 * BAR_VERTICAL_INSET;
+        let bars_height = PILL_HEIGHT - 2.0 * BAR_VERTICAL_INSET;
         for spec in &specs {
             let value = match state {
                 PillState::Listening | PillState::Error => spec.value,
@@ -99,9 +167,12 @@ pub fn render_rgba(
                 PillState::Error => [255, 82, 71, alpha(0.35 + 0.55 * value)],
                 PillState::Working | PillState::Idle => [219, 242, 255, alpha(0.22)],
             };
-            if let Some(path) =
-                capsule_path(bars_x + spec.x, (HEIGHT - height) / 2.0, spec.width, height)
-            {
+            if let Some(path) = capsule_path(
+                bars_x + spec.x,
+                (PILL_HEIGHT - height) / 2.0,
+                spec.width,
+                height,
+            ) {
                 fill_capsule(&mut pixmap, path, color, transform);
             }
         }
@@ -230,7 +301,9 @@ pub fn bar_specs(values: &[f32], area_width: f32, bar_count: usize) -> Vec<BarSp
         return Vec::new();
     }
     let pitch = area_width / bar_count as f32;
-    let width = (pitch * 0.5).clamp(1.0, 4.0);
+    // The pill is wider, but the approved fine waveform stroke stays the
+    // same; extra width becomes breathing room instead of thicker bars.
+    let width = (pitch * 0.5).clamp(1.0, 2.0);
     let start = values.len().saturating_sub(bar_count);
     let window = &values[start..];
     let pad = bar_count.saturating_sub(window.len());
@@ -262,13 +335,21 @@ pub fn bar_specs(values: &[f32], area_width: f32, bar_count: usize) -> Vec<BarSp
 
 #[cfg(test)]
 mod tests {
-    use super::{HEIGHT, PillState, WIDTH};
+    use super::{BORDER_WIDTH, HEIGHT, MAIN_TOP, PILL_HEIGHT, PillState, WIDTH};
+
+    #[test]
+    fn main_pill_keeps_the_approved_geometry() {
+        assert_eq!(WIDTH, 428.0);
+        assert_eq!(PILL_HEIGHT, 64.0);
+        assert_eq!(BORDER_WIDTH, 2.0);
+        assert_eq!(HEIGHT, MAIN_TOP + PILL_HEIGHT);
+    }
 
     #[test]
     fn bar_area_keeps_equal_margins_on_both_ends() {
-        assert_eq!(super::bars_area(285.0), (12.0, 261.0));
-        let (offset, width) = super::bars_area(285.0);
-        assert_eq!(285.0 - (offset + width), offset);
+        assert_eq!(super::bars_area(428.0), (12.0, 404.0));
+        let (offset, width) = super::bars_area(428.0);
+        assert_eq!(428.0 - (offset + width), offset);
         assert_eq!(super::bars_area(10.0), (12.0, 0.0));
     }
 
@@ -285,6 +366,7 @@ mod tests {
         for spec in &specs {
             assert!(spec.x >= 0.0);
             assert!(spec.x + spec.width <= 160.0 + 0.001);
+            assert_eq!(spec.width, 2.0);
         }
     }
 
@@ -314,21 +396,26 @@ mod tests {
     fn layered_bitmap_has_transparent_corners_and_symmetric_edges() {
         let width = (WIDTH * 1.25).round() as u32;
         let height = (HEIGHT * 1.25).round() as u32;
-        let pixels =
-            super::render_rgba(width, height, &[], PillState::Working).expect("pill should render");
+        let pixels = super::render_rgba(width, height, &[], PillState::Working, false, false)
+            .expect("pill should render");
         let pixel_at = |x: u32, y: u32| {
             let offset = ((y * width + x) * 4) as usize;
             &pixels[offset..offset + 4]
         };
 
-        assert_eq!(pixel_at(0, 0)[3], 0);
-        assert_eq!(pixel_at(width - 1, 0)[3], 0);
-        assert_eq!(pixel_at(0, height - 1)[3], 0);
-        assert_eq!(pixel_at(width - 1, height - 1)[3], 0);
+        let main_top = (MAIN_TOP * 1.25).round() as u32;
+        let main_height = (PILL_HEIGHT * 1.25).round() as u32;
+        assert_eq!(pixel_at(0, main_top)[3], 0);
+        assert_eq!(pixel_at(width - 1, main_top)[3], 0);
+        assert_eq!(pixel_at(0, main_top + main_height - 1)[3], 0);
+        assert_eq!(pixel_at(width - 1, main_top + main_height - 1)[3], 0);
 
-        for y in 0..height {
+        for y in 0..main_height {
             for x in 0..width {
-                assert_eq!(pixel_at(x, y), pixel_at(x, height - 1 - y));
+                assert_eq!(
+                    pixel_at(x, main_top + y),
+                    pixel_at(x, main_top + main_height - 1 - y)
+                );
             }
         }
         for y in 0..height {
@@ -343,15 +430,20 @@ mod tests {
         let width = (WIDTH * 1.25).round() as u32;
         let height = (HEIGHT * 1.25).round() as u32;
         let bars: Vec<f32> = (0..64).map(|index| index as f32 / 63.0).collect();
-        let pixels = super::render_rgba(width, height, &bars, PillState::Listening)
+        let pixels = super::render_rgba(width, height, &bars, PillState::Listening, true, false)
             .expect("waveform should render");
         let pixel_at = |x: u32, y: u32| {
             let offset = ((y * width + x) * 4) as usize;
             &pixels[offset..offset + 4]
         };
-        for y in 0..height {
+        let main_top = (MAIN_TOP * 1.25).round() as u32;
+        let main_height = (PILL_HEIGHT * 1.25).round() as u32;
+        for y in 0..main_height {
             for x in 0..width {
-                assert_eq!(pixel_at(x, y), pixel_at(x, height - 1 - y));
+                assert_eq!(
+                    pixel_at(x, main_top + y),
+                    pixel_at(x, main_top + main_height - 1 - y)
+                );
             }
         }
     }
@@ -360,9 +452,10 @@ mod tests {
     fn equal_waveform_values_keep_equal_end_padding() {
         let width = (WIDTH * 1.25).round() as u32;
         let height = (HEIGHT * 1.25).round() as u32;
-        let pixels = super::render_rgba(width, height, &[0.5; 64], PillState::Listening)
-            .expect("waveform should render");
-        let base = super::render_rgba(width, height, &[], PillState::Listening)
+        let pixels =
+            super::render_rgba(width, height, &[0.5; 64], PillState::Listening, true, false)
+                .expect("waveform should render");
+        let base = super::render_rgba(width, height, &[], PillState::Listening, true, false)
             .expect("base pill should render");
         let changed_columns: Vec<u32> = (0..width)
             .filter(|&x| {
@@ -375,5 +468,20 @@ mod tests {
         let first = *changed_columns.first().expect("waveform has pixels");
         let last = *changed_columns.last().expect("waveform has pixels");
         assert_eq!(first, width - 1 - last);
+    }
+
+    #[test]
+    fn typing_bar_uses_native_alpha_above_the_main_pill() {
+        let width = WIDTH as u32;
+        let height = HEIGHT as u32;
+        let hidden = super::render_rgba(width, height, &[], PillState::Listening, true, false)
+            .expect("hidden tab frame");
+        let shown = super::render_rgba(width, height, &[], PillState::Listening, true, true)
+            .expect("shown tab frame");
+        let sample_x = (super::TOP_BAR_X + super::TOP_BAR_WIDTH / 2.0) as u32;
+        let sample_y = 2_u32;
+        let offset = ((sample_y * width + sample_x) * 4 + 3) as usize;
+        assert_eq!(hidden[offset], 0);
+        assert!(shown[offset] > 0);
     }
 }

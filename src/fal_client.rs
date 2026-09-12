@@ -28,8 +28,26 @@ const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const WAV_DATA_URI_PREFIX: &str = "data:audio/wav;base64,";
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptWord {
+    pub text: String,
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FalTranscript {
+    pub text: String,
+    pub words: Vec<TranscriptWord>,
+}
+
 /// Transcribe a complete recording with one queue request.
-pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -> Result<String> {
+pub async fn transcribe_pcm(
+    config: AppConfig,
+    sample_rate: u32,
+    pcm: Vec<u8>,
+) -> Result<FalTranscript> {
     validate_capture(&pcm, sample_rate)?;
     let seconds = pcm.len() as f64 / f64::from(sample_rate) / 2.0;
     logger::info(format!(
@@ -47,9 +65,11 @@ pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -
         .build()
         .context("failed to create HTTP client")?;
     let wav = encode_wav_mono16(&pcm, sample_rate);
+    drop(pcm);
     let audio_url = wav_data_uri(&wav);
+    drop(wav);
     let encoded = Instant::now();
-    let queued = submit_transcription(&client, &config, &audio_url).await?;
+    let queued = submit_transcription(&client, &config, audio_url).await?;
     let submitted = Instant::now();
     wait_completed(&client, &config.fal_api_key, &queued).await?;
     let completed = Instant::now();
@@ -57,7 +77,7 @@ pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -
     let finished = Instant::now();
     logger::info(format!(
         "fal transcript chars={} encode_ms={} submit_ms={} queue_ms={} result_ms={} total_ms={}",
-        transcript.len(),
+        transcript.text.len(),
         encoded.duration_since(started).as_millis(),
         submitted.duration_since(encoded).as_millis(),
         completed.duration_since(submitted).as_millis(),
@@ -107,10 +127,10 @@ struct QueuedRequest {
 async fn submit_transcription(
     client: &reqwest::Client,
     config: &AppConfig,
-    audio_url: &str,
+    audio_url: String,
 ) -> Result<QueuedRequest> {
     let url = format!("{QUEUE_BASE_URL}/{}", config.fal_stt_model.trim());
-    let input = scribe_input(audio_url, &config.fal_language, &config.fal_keyterms);
+    let input = scribe_input_owned(audio_url, &config.fal_language, &config.fal_keyterms);
     let mut attempt = 1;
     let response = loop {
         match client
@@ -176,12 +196,12 @@ async fn wait_completed(
     ))
 }
 
-/// Fetch the completed output and read its transcript text.
+/// Fetch the completed output and read its text and word-level timing.
 async fn fetch_transcript(
     client: &reqwest::Client,
     api_key: &str,
     queued: &QueuedRequest,
-) -> Result<String> {
+) -> Result<FalTranscript> {
     let response = client
         .get(&queued.response_url)
         .header("Authorization", auth_header(api_key))
@@ -207,11 +227,12 @@ async fn fetch_transcript(
 /// insertable text, so diarization and audio-event tags stay off.
 /// Keyterms cost ~30% extra, so they are only sent when configured.
 pub fn scribe_input(audio_url: &str, language: &str, keyterms: &[String]) -> Value {
+    scribe_input_owned(audio_url.to_string(), language, keyterms)
+}
+
+fn scribe_input_owned(audio_url: String, language: &str, keyterms: &[String]) -> Value {
     let mut input = Map::new();
-    input.insert(
-        "audio_url".to_string(),
-        Value::String(audio_url.to_string()),
-    );
+    input.insert("audio_url".to_string(), Value::String(audio_url));
     input.insert("diarize".to_string(), Value::Bool(false));
     input.insert("tag_audio_events".to_string(), Value::Bool(false));
     if !language.trim().is_empty() {
@@ -279,14 +300,38 @@ fn parse_status(body: &Value) -> Result<QueueState> {
     }
 }
 
-/// Read the transcript text from a Scribe v2 output object.
-pub fn extract_transcript(output: &Value) -> String {
-    output
+/// Read the transcript and word timeline from a Scribe v2 output object.
+pub fn extract_transcript(output: &Value) -> FalTranscript {
+    let text = output
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
-        .to_string()
+        .to_string();
+    let words = match output.get("words") {
+        Some(Value::Array(words)) => words.iter().filter_map(parse_word).collect(),
+        Some(Value::Object(_)) => output
+            .get("words")
+            .and_then(parse_word)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    FalTranscript { text, words }
+}
+
+fn parse_word(word: &Value) -> Option<TranscriptWord> {
+    let text = word.get("text")?.as_str()?.to_string();
+    Some(TranscriptWord {
+        text,
+        start: word.get("start").and_then(Value::as_f64),
+        end: word.get("end").and_then(Value::as_f64),
+        kind: word
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("word")
+            .to_string(),
+    })
 }
 
 /// Wrap little-endian mono 16-bit PCM in a 44-byte WAV header so the
@@ -415,7 +460,42 @@ mod tests {
             "language_code": "eng",
             "language_probability": 1.0
         });
-        assert_eq!(extract_transcript(&output), "Hey, this is a test.");
-        assert!(extract_transcript(&json!({})).is_empty());
+        let transcript = extract_transcript(&output);
+        assert_eq!(transcript.text, "Hey, this is a test.");
+        assert_eq!(transcript.words.len(), 1);
+        assert_eq!(transcript.words[0].text, "Hey,");
+        assert_eq!(transcript.words[0].start, Some(0.079));
+        assert_eq!(transcript.words[0].end, Some(0.539));
+        assert_eq!(transcript.words[0].kind, "word");
+        let empty = extract_transcript(&json!({}));
+        assert!(empty.text.is_empty());
+        assert!(empty.words.is_empty());
+    }
+
+    #[test]
+    fn transcript_extraction_preserves_word_types_and_optional_times() {
+        let output = json!({
+            "text": "Hello world",
+            "words": [
+                {"text": "Hello", "start": 0.1, "end": 0.4, "type": "word"},
+                {"text": " ", "type": "spacing"},
+                {"text": "world", "start": 0.5, "end": 0.9, "type": "word"}
+            ]
+        });
+        let transcript = extract_transcript(&output);
+        assert_eq!(transcript.words.len(), 3);
+        assert_eq!(transcript.words[1].kind, "spacing");
+        assert_eq!(transcript.words[1].start, None);
+        assert_eq!(transcript.words[1].text, " ");
+    }
+
+    #[test]
+    fn transcript_extraction_accepts_a_single_word_object() {
+        let transcript = extract_transcript(&json!({
+            "text": "Hello",
+            "words": {"text": "Hello", "start": 0.1, "end": 0.4, "type": "word"}
+        }));
+        assert_eq!(transcript.words.len(), 1);
+        assert_eq!(transcript.words[0].text, "Hello");
     }
 }

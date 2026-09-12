@@ -2,6 +2,7 @@
 mod activity_pipeline;
 mod activity_telemetry;
 mod audio;
+mod composition;
 mod fal_client;
 mod injector;
 mod llm_client;

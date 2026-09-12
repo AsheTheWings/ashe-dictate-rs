@@ -34,7 +34,9 @@ const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(180);
 const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(1000);
 const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PASTE_PNG_BYTES: usize = 20 * 1024 * 1024;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+pub(crate) const ASHE_INJECTED_EXTRA_INFO: usize = 0x4153_4845_574b_5252;
 
 pub fn copy_text(text: &str) -> Result<()> {
     set_clipboard_text(text).context("failed to set clipboard text")?;
@@ -200,13 +202,17 @@ pub fn capture_selected_text() -> Result<Option<String>> {
     Ok(selected_text)
 }
 
+pub fn capture_clipboard_text() -> Result<Option<String>> {
+    read_clipboard_text()
+}
+
 pub fn paste_text(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
 
     set_clipboard_text(text).context("failed to set clipboard text")?;
-    logger::info(format!("Pasting text: {text}"));
+    logger::info(format!("Pasting text chars={}", text.chars().count()));
     wait_for_modifiers_released();
     send_ctrl_v().context("failed to send Ctrl+V")?;
     thread::sleep(PASTE_SETTLE_DELAY);
@@ -251,10 +257,14 @@ fn read_clipboard_text() -> Result<Option<String>> {
 
         let handle = GetClipboardData(CF_UNICODETEXT.0 as u32)?;
         let global = HGLOBAL(handle.0);
-        let size = GlobalSize(global) / size_of::<u16>();
-        if size == 0 {
+        let byte_size = GlobalSize(global);
+        if byte_size == 0 {
             return Ok(None);
         }
+        if byte_size > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(anyhow!("clipboard text exceeds the capture limit"));
+        }
+        let size = byte_size / size_of::<u16>();
 
         let ptr = GlobalLock(global) as *const u16;
         if ptr.is_null() {
@@ -386,7 +396,7 @@ fn key_input(vk: u16, up: bool) -> INPUT {
                     Default::default()
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: ASHE_INJECTED_EXTRA_INFO,
             },
         },
     }

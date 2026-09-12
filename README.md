@@ -40,15 +40,23 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Ctrl+Alt+V` | Upload a clipboard image and paste its remote path |
 
 During dictation, microphone audio is buffered locally while the pill overlay
-shows a live voice spectrum (FFT frequency bands) with a cyan border.
-Transcription runs once when you
-stop, as a single full-utterance request for a better result than streaming
-partials; while it works, the pill shows `processing...`. Speech-to-text runs
-through the fal.ai queue API (`FAL_STT_MODEL`, default scribe-v2): the worker
-embeds the utterance as a WAV data URI, polls the request to completion, and
-inserts the transcript, so dictation needs `FAL_KEY` set. State and errors are
-also reported through the tray tooltip and the log. Use `Enter` to finish and
-transcribe, or `Esc` to cancel.
+shows a live voice spectrum. Printable input and `Ctrl+V` switch to a private
+typing buffer without writing into the foreground application. The upper bar
+shows a clipped preview, represents clipboard spans as `[pasted]`, and counts
+committed insertions; `Backspace` edits the buffer. Press `Enter` with content
+to commit it and resume listening. Press `Enter` with an empty buffer to finish,
+or `Esc` to cancel the whole session. Navigation and unrelated system shortcuts
+continue to work normally. Direct IME and emoji-panel composition is not
+captured; use `Ctrl+V` for that content.
+
+Natural pauses remain intact. After two seconds of continuous silence the pill
+shows a countdown; at five seconds, dead air is compacted locally and is never
+submitted as a separate request. When the session finishes, all retained speech
+is sent once through the fal.ai queue API (`FAL_STT_MODEL`, default scribe-v2),
+then interleaved with exact typed and pasted content using word timestamps. The
+result is inserted once into the application where dictation started, with no
+LLM polishing. While fal.ai is working, the pill shows `processing...`.
+Dictation requires `FAL_KEY`.
 
 ## Activity records
 
