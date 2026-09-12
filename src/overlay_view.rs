@@ -303,7 +303,8 @@ pub fn apply_native_styles() {
         // across its antialiased outer fringe, which reads as a clean edge
         // rather than speckle.
         let (region_w, region_h, corner) = pill_region_px(GetDpiForWindow(hwnd));
-        let region = CreateRoundRectRgn(1, 1, region_w, region_h, corner - 2, corner - 2);
+        let (x1, y1, x2, y2, corner_w, corner_h) = inset_region_px(region_w, region_h, corner);
+        let region = CreateRoundRectRgn(x1, y1, x2, y2, corner_w, corner_h);
         if region.is_invalid() {
             logger::info(format!(
                 "Overlay native region skipped reason=create_failed hwnd={:p}",
@@ -368,6 +369,18 @@ pub fn pill_region_px(dpi: u32) -> (i32, i32, i32) {
     (width, height, height)
 }
 
+/// Inset a full-bleed `(width, height, corner)` region one device pixel on
+/// every side so the clip lands inside the solid border. Returns
+/// `(x1, y1, x2, y2, corner_w, corner_h)`; right and bottom edges stay
+/// exclusive, matching GDI region semantics.
+pub fn inset_region_px(
+    region_w: i32,
+    region_h: i32,
+    corner: i32,
+) -> (i32, i32, i32, i32, i32, i32) {
+    (1, 1, region_w - 1, region_h - 1, corner - 2, corner - 2)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -381,6 +394,15 @@ mod tests {
         assert_eq!(super::pill_region_px(144), (428, 96, 96));
         assert_eq!(super::pill_region_px(192), (570, 128, 128));
         assert_eq!(super::pill_region_px(0), (285, 64, 64));
+    }
+
+    #[test]
+    fn region_inset_clips_one_pixel_on_every_side() {
+        assert_eq!(super::inset_region_px(285, 64, 64), (1, 1, 284, 63, 62, 62));
+        assert_eq!(
+            super::inset_region_px(570, 128, 128),
+            (1, 1, 569, 127, 126, 126)
+        );
     }
 
     #[test]
