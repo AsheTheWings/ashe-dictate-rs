@@ -39,10 +39,12 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Win+Shift+Q` | Ask a question using selected text |
 | `Ctrl+Alt+V` | Upload a clipboard image and paste its remote path |
 
-During dictation, microphone audio is buffered locally while a voice visualizer
-in the pill overlay shows the input level. Transcription runs once when you
+During dictation, microphone audio is buffered locally while the pill overlay
+shows a live waveform with a cyan border. Transcription runs once when you
 stop, as a single full-utterance request for a better result than streaming
-partials. Use `Enter` to finish and transcribe, or `Esc` to cancel.
+partials; while it works, the pill shows a calm shimmer. The pill carries no
+text: state and errors are reported through the tray tooltip and the log. Use
+`Enter` to finish and transcribe, or `Esc` to cancel.
 
 ## Activity records
 

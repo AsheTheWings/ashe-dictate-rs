@@ -2,9 +2,12 @@
 
 use crate::logger;
 use crate::util::{pcwstr, wide};
-use iced::widget::{column, container, row, text};
+use iced::widget::{canvas, container};
 use iced::window;
-use iced::{Background, Color, Element, Length, Point, Shadow, Size, Task, Vector};
+use iced::{
+    Background, Color, Element, Length, Point, Rectangle, Renderer, Shadow, Size, Task, Theme,
+    Vector, mouse,
+};
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
@@ -24,12 +27,11 @@ const _: () = assert!(
     "pill ends stay fully rounded"
 );
 const _: () = assert!(HEIGHT < WIDTH, "pill stays wider than tall");
-const STATUS_FONT_SIZE: u32 = 12;
-const BODY_FONT_SIZE: u32 = 14;
-const VISUALIZER_BARS: usize = 24;
-const VISUALIZER_BAR_WIDTH: f32 = 3.0;
-const VISUALIZER_MAX_HEIGHT: f32 = 26.0;
-const VISUALIZER_MIN_HEIGHT: f32 = 4.0;
+const BAR_COUNT: usize = 56;
+const BAR_MIN_HEIGHT: f32 = 3.0;
+const IDLE_BAR_VALUE: f32 = 0.06;
+const SHIMMER_SPEED: f32 = 0.12;
+const SHIMMER_SPREAD: f32 = 0.55;
 #[cfg(target_os = "windows")]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 #[cfg(target_os = "windows")]
@@ -80,138 +82,178 @@ fn platform_specific_settings() -> window::settings::PlatformSpecific {
     window::settings::PlatformSpecific::default()
 }
 
-/// Everything the dictate pill renders. Bundled so the pill signature stays
-/// stable as recording, visualizer, and result states evolve.
-pub struct DictateContent<'a> {
-    pub status: &'a str,
-    pub transcript: &'a str,
-    pub polished: Option<&'a str>,
-    pub error: Option<&'a str>,
-    pub audio_level: f32,
-    pub level_history: &'a [f32],
-    pub recording: bool,
-    pub elapsed_secs: u64,
+/// Visual lifecycle of the dictate pill. State is carried by color and
+/// motion; the pill itself renders no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillState {
+    /// Microphone hot. Bars follow the live input level.
+    Listening,
+    /// Transcribing or polishing. Calm shimmer, distinct from listening.
+    Working,
+    /// Last operation failed.
+    Error,
+    /// Text actions and other quiet states.
+    Idle,
 }
 
-pub fn view<'a, Message: 'a>(content: &DictateContent<'a>) -> Element<'a, Message> {
-    let body = content
-        .polished
-        .or_else(|| {
-            let text = content.transcript.trim();
-            (!text.is_empty()).then_some(text)
-        })
-        .unwrap_or("Speak naturally; transcription runs when you stop.");
-    let body = single_line_preview(body);
-    let listening =
-        content.recording
-            || content.status.starts_with("Listening")
-            || content.status == "Speech detected";
-    let status = if let Some(error) = content.error {
-        format!("{} · {error}", content.status)
-    } else {
-        content.status.to_string()
+/// Everything the dictate pill renders: a level snapshot, the live level,
+/// the lifecycle state, and an animation frame counter.
+pub struct PillContent<'a> {
+    pub levels: &'a [f32],
+    pub audio_level: f32,
+    pub state: PillState,
+    pub frame: u64,
+}
+
+pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
+    let program = VoiceProgram {
+        bars: content.levels.to_vec(),
+        level: content.audio_level,
+        state: content.state,
+        frame: content.frame,
     };
-    let dot = text("●".to_string()).size(11);
-    let status_text = text(status).size(STATUS_FONT_SIZE).width(Length::Fill);
-    let timer = text(format_elapsed(content.elapsed_secs)).size(STATUS_FONT_SIZE);
-    let status_row = row![dot, status_text, timer].spacing(6).align_y(iced::Alignment::Center);
-    let body_text = text(body).size(BODY_FONT_SIZE).width(Length::Fill);
-    let text_column = column![status_row, body_text].spacing(2).width(Length::Fill);
-    let visualizer = visualizer_row(content.level_history, content.audio_level, listening);
-    let layout = row![text_column, visualizer]
-        .spacing(12)
-        .align_y(iced::Alignment::Center);
-    container(layout)
+    let visualizer = canvas(program).width(Length::Fill).height(Length::Fill);
+    container(visualizer)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding([10, 18])
+        .padding([8, 20])
         .clip(true)
-        .style(move |_| {
-            let background = Color::from_rgba(0.025, 0.035, 0.055, 0.95);
-            let border = if listening {
-                Color::from_rgba(0.0, 0.88, 1.0, 0.88)
-            } else {
-                background
-            };
-            container::Style {
-                text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
-                background: Some(Background::Color(background)),
-                border: iced::border::rounded(CORNER_RADIUS)
-                    .width(BORDER_WIDTH)
-                    .color(border),
-                shadow: Shadow {
-                    color: Color::TRANSPARENT,
-                    offset: Vector::ZERO,
-                    blur_radius: 0.0,
-                },
-                ..Default::default()
-            }
+        .style(move |_| container::Style {
+            text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
+            background: Some(Background::Color(Color::from_rgba(
+                0.025, 0.035, 0.055, 0.95,
+            ))),
+            border: iced::border::rounded(CORNER_RADIUS)
+                .width(BORDER_WIDTH)
+                .color(content.state.border_color()),
+            shadow: Shadow {
+                color: Color::TRANSPARENT,
+                offset: Vector::ZERO,
+                blur_radius: 0.0,
+            },
+            ..Default::default()
         })
         .into()
 }
 
-fn visualizer_row<'a, Message: 'a>(
-    history: &[f32],
+impl PillState {
+    fn border_color(self) -> Color {
+        let background = Color::from_rgba(0.025, 0.035, 0.055, 0.95);
+        match self {
+            Self::Listening => Color::from_rgba(0.0, 0.88, 1.0, 0.88),
+            Self::Working => Color::from_rgba(0.0, 0.88, 1.0, 0.45),
+            Self::Error => Color::from_rgba(1.0, 0.32, 0.28, 0.85),
+            Self::Idle => background,
+        }
+    }
+}
+
+/// Canvas program drawing the voice waveform: center-mirrored rounded bars
+/// whose height and alpha follow the audio level while listening, a slow
+/// traveling shimmer while working, and red bars on error.
+#[derive(Debug, Clone)]
+struct VoiceProgram {
+    bars: Vec<f32>,
     level: f32,
-    active: bool,
-) -> Element<'a, Message> {
-    let mut bars = row![].spacing(2).align_y(iced::Alignment::Center);
-    let start = history.len().saturating_sub(VISUALIZER_BARS);
-    let mut values: Vec<f32> = history[start..].to_vec();
-    if values.len() < VISUALIZER_BARS {
-        let mut padded = vec![0.0; VISUALIZER_BARS - values.len()];
-        padded.append(&mut values);
-        values = padded;
-    }
-    if active
-        && let Some(last) = values.last_mut()
-    {
-        *last = level.clamp(0.0, 1.0).max(*last);
-    }
-    for value in values {
-        let normalized = value.clamp(0.0, 1.0);
-        let height = VISUALIZER_MIN_HEIGHT + normalized * (VISUALIZER_MAX_HEIGHT - VISUALIZER_MIN_HEIGHT);
-        let color = if active {
-            Color::from_rgba(0.0, 0.88, 1.0, 0.35 + 0.6 * normalized)
+    state: PillState,
+    frame: u64,
+}
+
+impl<Message> canvas::Program<Message> for VoiceProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut values = if self.bars.len() > BAR_COUNT {
+            self.bars[self.bars.len() - BAR_COUNT..].to_vec()
         } else {
-            Color::from_rgba(0.86, 0.95, 1.0, 0.18)
+            self.bars.clone()
         };
-        let bar = container(text(String::new()).size(1))
-            .width(Length::Fixed(VISUALIZER_BAR_WIDTH))
-            .height(Length::Fixed(height))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(color)),
-                border: iced::border::rounded(2),
-                ..Default::default()
-            });
-        bars = bars.push(bar);
+        if self.state == PillState::Listening
+            && let Some(last) = values.last_mut()
+        {
+            *last = self.level.clamp(0.0, 1.0).max(*last);
+        }
+        while values.len() < BAR_COUNT {
+            values.insert(0, 0.0);
+        }
+        let specs = bar_specs(&values, bounds.width, BAR_COUNT);
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        for (index, spec) in specs.iter().enumerate() {
+            let value = match self.state {
+                PillState::Listening | PillState::Error => spec.value,
+                PillState::Working => 0.16 + 0.30 * work_shimmer(index, BAR_COUNT, self.frame),
+                PillState::Idle => IDLE_BAR_VALUE,
+            };
+            let height = BAR_MIN_HEIGHT + value * (bounds.height - BAR_MIN_HEIGHT);
+            let color = match self.state {
+                PillState::Listening | PillState::Working => {
+                    Color::from_rgba(0.0, 0.88, 1.0, 0.30 + 0.65 * value)
+                }
+                PillState::Error => Color::from_rgba(1.0, 0.32, 0.28, 0.35 + 0.55 * value),
+                PillState::Idle => Color::from_rgba(0.86, 0.95, 1.0, 0.22),
+            };
+            let bar = canvas::Path::rounded_rectangle(
+                Point::new(spec.x, (bounds.height - height) / 2.0),
+                Size::new(spec.width, height),
+                (spec.width / 2.0).into(),
+            );
+            frame.fill(&bar, color);
+        }
+        vec![frame.into_geometry()]
     }
-    container(bars)
-        .width(Length::Shrink)
-        .height(Length::Fixed(VISUALIZER_MAX_HEIGHT + 4.0))
-        .style(|_| container::Style::default())
-        .into()
 }
 
-fn single_line_preview(body: &str) -> String {
-    let first_line = body.split(['\r', '\n']).next().unwrap_or("").trim();
-    const MAX_CHARS: usize = 72;
-    let truncated: String = first_line.chars().take(MAX_CHARS + 1).collect();
-    if truncated.chars().count() > MAX_CHARS {
-        format!("{}…", truncated.chars().take(MAX_CHARS).collect::<String>())
-    } else {
-        truncated
+/// Horizontal layout of one [`BarSpec`] per bar: even pitch across the area
+/// with neighbor-averaged values so motion stays fluid instead of jagged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarSpec {
+    pub x: f32,
+    pub width: f32,
+    pub value: f32,
+}
+
+pub fn bar_specs(values: &[f32], area_width: f32, bar_count: usize) -> Vec<BarSpec> {
+    if bar_count == 0 || area_width <= 0.0 {
+        return Vec::new();
     }
+    let pitch = area_width / bar_count as f32;
+    let width = (pitch * 0.55).clamp(2.0, 4.0);
+    let start = values.len().saturating_sub(bar_count);
+    let window = &values[start..];
+    let pad = bar_count.saturating_sub(window.len());
+    (0..bar_count)
+        .map(|index| {
+            let value = if index < pad || window.is_empty() {
+                0.0
+            } else {
+                let position = index - pad;
+                let at = |offset: usize| window[offset.min(window.len() - 1)];
+                (at(position.saturating_sub(1)) + at(position) + at(position + 1)) / 3.0
+            };
+            BarSpec {
+                x: index as f32 * pitch + (pitch - width) / 2.0,
+                width,
+                value: value.clamp(0.0, 1.0),
+            }
+        })
+        .collect()
 }
 
-fn format_elapsed(total_secs: u64) -> String {
-    format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
-}
-
-/// Retained for existing call sites. The pill shows a single-line preview
-/// with no scrollable transcript, so there is nothing to scroll.
-pub fn scroll_transcript_to_end<Message>() -> Task<Message> {
-    Task::none()
+/// Slow traveling wave driving the [`PillState::Working`] shimmer. Pure and
+/// deterministic in bar index and animation frame.
+pub fn work_shimmer(bar: usize, bar_count: usize, frame: u64) -> f32 {
+    if bar_count == 0 {
+        return 0.0;
+    }
+    let phase = frame as f32 * SHIMMER_SPEED + bar as f32 * SHIMMER_SPREAD;
+    0.5 + 0.5 * phase.sin()
 }
 
 pub fn apply_native_styles() {
@@ -308,18 +350,49 @@ mod tests {
     }
 
     #[test]
-    fn body_preview_stays_single_line() {
-        assert_eq!(
-            super::single_line_preview("hello\nworld"),
-            "hello".to_string()
-        );
-        let long = "a".repeat(100);
-        assert!(super::single_line_preview(&long).ends_with('…'));
+    fn bar_specs_cover_the_area_with_even_pitch() {
+        let values = vec![0.5; 8];
+        let specs = super::bar_specs(&values, 160.0, 8);
+        assert_eq!(specs.len(), 8);
+        for pair in specs.windows(2) {
+            let pitch = pair[1].x - pair[0].x;
+            assert!((pitch - 20.0).abs() < 0.001);
+            assert_eq!(pair[0].width, pair[1].width);
+        }
+        for spec in &specs {
+            assert!(spec.x >= 0.0);
+            assert!(spec.x + spec.width <= 160.0 + 0.001);
+        }
     }
 
     #[test]
-    fn elapsed_formats_as_minutes_and_seconds() {
-        assert_eq!(super::format_elapsed(0), "00:00".to_string());
-        assert_eq!(super::format_elapsed(75), "01:15".to_string());
+    fn bar_specs_pad_short_histories_and_clamp() {
+        let specs = super::bar_specs(&[2.0, -1.0], 100.0, 4);
+        assert_eq!(specs.len(), 4);
+        assert_eq!(specs[0].value, 0.0);
+        assert_eq!(specs[1].value, 0.0);
+        for spec in &specs {
+            assert!((0.0..=1.0).contains(&spec.value));
+        }
+        assert!(super::bar_specs(&[0.5], 100.0, 0).is_empty());
+        assert!(super::bar_specs(&[0.5], 0.0, 4).is_empty());
+    }
+
+    #[test]
+    fn bar_specs_smooth_neighbors() {
+        let specs = super::bar_specs(&[0.0, 0.3, 0.6, 0.9], 80.0, 4);
+        assert!((specs[0].value - 0.1).abs() < 0.0001);
+        assert!((specs[1].value - 0.3).abs() < 0.0001);
+        assert!((specs[2].value - 0.6).abs() < 0.0001);
+        assert!((specs[3].value - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn work_shimmer_stays_unit_and_moves_with_frame() {
+        let first = super::work_shimmer(3, 8, 10);
+        assert!((0.0..=1.0).contains(&first));
+        assert_eq!(first, super::work_shimmer(3, 8, 10));
+        assert_ne!(first, super::work_shimmer(3, 8, 11));
+        assert_eq!(super::work_shimmer(0, 0, 10), 0.0);
     }
 }

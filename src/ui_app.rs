@@ -11,7 +11,7 @@ use crate::win32_service::{self, Win32Command, Win32Event};
 use crossbeam_channel::{Receiver, Sender};
 use iced::{Element, Point, Subscription, Task, window};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = env!("ASHE_BUILD_ID");
@@ -66,10 +66,9 @@ pub struct UiApp {
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     recorded_pcm: Vec<u8>,
     record_sample_rate: u32,
-    record_started: Option<Instant>,
-    record_elapsed_secs: u64,
     audio_level: f32,
     level_history: Vec<f32>,
+    anim_frame: u64,
     session: Option<DictationSession>,
     text_action: Option<TextAction>,
     window_id: Option<window::Id>,
@@ -118,10 +117,9 @@ impl UiApp {
             audio_rx: None,
             recorded_pcm: Vec::new(),
             record_sample_rate: 0,
-            record_started: None,
-            record_elapsed_secs: 0,
             audio_level: 0.0,
             level_history: Vec::new(),
+            anim_frame: 0,
             session: None,
             text_action: None,
             window_id: None,
@@ -176,19 +174,28 @@ impl UiApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let recording = matches!(
-            self.state,
-            DictationState::Starting | DictationState::Listening
-        );
-        overlay_view::view(&overlay_view::DictateContent {
-            status: &self.status,
-            transcript: &self.transcript,
-            polished: self.polished.as_deref(),
-            error: self.error.as_deref(),
+        // The pill is a text-free state lamp: lifecycle by color and motion,
+        // status words live in the tray tooltip.
+        let state = if self.error.is_some() {
+            overlay_view::PillState::Error
+        } else {
+            match self.state {
+                DictationState::Starting | DictationState::Listening => {
+                    overlay_view::PillState::Listening
+                }
+                DictationState::Transcribing
+                | DictationState::Polishing
+                | DictationState::Inserting => overlay_view::PillState::Working,
+                DictationState::Idle
+                | DictationState::FixingGrammar
+                | DictationState::AnsweringQuestion => overlay_view::PillState::Idle,
+            }
+        };
+        overlay_view::view(overlay_view::PillContent {
+            levels: &self.level_history,
             audio_level: self.audio_level,
-            level_history: &self.level_history,
-            recording,
-            elapsed_secs: self.record_elapsed_secs,
+            state,
+            frame: self.anim_frame,
         })
     }
 
@@ -201,6 +208,9 @@ impl UiApp {
             tasks.push(self.handle_win32_event(event));
         }
         self.pump_audio_capture();
+        if self.visible {
+            self.anim_frame = self.anim_frame.wrapping_add(1);
+        }
         if self.visible && self.advance_overlay_position() {
             tasks.push(self.apply_window_state());
         }
@@ -227,9 +237,6 @@ impl UiApp {
             DictationState::Starting | DictationState::Listening
         ) {
             return;
-        }
-        if let Some(started) = self.record_started {
-            self.record_elapsed_secs = started.elapsed().as_secs();
         }
         let mut peak: f32 = 0.0;
         let mut drained = false;
@@ -348,9 +355,7 @@ impl UiApp {
     fn toggle(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
         match self.state {
             DictationState::Idle => self.start(target_hwnd, position),
-            DictationState::Starting | DictationState::Listening => {
-                self.request_stop()
-            }
+            DictationState::Starting | DictationState::Listening => self.request_stop(),
             DictationState::Transcribing => {
                 logger::info("Transcription already in progress");
                 Task::none()
@@ -376,8 +381,6 @@ impl UiApp {
         }
         self.audio_rx.take();
         self.recorded_pcm.clear();
-        self.record_started = None;
-        self.record_elapsed_secs = 0;
         self.audio_level = 0.0;
         self.level_history.clear();
         self.session = None;
@@ -415,7 +418,7 @@ impl UiApp {
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Last sentence reverted - Win+Shift+H".to_string(),
         ));
-        overlay_view::scroll_transcript_to_end()
+        Task::none()
     }
 
     fn clear_transcript(&mut self) -> Task<Message> {
@@ -439,7 +442,7 @@ impl UiApp {
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Transcript cleared - Win+Shift+H".to_string(),
         ));
-        overlay_view::scroll_transcript_to_end()
+        Task::none()
     }
 
     fn start(&mut self, target_hwnd: isize, position: Point) -> Task<Message> {
@@ -489,8 +492,6 @@ impl UiApp {
         self.record_sample_rate = audio.sample_rate();
         self.recorded_pcm.clear();
         self.audio_rx = Some(audio_rx);
-        self.record_started = Some(Instant::now());
-        self.record_elapsed_secs = 0;
         self.audio_level = 0.0;
         self.level_history.clear();
         self.audio = Some(audio);
@@ -910,7 +911,6 @@ impl UiApp {
         self.text_action = None;
         self.state = DictationState::Idle;
         self.visible = false;
-        self.record_started = None;
         self.target_position = self.position;
         self.send_win32(Win32Command::SetActive(false));
         self.send_win32(Win32Command::SetFollowCursor(false));

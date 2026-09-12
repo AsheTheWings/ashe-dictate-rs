@@ -11,11 +11,7 @@ use deepgram::common::options::Options;
 /// Dictation buffers microphone audio locally while recording and calls this
 /// once on stop. A single full-utterance request produces a more accurate
 /// result than committing streaming partials as they arrive.
-pub async fn transcribe_pcm(
-    config: AppConfig,
-    sample_rate: u32,
-    pcm: Vec<u8>,
-) -> Result<String> {
+pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -> Result<String> {
     if pcm.is_empty() {
         return Err(anyhow!("no audio captured"));
     }
@@ -35,8 +31,8 @@ pub async fn transcribe_pcm(
         seconds,
         config.deepgram_keyterms.len()
     ));
-    let dg =
-        Deepgram::new(config.deepgram_api_key.clone()).context("failed to create Deepgram client")?;
+    let dg = Deepgram::new(config.deepgram_api_key.clone())
+        .context("failed to create Deepgram client")?;
     let options: Options = Options::builder()
         .query_params(config.deepgram_query_params())
         .punctuate(true)
@@ -105,13 +101,13 @@ mod tests {
         assert_eq!(&wav[12..16], b"fmt ");
         assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
         assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
-        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 48_000);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            48_000
+        );
         assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
         assert_eq!(&wav[36..40], b"data");
-        assert_eq!(
-            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
-            4
-        );
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
         assert_eq!(&wav[44..], &pcm[..]);
     }
 
@@ -119,10 +115,7 @@ mod tests {
     fn empty_pcm_still_produces_a_valid_header() {
         let wav = encode_wav_mono16(&[], 16_000);
         assert_eq!(wav.len(), 44);
-        assert_eq!(
-            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
-            0
-        );
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 0);
     }
 
     #[test]
