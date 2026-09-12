@@ -7,6 +7,7 @@ use crate::llm_client;
 use crate::logger;
 use crate::overlay_view;
 use crate::paste_upload::PasteUploader;
+use crate::spectrum::{SpectrumAnalyzer, pcm_chunk_to_mono};
 use crate::win32_service::{self, Win32Command, Win32Event};
 use crossbeam_channel::{Receiver, Sender};
 use iced::{Element, Point, Subscription, Task, window};
@@ -18,7 +19,6 @@ const BUILD_ID: &str = env!("ASHE_BUILD_ID");
 const OVERLAY_TICK_MS: u64 = 16;
 const OVERLAY_SMOOTHING: f32 = 0.28;
 const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
-const VISUALIZER_HISTORY_LEN: usize = 24;
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,8 +66,7 @@ pub struct UiApp {
     audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     recorded_pcm: Vec<u8>,
     record_sample_rate: u32,
-    audio_level: f32,
-    level_history: Vec<f32>,
+    spectrum: SpectrumAnalyzer,
     anim_frame: u64,
     session: Option<DictationSession>,
     text_action: Option<TextAction>,
@@ -107,6 +106,7 @@ impl UiApp {
         let (win32_tx, command_rx) = crossbeam_channel::unbounded();
         let win32_thread = win32_service::spawn(event_tx, command_rx);
         let activity = ActivityHandle::spawn(config.clone());
+        let output_sample_rate = config.output_sample_rate;
         let app = Self {
             config,
             state: DictationState::Idle,
@@ -117,8 +117,7 @@ impl UiApp {
             audio_rx: None,
             recorded_pcm: Vec::new(),
             record_sample_rate: 0,
-            audio_level: 0.0,
-            level_history: Vec::new(),
+            spectrum: SpectrumAnalyzer::new(output_sample_rate),
             anim_frame: 0,
             session: None,
             text_action: None,
@@ -192,8 +191,7 @@ impl UiApp {
             }
         };
         overlay_view::view(overlay_view::PillContent {
-            levels: &self.level_history,
-            audio_level: self.audio_level,
+            bars: self.spectrum.bars(),
             state,
             frame: self.anim_frame,
         })
@@ -229,8 +227,8 @@ impl UiApp {
         Task::batch(tasks)
     }
 
-    /// Drain captured PCM into the recording buffer while updating the voice
-    /// visualizer level. Transcription happens once on stop, not streaming.
+    /// Drain captured PCM into the recording buffer while feeding the live
+    /// voice spectrum. Transcription happens once on stop, not streaming.
     fn pump_audio_capture(&mut self) {
         if !matches!(
             self.state,
@@ -238,30 +236,16 @@ impl UiApp {
         ) {
             return;
         }
-        let mut peak: f32 = 0.0;
-        let mut drained = false;
         if let Some(rx) = self.audio_rx.as_mut() {
             while let Ok(chunk) = rx.try_recv() {
                 if chunk.is_empty() {
                     continue;
                 }
-                drained = true;
-                peak = peak.max(chunk_peak(&chunk));
                 self.recorded_pcm.extend_from_slice(&chunk);
+                self.spectrum.push_samples(&pcm_chunk_to_mono(&chunk));
             }
         }
-        if drained {
-            self.audio_level = peak.max(self.audio_level * 0.55);
-        } else {
-            self.audio_level *= 0.90;
-            if self.audio_level < 0.001 {
-                self.audio_level = 0.0;
-            }
-        }
-        self.level_history.push(self.audio_level);
-        while self.level_history.len() > VISUALIZER_HISTORY_LEN {
-            self.level_history.remove(0);
-        }
+        self.spectrum.update();
     }
 
     fn handle_win32_event(&mut self, event: Win32Event) -> Task<Message> {
@@ -381,8 +365,7 @@ impl UiApp {
         }
         self.audio_rx.take();
         self.recorded_pcm.clear();
-        self.audio_level = 0.0;
-        self.level_history.clear();
+        self.spectrum.reset();
         self.session = None;
         self.state = DictationState::Idle;
         self.visible = false;
@@ -492,8 +475,7 @@ impl UiApp {
         self.record_sample_rate = audio.sample_rate();
         self.recorded_pcm.clear();
         self.audio_rx = Some(audio_rx);
-        self.audio_level = 0.0;
-        self.level_history.clear();
+        self.spectrum = SpectrumAnalyzer::new(self.config.output_sample_rate);
         self.audio = Some(audio);
         self.state = DictationState::Listening;
         self.status = "Listening...".to_string();
@@ -537,7 +519,6 @@ impl UiApp {
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Transcribing... - Win+Shift+H".to_string(),
         ));
-        self.audio_level = 0.0;
         let pcm = std::mem::take(&mut self.recorded_pcm);
         let sample_rate = self.record_sample_rate;
         let config = self.config.clone();
@@ -981,18 +962,6 @@ fn remove_last_sentence(text: &str) -> String {
     String::new()
 }
 
-/// Peak normalized amplitude (0.0..=1.0) of a little-endian mono 16-bit PCM
-/// chunk. Feeds the overlay voice visualizer while recording.
-fn chunk_peak(chunk: &[u8]) -> f32 {
-    let (pairs, _) = chunk.as_chunks::<2>();
-    let mut peak: f32 = 0.0;
-    for pair in pairs {
-        let value = i16::from_le_bytes(*pair) as f32 / 32768.0;
-        peak = peak.max(value.abs());
-    }
-    peak.clamp(0.0, 1.0)
-}
-
 impl Drop for UiApp {
     fn drop(&mut self) {
         if let Some(mut audio) = self.audio.take() {
@@ -1004,7 +973,7 @@ impl Drop for UiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{DictationSession, chunk_peak};
+    use super::DictationSession;
 
     fn session() -> DictationSession {
         DictationSession {
@@ -1019,20 +988,5 @@ mod tests {
         let mut session = session();
         session.raw_transcript = "Hello world.".to_string();
         assert_eq!(session.displayed_transcript(), "Hello world.");
-    }
-
-    #[test]
-    fn chunk_peak_measures_silence_and_full_scale() {
-        assert_eq!(chunk_peak(&[0, 0, 0, 0]), 0.0);
-        assert_eq!(chunk_peak(&[]), 0.0);
-        let full_scale = chunk_peak(&[0xFF, 0x7F]);
-        assert!(full_scale > 0.99 && full_scale <= 1.0);
-        assert_eq!(chunk_peak(&[0x00, 0x80]), 1.0);
-    }
-
-    #[test]
-    fn chunk_peak_ignores_a_trailing_odd_byte() {
-        assert_eq!(chunk_peak(&[0xFF]), 0.0);
-        assert_eq!(chunk_peak(&[0, 0, 0xFF]), 0.0);
     }
 }

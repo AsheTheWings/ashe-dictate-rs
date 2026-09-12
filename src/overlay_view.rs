@@ -27,7 +27,6 @@ const _: () = assert!(
     "pill ends stay fully rounded"
 );
 const _: () = assert!(HEIGHT < WIDTH, "pill stays wider than tall");
-const BAR_COUNT: usize = 56;
 const BAR_MIN_HEIGHT: f32 = 3.0;
 const IDLE_BAR_VALUE: f32 = 0.06;
 const SHIMMER_SPEED: f32 = 0.12;
@@ -96,19 +95,17 @@ pub enum PillState {
     Idle,
 }
 
-/// Everything the dictate pill renders: a level snapshot, the live level,
-/// the lifecycle state, and an animation frame counter.
+/// Everything the dictate pill renders: live spectrum bars, the lifecycle
+/// state, and an animation frame counter.
 pub struct PillContent<'a> {
-    pub levels: &'a [f32],
-    pub audio_level: f32,
+    pub bars: &'a [f32],
     pub state: PillState,
     pub frame: u64,
 }
 
 pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
     let program = VoiceProgram {
-        bars: content.levels.to_vec(),
-        level: content.audio_level,
+        bars: content.bars.to_vec(),
         state: content.state,
         frame: content.frame,
     };
@@ -149,12 +146,11 @@ impl PillState {
 }
 
 /// Canvas program drawing the voice waveform: center-mirrored rounded bars
-/// whose height and alpha follow the audio level while listening, a slow
-/// traveling shimmer while working, and red bars on error.
+/// whose height and alpha follow the live voice spectrum while listening, a
+/// slow traveling shimmer while working, and red bars on error.
 #[derive(Debug, Clone)]
 struct VoiceProgram {
     bars: Vec<f32>,
-    level: f32,
     state: PillState,
     frame: u64,
 }
@@ -170,25 +166,13 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut values = if self.bars.len() > BAR_COUNT {
-            self.bars[self.bars.len() - BAR_COUNT..].to_vec()
-        } else {
-            self.bars.clone()
-        };
-        if self.state == PillState::Listening
-            && let Some(last) = values.last_mut()
-        {
-            *last = self.level.clamp(0.0, 1.0).max(*last);
-        }
-        while values.len() < BAR_COUNT {
-            values.insert(0, 0.0);
-        }
-        let specs = bar_specs(&values, bounds.width, BAR_COUNT);
+        let count = self.bars.len().max(1);
+        let specs = bar_specs(&self.bars, bounds.width, count);
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         for (index, spec) in specs.iter().enumerate() {
             let value = match self.state {
                 PillState::Listening | PillState::Error => spec.value,
-                PillState::Working => 0.16 + 0.30 * work_shimmer(index, BAR_COUNT, self.frame),
+                PillState::Working => 0.16 + 0.30 * work_shimmer(index, count, self.frame),
                 PillState::Idle => IDLE_BAR_VALUE,
             };
             let height = BAR_MIN_HEIGHT + value * (bounds.height - BAR_MIN_HEIGHT);

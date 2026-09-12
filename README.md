@@ -40,7 +40,8 @@ collection. Right-click it to control features, reload configuration, open logs,
 | `Ctrl+Alt+V` | Upload a clipboard image and paste its remote path |
 
 During dictation, microphone audio is buffered locally while the pill overlay
-shows a live waveform with a cyan border. Transcription runs once when you
+shows a live voice spectrum (FFT frequency bands) with a cyan border.
+Transcription runs once when you
 stop, as a single full-utterance request for a better result than streaming
 partials; while it works, the pill shows a calm shimmer. The pill carries no
 text: state and errors are reported through the tray tooltip and the log. Use

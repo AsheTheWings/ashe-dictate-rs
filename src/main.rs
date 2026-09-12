@@ -8,6 +8,7 @@ mod llm_client;
 mod overlay_view;
 mod paste_upload;
 mod screen_capture;
+mod spectrum;
 mod ui_app;
 mod util;
 mod win32_service;
