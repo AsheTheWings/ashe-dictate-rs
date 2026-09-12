@@ -4,10 +4,7 @@ use crate::logger;
 use crate::util::{pcwstr, wide};
 use iced::widget::{canvas, container};
 use iced::window;
-use iced::{
-    Background, Color, Element, Length, Point, Rectangle, Renderer, Shadow, Size, Task, Theme,
-    Vector, mouse,
-};
+use iced::{Color, Element, Length, Point, Rectangle, Renderer, Size, Task, Theme, mouse};
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
@@ -23,7 +20,16 @@ pub const TITLE: &str = "Ashe Worker";
 pub const WIDTH: f32 = 285.0;
 pub const HEIGHT: f32 = 64.0;
 const CORNER_RADIUS: u32 = 32;
-const BORDER_WIDTH: f32 = 3.0;
+const BORDER_WIDTH: f32 = 4.0;
+/// Clearance between the window edge and the border stroke's outer edge.
+/// The window region never touches the stroke, so its width renders
+/// uniformly instead of being clipped unevenly by the 1-bit region mask.
+const BORDER_CLEARANCE: f32 = 2.0;
+/// Horizontal margin between the window edge and the bar area. Identical
+/// on both ends by construction.
+const BAR_MARGIN: f32 = 12.0;
+/// Vertical inset of the bar area; bars stay centered in the full height.
+const BAR_VERTICAL_INSET: f32 = 8.0;
 const _: () = assert!(HEIGHT <= 96.0, "dictate overlay stays pill height");
 const _: () = assert!(WIDTH <= 480.0, "dictate overlay stays compact");
 const _: () = assert!(
@@ -114,26 +120,12 @@ pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
         frame: content.frame,
     };
     let visualizer = canvas(program).width(Length::Fill).height(Length::Fill);
+    // The container is a transparent pass-through: the canvas paints the
+    // background, the border stroke, and the bars with exact insets, so no
+    // framework border or padding can drift asymmetrically.
     container(visualizer)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(8)
-        .clip(true)
-        .style(move |_| container::Style {
-            text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
-            background: Some(Background::Color(Color::from_rgba(
-                0.025, 0.035, 0.055, 0.95,
-            ))),
-            border: iced::border::rounded(CORNER_RADIUS)
-                .width(BORDER_WIDTH)
-                .color(content.state.border_color()),
-            shadow: Shadow {
-                color: Color::TRANSPARENT,
-                offset: Vector::ZERO,
-                blur_radius: 0.0,
-            },
-            ..Default::default()
-        })
         .into()
 }
 
@@ -171,15 +163,41 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let count = self.bars.len().max(1);
-        let specs = bar_specs(&self.bars, bounds.width, count);
         let mut frame = canvas::Frame::new(renderer, bounds.size());
+        // Square background: the window region provides the pill shape, so
+        // the region clips solid fill instead of a rounded painted edge.
+        frame.fill_rectangle(
+            Point::ORIGIN,
+            bounds.size(),
+            Color::from_rgba(0.025, 0.035, 0.055, 0.95),
+        );
+        // Border stroke fully inside the region with uniform width and
+        // antialiased edges on every side, including the caps.
+        let stroke_inset = BORDER_CLEARANCE + BORDER_WIDTH / 2.0;
+        let border = canvas::Path::rounded_rectangle(
+            Point::new(stroke_inset, stroke_inset),
+            Size::new(
+                bounds.width - 2.0 * stroke_inset,
+                bounds.height - 2.0 * stroke_inset,
+            ),
+            (CORNER_RADIUS as f32 - stroke_inset).into(),
+        );
+        frame.stroke(
+            &border,
+            canvas::Stroke::default()
+                .with_color(self.state.border_color())
+                .with_width(BORDER_WIDTH),
+        );
+        let (bars_x, bars_width) = bars_area(bounds.width);
+        let specs = bar_specs(&self.bars, bars_width, count);
+        let bars_height = bounds.height - 2.0 * BAR_VERTICAL_INSET;
         for (index, spec) in specs.iter().enumerate() {
             let value = match self.state {
                 PillState::Listening | PillState::Error => spec.value,
                 PillState::Working => 0.16 + 0.30 * work_shimmer(index, count, self.frame),
                 PillState::Idle => IDLE_BAR_VALUE,
             };
-            let height = BAR_MIN_HEIGHT + value * (bounds.height - BAR_MIN_HEIGHT);
+            let height = BAR_MIN_HEIGHT + value * (bars_height - BAR_MIN_HEIGHT);
             let color = match self.state {
                 PillState::Listening | PillState::Working => {
                     Color::from_rgba(0.0, 0.88, 1.0, 0.30 + 0.65 * value)
@@ -188,7 +206,7 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
                 PillState::Idle => Color::from_rgba(0.86, 0.95, 1.0, 0.22),
             };
             let bar = canvas::Path::rounded_rectangle(
-                Point::new(spec.x, (bounds.height - height) / 2.0),
+                Point::new(bars_x + spec.x, (bounds.height - height) / 2.0),
                 Size::new(spec.width, height),
                 (spec.width / 2.0).into(),
             );
@@ -196,6 +214,12 @@ impl<Message> canvas::Program<Message> for VoiceProgram {
         }
         vec![frame.into_geometry()]
     }
+}
+
+/// Horizontal bar area for a window of the given width: `(x_offset,
+/// width)`. One margin on each side keeps both pill ends identical.
+pub fn bars_area(total_width: f32) -> (f32, f32) {
+    (BAR_MARGIN, (total_width - 2.0 * BAR_MARGIN).max(0.0))
 }
 
 /// Horizontal layout of one [`BarSpec`] per bar: even pitch across the area
@@ -403,6 +427,14 @@ mod tests {
             super::inset_region_px(570, 128, 128),
             (1, 1, 569, 127, 126, 126)
         );
+    }
+
+    #[test]
+    fn bar_area_keeps_equal_margins_on_both_ends() {
+        assert_eq!(super::bars_area(285.0), (12.0, 261.0));
+        let (offset, width) = super::bars_area(285.0);
+        assert_eq!(285.0 - (offset + width), offset);
+        assert_eq!(super::bars_area(10.0), (12.0, 0.0));
     }
 
     #[test]

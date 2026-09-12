@@ -127,8 +127,16 @@ pub fn map_bins_to_bands(
 }
 
 /// Scale bands relative to the frame peak with a square-root lift so quiet
-/// voice energy stays visible next to loud vowels.
+/// voice energy stays visible next to loud vowels. A gentle treble tilt
+/// compensates the natural downward slope of voice spectra so consonants
+/// on the right of the pill read next to bass-heavy vowels on the left.
+const TREBLE_TILT: f32 = 0.5;
+
 pub fn normalize_relative(bands: &mut [f32]) {
+    let denom = bands.len().saturating_sub(1).max(1) as f32;
+    for (index, value) in bands.iter_mut().enumerate() {
+        *value *= 1.0 + TREBLE_TILT * index as f32 / denom;
+    }
     let max = bands.iter().fold(0.0f32, |peak, value| peak.max(*value));
     if max <= 0.0 {
         bands.fill(0.0);
@@ -190,11 +198,20 @@ mod tests {
         let mut bands = vec![0.25, 1.0, 0.0];
         normalize_relative(&mut bands);
         assert_eq!(bands[1], 1.0);
-        assert_eq!(bands[0], 0.5);
         assert_eq!(bands[2], 0.0);
+        // Tilted [0.25, 1.25, 0.0] peaks at 1.25: sqrt(0.25 / 1.25).
+        assert!((bands[0] - 0.4472).abs() < 0.0001);
         let mut silent = vec![0.0, 0.0];
         normalize_relative(&mut silent);
         assert_eq!(silent, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn treble_tilt_breaks_ties_toward_the_right() {
+        let mut bands = vec![1.0, 1.0, 1.0];
+        normalize_relative(&mut bands);
+        assert_eq!(bands[2], 1.0);
+        assert!(bands[0] < bands[1] && bands[1] < bands[2]);
     }
 
     #[test]
