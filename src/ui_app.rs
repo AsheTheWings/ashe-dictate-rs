@@ -23,7 +23,7 @@ const OVERLAY_SMOOTHING: f32 = 0.28;
 const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
 const TYPING_PREVIEW_CHARACTERS: usize = 256;
 const LINE_BREAK_SYMBOL: &str = "↵";
-const LINE_BREAK_FEEDBACK_DURATION: Duration = Duration::from_millis(1_500);
+const LINE_BREAK_FEEDBACK_DURATION: Duration = Duration::from_millis(1_000);
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -510,8 +510,12 @@ impl UiApp {
     fn capture_backspace(&mut self) -> Task<Message> {
         if self.state == DictationState::Typing
             && let Some(session) = self.session.as_mut()
+            && session.backspace()
+            && session.typing_is_empty()
         {
-            session.backspace();
+            // Clearing the buffer resumes listening without committing.
+            logger::info("Dictation typing cleared; resuming listening");
+            return self.resume_audio_capture();
         }
         Task::none()
     }
@@ -546,15 +550,7 @@ impl UiApp {
             });
             self.dictation_insertion_count = count;
             logger::info(format!("Dictation insertion committed count={count}"));
-            if let Err(error) = self.start_audio_capture() {
-                logger::info(format!("Audio resume failed: {error:#}"));
-                self.send_win32(Win32Command::ShowMessageBox {
-                    title: "Ashe Worker".to_string(),
-                    text: format!("Could not resume audio capture: {error}"),
-                });
-                return self.request_stop();
-            }
-            return Task::none();
+            return self.resume_audio_capture();
         }
         if matches!(
             self.state,
@@ -564,6 +560,20 @@ impl UiApp {
         } else {
             Task::none()
         }
+    }
+
+    /// Restart capture after typing ends without submitting.
+    fn resume_audio_capture(&mut self) -> Task<Message> {
+        if let Err(error) = self.start_audio_capture() {
+            logger::info(format!("Audio resume failed: {error:#}"));
+            self.send_win32(Win32Command::ShowMessageBox {
+                title: "Ashe Worker".to_string(),
+                text: format!("Could not resume audio capture: {error}"),
+            });
+            return self.request_stop();
+        }
+        self.send_win32(Win32Command::EndTyping);
+        Task::none()
     }
 
     fn handle_line_break(&mut self) -> Task<Message> {

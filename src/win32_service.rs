@@ -85,6 +85,7 @@ pub enum Win32Event {
 pub enum Win32Command {
     SetActive(bool),
     SetKeyboardCapture(bool),
+    EndTyping,
     SetFollowCursor(bool),
     SetTooltip(String),
     SetActivityStatus {
@@ -418,6 +419,13 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
             }
             Win32Command::SetKeyboardCapture(active) => {
                 set_keyboard_capture(state, active);
+            }
+            Win32Command::EndTyping => {
+                KEYBOARD_HOOK_STATE.with(|hook_state| {
+                    if let Some(hook_state) = hook_state.borrow_mut().as_mut() {
+                        unsafe { hook_state.end_typing() };
+                    }
+                });
             }
             Win32Command::SetFollowCursor(follow) => {
                 state.follow_cursor = follow;
@@ -764,6 +772,13 @@ impl KeyboardHookState {
             self.typing = true;
             let _ = self.event_tx.send(Win32Event::TypingStarted);
         }
+    }
+
+    /// Drop hook-local typing residue after the app resumes listening
+    /// without a submit, so further keys classify as listening input.
+    unsafe fn end_typing(&mut self) {
+        self.typing = false;
+        unsafe { self.clear_dead_key_state() };
     }
 
     fn update_key_state(&mut self, vk: u32, is_down: bool, was_down: bool) {
@@ -1419,6 +1434,28 @@ mod tests {
             Ok(Win32Event::SubmitRequested)
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn end_typing_releases_backspace_to_listening() {
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let mut state = KeyboardHookState {
+            event_tx,
+            keyboard_state: [0; 256],
+            physical_down: [false; 256],
+            captured: [false; 256],
+            accepting: true,
+            typing: true,
+            dead_key_pending: false,
+        };
+        unsafe { state.end_typing() };
+        assert!(!state.typing);
+        assert!(state.accepting);
+        let backspace = KBDLLHOOKSTRUCT {
+            vkCode: VK_BACK.0 as u32,
+            ..Default::default()
+        };
+        assert!(!unsafe { state.handle_key(&backspace, true) });
     }
 
     #[test]
