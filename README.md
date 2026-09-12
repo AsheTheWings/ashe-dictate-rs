@@ -41,22 +41,25 @@ collection. Right-click it to control features, reload configuration, open logs,
 
 During dictation, microphone audio is buffered locally while the pill overlay
 shows a live voice spectrum. Printable input and `Ctrl+V` switch to a private
-typing buffer without writing into the foreground application. The upper bar
-shows a clipped preview, represents clipboard spans as `[pasted]`, and counts
-committed insertions; `Backspace` edits the buffer. Press `Enter` with content
-to commit it and resume listening. Press `Enter` with an empty buffer to finish,
-or `Esc` to cancel the whole session. Navigation and unrelated system shortcuts
-continue to work normally. Direct IME and emoji-panel composition is not
-captured; use `Ctrl+V` for that content.
+typing buffer without writing into the foreground application. A status bar is
+always rendered above the pill as one connected body, with no border across
+the contact surface. Its left side always shows the insertion count. While
+typing with content it shows a trailing preview, representing clipboard
+spans as `[pasted]`; otherwise it shows a centered recording timer.
+`Backspace` edits the buffer. Press `Enter` with content to commit it and
+resume listening. Press `Enter` with an empty buffer to finish, or `Esc` to
+cancel the whole session. Navigation and unrelated system shortcuts continue
+to work normally. Direct IME and emoji-panel composition is not captured;
+use `Ctrl+V` for that content.
 
-Natural pauses remain intact. After two seconds of continuous silence the pill
-shows a countdown; at five seconds, dead air is compacted locally and is never
-submitted as a separate request. When the session finishes, all retained speech
-is sent once through the fal.ai queue API (`FAL_STT_MODEL`, default scribe-v2),
-then interleaved with exact typed and pasted content using word timestamps. The
-result is inserted once into the application where dictation started, with no
-LLM polishing. While fal.ai is working, the pill shows `processing...`.
-Dictation requires `FAL_KEY`.
+Natural pauses remain intact. Once silence reaches five seconds, dead air is
+compacted locally and the bar shows `silence skipped` instead of the timer;
+compacted audio is never submitted as a separate request. When the session
+finishes, all retained speech is sent once through the fal.ai queue API
+(`FAL_STT_MODEL`, default scribe-v2), then interleaved with exact typed and
+pasted content using word timestamps. The result is inserted once into the
+application where dictation started, with no LLM polishing. While fal.ai is
+working, the pill shows `processing...`. Dictation requires `FAL_KEY`.
 
 ## Activity records
 

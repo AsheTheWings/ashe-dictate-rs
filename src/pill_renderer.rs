@@ -2,16 +2,18 @@ use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Transform};
 
 pub const WIDTH: f32 = 428.0;
 pub const PILL_HEIGHT: f32 = 64.0;
-pub const MAIN_TOP: f32 = 20.0;
+pub const MAIN_TOP: f32 = 31.2;
 pub const HEIGHT: f32 = MAIN_TOP + PILL_HEIGHT;
-pub const TOP_BAR_X: f32 = 34.0;
+pub const TOP_BAR_X: f32 = 52.0;
 pub const TOP_BAR_Y: f32 = 0.0;
 pub const TOP_BAR_WIDTH: f32 = WIDTH - 2.0 * TOP_BAR_X;
-pub const TOP_BAR_HEIGHT: f32 = 26.0;
-pub const TOP_BAR_TEXT_INSET: f32 = 10.0;
-pub const TOP_BAR_COUNT_WIDTH: f32 = 76.0;
+pub const TOP_BAR_HEIGHT: f32 = 31.2;
+pub const TOP_BAR_TEXT_INSET: f32 = 12.0;
+pub const TOP_BAR_COUNT_WIDTH: f32 = 96.0;
+pub const TOP_BAR_CONTENT_GAP: f32 = 2.0;
 const BORDER_WIDTH: f32 = 2.0;
-const TOP_BAR_BORDER_WIDTH: f32 = 1.5;
+const TOP_BAR_CORNER_RADIUS: f32 = 10.0;
+const TOP_BAR_SHOULDER_RADIUS: f32 = 10.0;
 /// Keep the antialiased edge inside the layered bitmap.
 const PILL_EDGE_INSET: f32 = 1.0;
 /// Horizontal margin between the pill edge and the bar area. Identical on
@@ -24,7 +26,7 @@ const BACKGROUND: [u8; 4] = [6, 19, 25, 255];
 const LISTENING_BORDER: [u8; 4] = [0, 197, 224, 255];
 const WORKING_BORDER: [u8; 4] = [0, 101, 115, 255];
 const ERROR_BORDER: [u8; 4] = [217, 69, 61, 255];
-const _: () = assert!(HEIGHT <= 96.0, "dictate overlay stays compact");
+const _: () = assert!(HEIGHT <= 104.0, "dictate overlay stays compact");
 const _: () = assert!(WIDTH <= 480.0, "dictate overlay stays compact");
 const _: () = assert!(PILL_HEIGHT < WIDTH, "pill stays wider than tall");
 
@@ -41,10 +43,17 @@ pub enum PillState {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopBarAlignment {
+    Center,
+    Trailing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypingBarContent {
+pub struct TopBarContent {
     pub count: String,
-    pub preview: String,
+    pub content: String,
+    pub alignment: TopBarAlignment,
 }
 
 impl PillState {
@@ -68,88 +77,53 @@ pub fn render_rgba(
     bars: &[f32],
     state: PillState,
     show_visualizer: bool,
-    show_typing_bar: bool,
+    show_top_bar: bool,
 ) -> Option<Vec<u8>> {
     let mut pixmap = Pixmap::new(pixel_width, pixel_height)?;
     let scale = pixel_width as f32 / WIDTH;
     let transform = Transform::from_scale(scale, scale);
 
-    if show_typing_bar {
+    if show_top_bar {
         fill_capsule(
             &mut pixmap,
-            capsule_path(TOP_BAR_X, TOP_BAR_Y, TOP_BAR_WIDTH, TOP_BAR_HEIGHT)?,
-            LISTENING_BORDER,
+            connected_body_path(PILL_EDGE_INSET)?,
+            state.border(),
             transform,
         );
-        let inset = TOP_BAR_BORDER_WIDTH;
+        fill_capsule(
+            &mut pixmap,
+            connected_body_path(PILL_EDGE_INSET + BORDER_WIDTH)?,
+            BACKGROUND,
+            transform,
+        );
+        symmetrize_horizontal(&mut pixmap);
+    } else {
+        let outer = PILL_EDGE_INSET;
         fill_capsule(
             &mut pixmap,
             capsule_path(
-                TOP_BAR_X + inset,
-                TOP_BAR_Y + inset,
-                TOP_BAR_WIDTH - 2.0 * inset,
-                TOP_BAR_HEIGHT - 2.0 * inset,
+                outer,
+                MAIN_TOP + outer,
+                WIDTH - 2.0 * outer,
+                PILL_HEIGHT - 2.0 * outer,
+            )?,
+            state.border(),
+            transform,
+        );
+        let inner = outer + BORDER_WIDTH;
+        fill_capsule(
+            &mut pixmap,
+            capsule_path(
+                inner,
+                MAIN_TOP + inner,
+                WIDTH - 2.0 * inner,
+                PILL_HEIGHT - 2.0 * inner,
             )?,
             BACKGROUND,
             transform,
         );
+        symmetrize_horizontal(&mut pixmap);
     }
-
-    let main_height = (PILL_HEIGHT * scale).round().max(1.0) as u32;
-    let main = render_main_rgba(pixel_width, main_height, bars, state, show_visualizer)?;
-    let main_top = (MAIN_TOP * scale).round().max(0.0) as usize;
-    let row_bytes = pixel_width as usize * 4;
-    for (row, source) in main.chunks_exact(row_bytes).enumerate() {
-        let destination_start = (main_top + row) * row_bytes;
-        let destination_end = destination_start + row_bytes;
-        if destination_end <= pixmap.data().len() {
-            pixmap.data_mut()[destination_start..destination_end].copy_from_slice(source);
-        }
-    }
-    symmetrize_horizontal(&mut pixmap);
-
-    Some(pixmap.take())
-}
-
-fn render_main_rgba(
-    pixel_width: u32,
-    pixel_height: u32,
-    bars: &[f32],
-    state: PillState,
-    show_visualizer: bool,
-) -> Option<Vec<u8>> {
-    let mut pixmap = Pixmap::new(pixel_width, pixel_height)?;
-    let transform = Transform::from_scale(
-        pixel_width as f32 / WIDTH,
-        pixel_height as f32 / PILL_HEIGHT,
-    );
-
-    fill_capsule(
-        &mut pixmap,
-        capsule_path(
-            PILL_EDGE_INSET,
-            PILL_EDGE_INSET,
-            WIDTH - 2.0 * PILL_EDGE_INSET,
-            PILL_HEIGHT - 2.0 * PILL_EDGE_INSET,
-        )?,
-        state.border(),
-        transform,
-    );
-
-    let inner_inset = PILL_EDGE_INSET + BORDER_WIDTH;
-    fill_capsule(
-        &mut pixmap,
-        capsule_path(
-            inner_inset,
-            inner_inset,
-            WIDTH - 2.0 * inner_inset,
-            PILL_HEIGHT - 2.0 * inner_inset,
-        )?,
-        BACKGROUND,
-        transform,
-    );
-    symmetrize_horizontal(&mut pixmap);
-    symmetrize_vertical(&mut pixmap);
 
     if state != PillState::Working && show_visualizer {
         let (bars_x, bars_width) = bars_area(WIDTH);
@@ -169,7 +143,7 @@ fn render_main_rgba(
             };
             if let Some(path) = capsule_path(
                 bars_x + spec.x,
-                (PILL_HEIGHT - height) / 2.0,
+                MAIN_TOP + (PILL_HEIGHT - height) / 2.0,
                 spec.width,
                 height,
             ) {
@@ -177,10 +151,9 @@ fn render_main_rgba(
             }
         }
     }
-    // Every bar is centered on the horizontal axis. Normalize subpixel
-    // coverage so the top and bottom halves remain byte-identical at any DPI.
-    symmetrize_vertical(&mut pixmap);
-
+    if !show_top_bar {
+        symmetrize_vertical_region(&mut pixmap, MAIN_TOP, PILL_HEIGHT, scale);
+    }
     Some(pixmap.take())
 }
 
@@ -205,13 +178,19 @@ fn symmetrize_horizontal(pixmap: &mut Pixmap) {
     }
 }
 
-fn symmetrize_vertical(pixmap: &mut Pixmap) {
+fn symmetrize_vertical_region(pixmap: &mut Pixmap, top: f32, height: f32, scale: f32) {
     let width = pixmap.width() as usize;
-    let height = pixmap.height() as usize;
+    let start = (top * scale).round().max(0.0) as usize;
+    let region_height = (height * scale).round().max(0.0) as usize;
+    let end = start
+        .saturating_add(region_height)
+        .min(pixmap.height() as usize);
     let pixels = pixmap.data_mut();
-    for y in 0..height / 2 {
+    for offset in 0..(end - start) / 2 {
+        let upper = start + offset;
+        let lower = end - 1 - offset;
         for x in 0..width {
-            average_pixel_pair(pixels, y * width + x, (height - 1 - y) * width + x);
+            average_pixel_pair(pixels, upper * width + x, lower * width + x);
         }
     }
 }
@@ -225,6 +204,113 @@ fn average_pixel_pair(pixels: &mut [u8], first_pixel: usize, second_pixel: usize
         pixels[first + channel] = average as u8;
         pixels[second + channel] = average as u8;
     }
+}
+
+/// Build the outline shared by the raised bar and main pill. The bar has no
+/// bottom edge: concave shoulders turn its sides directly into the main top
+/// edge so the two regions read as one continuous body.
+fn connected_body_path(inset: f32) -> Option<Path> {
+    let border_offset = (inset - PILL_EDGE_INSET).max(0.0);
+    let main_left = inset;
+    let main_right = WIDTH - inset;
+    let main_top = MAIN_TOP + inset;
+    let main_bottom = HEIGHT - inset;
+    let main_radius = (main_bottom - main_top) / 2.0;
+
+    let tab_left = TOP_BAR_X + inset;
+    let tab_right = TOP_BAR_X + TOP_BAR_WIDTH - inset;
+    let tab_top = TOP_BAR_Y + inset;
+    let top_radius = (TOP_BAR_CORNER_RADIUS - border_offset).max(1.0);
+    // An inward offset grows a concave radius. This keeps the inner and outer
+    // shoulder centers identical and therefore the border width uniform.
+    let shoulder_radius = TOP_BAR_SHOULDER_RADIUS + border_offset;
+    if main_radius <= 0.0
+        || tab_right <= tab_left
+        || main_top - shoulder_radius <= tab_top + top_radius
+        || tab_left - shoulder_radius <= main_left + main_radius
+        || tab_right + shoulder_radius >= main_right - main_radius
+    {
+        return None;
+    }
+
+    let top_tangent = top_radius * 0.552_284_8;
+    let shoulder_tangent = shoulder_radius * 0.552_284_8;
+    let main_tangent = main_radius * 0.552_284_8;
+    let mut path = PathBuilder::new();
+
+    path.move_to(main_left + main_radius, main_top);
+    path.line_to(tab_left - shoulder_radius, main_top);
+    path.cubic_to(
+        tab_left - shoulder_radius + shoulder_tangent,
+        main_top,
+        tab_left,
+        main_top - shoulder_radius + shoulder_tangent,
+        tab_left,
+        main_top - shoulder_radius,
+    );
+    path.line_to(tab_left, tab_top + top_radius);
+    path.cubic_to(
+        tab_left,
+        tab_top + top_radius - top_tangent,
+        tab_left + top_radius - top_tangent,
+        tab_top,
+        tab_left + top_radius,
+        tab_top,
+    );
+    path.line_to(tab_right - top_radius, tab_top);
+    path.cubic_to(
+        tab_right - top_radius + top_tangent,
+        tab_top,
+        tab_right,
+        tab_top + top_radius - top_tangent,
+        tab_right,
+        tab_top + top_radius,
+    );
+    path.line_to(tab_right, main_top - shoulder_radius);
+    path.cubic_to(
+        tab_right,
+        main_top - shoulder_radius + shoulder_tangent,
+        tab_right + shoulder_radius - shoulder_tangent,
+        main_top,
+        tab_right + shoulder_radius,
+        main_top,
+    );
+    path.line_to(main_right - main_radius, main_top);
+    path.cubic_to(
+        main_right - main_radius + main_tangent,
+        main_top,
+        main_right,
+        main_top + main_radius - main_tangent,
+        main_right,
+        main_top + main_radius,
+    );
+    path.cubic_to(
+        main_right,
+        main_bottom - main_radius + main_tangent,
+        main_right - main_radius + main_tangent,
+        main_bottom,
+        main_right - main_radius,
+        main_bottom,
+    );
+    path.line_to(main_left + main_radius, main_bottom);
+    path.cubic_to(
+        main_left + main_radius - main_tangent,
+        main_bottom,
+        main_left,
+        main_bottom - main_radius + main_tangent,
+        main_left,
+        main_bottom - main_radius,
+    );
+    path.cubic_to(
+        main_left,
+        main_top + main_radius - main_tangent,
+        main_left + main_radius - main_tangent,
+        main_top,
+        main_left + main_radius,
+        main_top,
+    );
+    path.close();
+    path.finish()
 }
 
 /// Build a single closed capsule path so one rasterizer owns all four edges.

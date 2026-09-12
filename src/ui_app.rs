@@ -1,8 +1,6 @@
 use crate::activity_pipeline::ActivityHandle;
 use crate::audio::AudioCapture;
-use crate::composition::{
-    CompositionSession, MAX_SESSION_PCM_BYTES, SilenceCompactor, SilenceDisplay,
-};
+use crate::composition::{CompositionSession, MAX_SESSION_PCM_BYTES, SilenceCompactor};
 use crate::config::AppConfig;
 use crate::fal_client::transcribe_pcm;
 use crate::injector;
@@ -24,7 +22,6 @@ const OVERLAY_TICK_MS: u64 = 16;
 const OVERLAY_SMOOTHING: f32 = 0.28;
 const OVERLAY_SNAP_DISTANCE: f32 = 1.0;
 const TYPING_PREVIEW_CHARACTERS: usize = 256;
-const INSERTION_BADGE_DURATION: Duration = Duration::from_millis(1_200);
 type PolishResult = std::result::Result<String, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,7 +58,10 @@ pub struct UiApp {
     current_audio: Option<SilenceCompactor>,
     spectrum: SpectrumAnalyzer,
     session: Option<CompositionSession>,
-    typing_bar_until: Option<Instant>,
+    dictation_bar_active: bool,
+    dictation_insertion_count: usize,
+    recording_elapsed: Duration,
+    recording_started_at: Option<Instant>,
     text_action: Option<TextAction>,
     window_id: Option<window::Id>,
     position: Option<Point>,
@@ -113,7 +113,10 @@ impl UiApp {
             current_audio: None,
             spectrum: SpectrumAnalyzer::new(output_sample_rate),
             session: None,
-            typing_bar_until: None,
+            dictation_bar_active: false,
+            dictation_insertion_count: 0,
+            recording_elapsed: Duration::ZERO,
+            recording_started_at: None,
             text_action: None,
             window_id: None,
             position: None,
@@ -389,6 +392,7 @@ impl UiApp {
             return Task::none();
         }
         logger::info("Cancel operation requested");
+        self.stop_recording_timer();
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
@@ -396,7 +400,7 @@ impl UiApp {
         self.current_audio.take();
         self.spectrum.reset();
         self.session = None;
-        self.typing_bar_until = None;
+        self.clear_dictation_bar();
         self.state = DictationState::Idle;
         self.visible = false;
         self.status = "Cancelled".to_string();
@@ -428,7 +432,10 @@ impl UiApp {
         self.transcript.clear();
         self.polished = None;
         self.error = None;
-        self.typing_bar_until = None;
+        self.dictation_bar_active = true;
+        self.dictation_insertion_count = 0;
+        self.recording_elapsed = Duration::ZERO;
+        self.recording_started_at = None;
         self.session = Some(CompositionSession::new(
             target_hwnd,
             self.config.output_sample_rate,
@@ -458,6 +465,7 @@ impl UiApp {
         self.current_audio = Some(SilenceCompactor::new(sample_rate));
         self.spectrum = SpectrumAnalyzer::new(sample_rate);
         self.audio = Some(audio);
+        self.recording_started_at = Some(Instant::now());
         self.state = DictationState::Listening;
         self.status = "Listening...".to_string();
         self.send_win32(Win32Command::SetTooltip(
@@ -476,7 +484,6 @@ impl UiApp {
         self.seal_current_audio();
         self.state = DictationState::Typing;
         self.status = "Typing...".to_string();
-        self.typing_bar_until = None;
         self.send_win32(Win32Command::SetTooltip(
             "Ashe Worker - Typing - Enter to resume - Win+Shift+H".to_string(),
         ));
@@ -530,8 +537,8 @@ impl UiApp {
                 session.commit_insertion();
                 session.insertion_count()
             });
+            self.dictation_insertion_count = count;
             logger::info(format!("Dictation insertion committed count={count}"));
-            self.typing_bar_until = Some(Instant::now() + INSERTION_BADGE_DURATION);
             if let Err(error) = self.start_audio_capture() {
                 logger::info(format!("Audio resume failed: {error:#}"));
                 self.send_win32(Win32Command::ShowMessageBox {
@@ -553,6 +560,7 @@ impl UiApp {
     }
 
     fn seal_current_audio(&mut self) {
+        self.stop_recording_timer();
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
@@ -595,10 +603,10 @@ impl UiApp {
             session.commit_insertion();
         }
         self.send_win32(Win32Command::SetKeyboardCapture(false));
-        self.typing_bar_until = None;
         let Some(session) = self.session.take() else {
             return self.finish_without_transcript();
         };
+        self.dictation_insertion_count = session.insertion_count();
         let mut composition = session.finish();
         let target_hwnd = composition.target_hwnd();
         logger::info(format!(
@@ -944,7 +952,7 @@ impl UiApp {
     fn hide_overlay_after_session(&mut self) -> Task<Message> {
         self.session = None;
         self.current_audio = None;
-        self.typing_bar_until = None;
+        self.clear_dictation_bar();
         self.text_action = None;
         self.state = DictationState::Idle;
         self.visible = false;
@@ -953,6 +961,26 @@ impl UiApp {
         self.send_win32(Win32Command::SetActive(false));
         self.send_win32(Win32Command::SetFollowCursor(false));
         self.apply_window_state()
+    }
+
+    fn stop_recording_timer(&mut self) {
+        if let Some(started_at) = self.recording_started_at.take() {
+            self.recording_elapsed = self.recording_elapsed.saturating_add(started_at.elapsed());
+        }
+    }
+
+    fn recording_duration(&self) -> Duration {
+        self.recording_started_at
+            .map_or(self.recording_elapsed, |started_at| {
+                self.recording_elapsed.saturating_add(started_at.elapsed())
+            })
+    }
+
+    fn clear_dictation_bar(&mut self) {
+        self.dictation_bar_active = false;
+        self.dictation_insertion_count = 0;
+        self.recording_elapsed = Duration::ZERO;
+        self.recording_started_at = None;
     }
 
     fn advance_overlay_position(&mut self) -> bool {
@@ -993,21 +1021,12 @@ impl UiApp {
             DictationState::Transcribing | DictationState::Inserting => {
                 Some("processing...".to_string())
             }
-            DictationState::Typing => None,
-            DictationState::Listening | DictationState::Starting => self
-                .current_audio
-                .as_ref()
-                .and_then(|audio| match audio.display() {
-                    SilenceDisplay::Active => None,
-                    SilenceDisplay::Countdown(seconds) => Some(format!("silence {seconds}…")),
-                    SilenceDisplay::SilentNotSent => Some("silent · not sent".to_string()),
-                    SilenceDisplay::SilenceSkipped => Some("silence skipped".to_string()),
-                }),
+            DictationState::Typing | DictationState::Listening | DictationState::Starting => None,
             DictationState::Idle
             | DictationState::FixingGrammar
             | DictationState::AnsweringQuestion => None,
         };
-        let typing_bar = self.typing_bar_content();
+        let top_bar = self.top_bar_content();
         self.send_win32(Win32Command::UpdateOverlay {
             x: position.x,
             y: position.y,
@@ -1019,21 +1038,43 @@ impl UiApp {
             },
             state: self.pill_state(),
             main_text,
-            typing_bar,
+            top_bar,
         });
     }
 
-    fn typing_bar_content(&self) -> Option<pill_renderer::TypingBarContent> {
-        let show_after_commit = self
-            .typing_bar_until
-            .is_some_and(|deadline| Instant::now() < deadline);
-        if self.state != DictationState::Typing && !show_after_commit {
+    fn top_bar_content(&self) -> Option<pill_renderer::TopBarContent> {
+        if !self.dictation_bar_active {
             return None;
         }
-        let session = self.session.as_ref()?;
-        Some(pill_renderer::TypingBarContent {
-            count: format!("{} inserted", session.insertion_count()),
-            preview: session.typing_preview_tail(TYPING_PREVIEW_CHARACTERS),
+        let preview = self
+            .session
+            .as_ref()
+            .map(|session| session.typing_preview_tail(TYPING_PREVIEW_CHARACTERS))
+            .unwrap_or_default();
+        let (content, alignment) = if self.state == DictationState::Typing && !preview.is_empty() {
+            (preview, pill_renderer::TopBarAlignment::Trailing)
+        } else if matches!(
+            self.state,
+            DictationState::Starting | DictationState::Listening
+        ) && self
+            .current_audio
+            .as_ref()
+            .is_some_and(SilenceCompactor::silence_truncated)
+        {
+            (
+                "silence skipped".to_string(),
+                pill_renderer::TopBarAlignment::Center,
+            )
+        } else {
+            (
+                format_recording_duration(self.recording_duration()),
+                pill_renderer::TopBarAlignment::Center,
+            )
+        };
+        Some(pill_renderer::TopBarContent {
+            count: format!("{} inserted", self.dictation_insertion_count),
+            content,
+            alignment,
         })
     }
 
@@ -1041,6 +1082,18 @@ impl UiApp {
         if let Err(err) = self.win32_tx.send(command) {
             logger::info(format!("Win32 command send failed: {err}"));
         }
+    }
+}
+
+fn format_recording_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3_600;
+    let minutes = total_seconds / 60 % 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
     }
 }
 

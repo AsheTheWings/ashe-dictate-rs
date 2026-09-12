@@ -13,18 +13,9 @@ pub const MAX_SESSION_PCM_BYTES: usize = 256 * 1024 * 1024;
 
 const BYTES_PER_SAMPLE: usize = 2;
 const LONG_SILENCE_SECONDS: usize = 5;
-const COUNTDOWN_START_SECONDS: usize = 2;
 const GAP_EDGE_MILLISECONDS: usize = 250;
 const SPEECH_SEPARATOR_MILLISECONDS: usize = 500;
 const PASTE_MARKER: &str = "[pasted]";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SilenceDisplay {
-    Active,
-    Countdown(u8),
-    SilentNotSent,
-    SilenceSkipped,
-}
 
 /// Retains natural pauses exactly and compacts only proven five-second gaps.
 pub struct SilenceCompactor {
@@ -99,25 +90,8 @@ impl SilenceCompactor {
         }
     }
 
-    pub fn display(&self) -> SilenceDisplay {
-        let countdown_start = self.samples_for_seconds(COUNTDOWN_START_SECONDS);
-        if self.silent_samples < countdown_start {
-            return SilenceDisplay::Active;
-        }
-        if self.skipping {
-            return if self.has_speech {
-                SilenceDisplay::SilenceSkipped
-            } else {
-                SilenceDisplay::SilentNotSent
-            };
-        }
-
-        let remaining_samples = self
-            .samples_for_seconds(LONG_SILENCE_SECONDS)
-            .saturating_sub(self.silent_samples);
-        let sample_rate = self.sample_rate.max(1) as usize;
-        let remaining = remaining_samples.div_ceil(sample_rate).clamp(1, 3) as u8;
-        SilenceDisplay::Countdown(remaining)
+    pub fn silence_truncated(&self) -> bool {
+        self.skipping
     }
 
     pub fn estimated_bytes(&self) -> usize {
@@ -512,9 +486,7 @@ fn needs_boundary_space(left: char, right: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CompositionSession, MAX_SESSION_PCM_BYTES, SilenceCompactor, SilenceDisplay, TypingBuffer,
-    };
+    use super::{CompositionSession, MAX_SESSION_PCM_BYTES, SilenceCompactor, TypingBuffer};
     use crate::fal_client::{FalTranscript, TranscriptWord};
 
     fn pcm(sample: i16, samples: usize) -> Vec<u8> {
@@ -569,7 +541,7 @@ mod tests {
         let mut compact = SilenceCompactor::new(rate);
         compact.push_pcm(&speech_a, true);
         compact.push_pcm(&silence, false);
-        assert_eq!(compact.display(), SilenceDisplay::SilenceSkipped);
+        assert!(compact.silence_truncated());
         compact.push_pcm(&speech_b, true);
         let output = compact.finish().unwrap();
         assert_eq!(
@@ -587,7 +559,7 @@ mod tests {
         let speech = pcm(2_000, 10);
         let mut compact = SilenceCompactor::new(rate);
         compact.push_pcm(&silence, false);
-        assert_eq!(compact.display(), SilenceDisplay::SilentNotSent);
+        assert!(compact.silence_truncated());
         compact.push_pcm(&speech, true);
         let output = compact.finish().unwrap();
         assert_eq!(output.len(), pcm(0, 25).len() + speech.len());
@@ -613,16 +585,12 @@ mod tests {
     }
 
     #[test]
-    fn countdown_begins_after_two_seconds() {
+    fn silence_status_changes_only_after_truncation() {
         let mut compact = SilenceCompactor::new(100);
-        compact.push_pcm(&pcm(0, 199), false);
-        assert_eq!(compact.display(), SilenceDisplay::Active);
+        compact.push_pcm(&pcm(0, 499), false);
+        assert!(!compact.silence_truncated());
         compact.push_pcm(&pcm(0, 1), false);
-        assert_eq!(compact.display(), SilenceDisplay::Countdown(3));
-        compact.push_pcm(&pcm(0, 100), false);
-        assert_eq!(compact.display(), SilenceDisplay::Countdown(2));
-        compact.push_pcm(&pcm(0, 100), false);
-        assert_eq!(compact.display(), SilenceDisplay::Countdown(1));
+        assert!(compact.silence_truncated());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::logger;
-use crate::pill_renderer::{self, PillState, TypingBarContent};
+use crate::pill_renderer::{self, PillState, TopBarAlignment, TopBarContent};
 use crate::util::{pcwstr, wide};
 use anyhow::{Context, Result, anyhow};
 use cosmic_text::{Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping};
@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const CLASS_NAME: &str = "AsheWorkerLayeredOverlay";
 const WINDOW_NAME: &str = "Ashe Worker Dictation Overlay";
 const MAIN_FONT_PIXELS: f32 = 14.0;
-const TOP_BAR_FONT_PIXELS: f32 = 11.0;
+const TOP_BAR_FONT_PIXELS: f32 = 13.2;
 
 /// A Win32 layered window whose shape comes exclusively from per-pixel alpha.
 /// No chroma key, clipping region, or opaque backing surface participates.
@@ -45,7 +45,7 @@ pub struct OverlayFrame<'a> {
     pub bars: &'a [f32],
     pub state: PillState,
     pub main_text: Option<&'a str>,
-    pub typing_bar: Option<&'a TypingBarContent>,
+    pub top_bar: Option<&'a TopBarContent>,
 }
 
 impl NativeOverlay {
@@ -122,7 +122,7 @@ impl NativeOverlay {
             frame.bars,
             frame.state,
             frame.main_text.is_none(),
-            frame.typing_bar.is_some(),
+            frame.top_bar.is_some(),
         )
         .ok_or_else(|| anyhow!("failed to allocate layered overlay frame"))?;
         self.text.draw(
@@ -131,7 +131,7 @@ impl NativeOverlay {
             height,
             scale,
             frame.main_text,
-            frame.typing_bar,
+            frame.top_bar,
         );
 
         if self
@@ -296,7 +296,7 @@ impl TextRasterizer {
         height: u32,
         scale: f32,
         main_text: Option<&str>,
-        typing_bar: Option<&TypingBarContent>,
+        top_bar: Option<&TopBarContent>,
     ) {
         if let Some(text) = main_text.filter(|text| !text.is_empty()) {
             let rect = PixelRect::from_logical(
@@ -317,13 +317,13 @@ impl TextRasterizer {
                 u8::MAX,
             );
         }
-        if let Some(content) = typing_bar {
+        if let Some(content) = top_bar {
             let count_left = pill_renderer::TOP_BAR_X + pill_renderer::TOP_BAR_TEXT_INSET;
             let count_rect = PixelRect::from_logical(
                 count_left,
                 pill_renderer::TOP_BAR_Y,
                 pill_renderer::TOP_BAR_COUNT_WIDTH,
-                pill_renderer::MAIN_TOP,
+                pill_renderer::TOP_BAR_HEIGHT,
                 scale,
             );
             self.draw_text(
@@ -334,26 +334,55 @@ impl TextRasterizer {
                 TOP_BAR_FONT_PIXELS * scale,
                 count_rect,
                 TextAlign::Left,
-                178,
+                204,
             );
-            let preview_left = count_left + pill_renderer::TOP_BAR_COUNT_WIDTH + 8.0;
-            let preview_right = pill_renderer::TOP_BAR_X + pill_renderer::TOP_BAR_WIDTH
-                - pill_renderer::TOP_BAR_TEXT_INSET;
-            let preview_rect = PixelRect::from_logical(
-                preview_left,
-                pill_renderer::TOP_BAR_Y,
-                (preview_right - preview_left).max(0.0),
-                pill_renderer::MAIN_TOP,
-                scale,
-            );
+            // Both centered status (timer, silence notice) and trailing typed
+            // preview share the region right of the insertion count so the
+            // two text runs can never overlap. Centered status stays
+            // optically centered in the remaining space.
+            // Centered status (timer, silence notice) is centered in the
+            // full bar so its midpoint matches the bar midpoint, with the
+            // insertion count balanced by equal space on the right. At the
+            // current strings and sizes this clears the count without
+            // overlap. The typed preview stays in the region right of the
+            // count, right-aligned.
+            let (content_rect, alignment) = match content.alignment {
+                TopBarAlignment::Center => (
+                    PixelRect::from_logical(
+                        pill_renderer::TOP_BAR_X + pill_renderer::TOP_BAR_TEXT_INSET,
+                        pill_renderer::TOP_BAR_Y,
+                        pill_renderer::TOP_BAR_WIDTH - 2.0 * pill_renderer::TOP_BAR_TEXT_INSET,
+                        pill_renderer::TOP_BAR_HEIGHT,
+                        scale,
+                    ),
+                    TextAlign::Center,
+                ),
+                TopBarAlignment::Trailing => {
+                    let content_left = count_left
+                        + pill_renderer::TOP_BAR_COUNT_WIDTH
+                        + pill_renderer::TOP_BAR_CONTENT_GAP;
+                    let content_right = pill_renderer::TOP_BAR_X + pill_renderer::TOP_BAR_WIDTH
+                        - pill_renderer::TOP_BAR_TEXT_INSET;
+                    (
+                        PixelRect::from_logical(
+                            content_left,
+                            pill_renderer::TOP_BAR_Y,
+                            (content_right - content_left).max(0.0),
+                            pill_renderer::TOP_BAR_HEIGHT,
+                            scale,
+                        ),
+                        TextAlign::Right,
+                    )
+                }
+            };
             self.draw_text(
                 rgba,
                 width,
                 height,
-                &content.preview,
+                &content.content,
                 TOP_BAR_FONT_PIXELS * scale,
-                preview_rect,
-                TextAlign::Right,
+                content_rect,
+                alignment,
                 204,
             );
         }

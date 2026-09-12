@@ -3,7 +3,7 @@
 use crate::injector;
 use crate::logger;
 use crate::native_overlay::{NativeOverlay, OverlayFrame};
-use crate::pill_renderer::{self, TypingBarContent};
+use crate::pill_renderer::{self, TopBarContent};
 use crate::util::{pcwstr, wide};
 use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
@@ -117,7 +117,7 @@ pub enum Win32Command {
         bars: Vec<f32>,
         state: pill_renderer::PillState,
         main_text: Option<String>,
-        typing_bar: Option<TypingBarContent>,
+        top_bar: Option<TopBarContent>,
     },
     Shutdown,
 }
@@ -142,7 +142,7 @@ struct OverlayUpdate {
     bars: Vec<f32>,
     state: pill_renderer::PillState,
     main_text: Option<String>,
-    typing_bar: Option<TypingBarContent>,
+    top_bar: Option<TopBarContent>,
 }
 
 thread_local! {
@@ -486,7 +486,7 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                 bars,
                 state,
                 main_text,
-                typing_bar,
+                top_bar,
             } => {
                 pending_overlay = Some(OverlayUpdate {
                     x,
@@ -495,7 +495,7 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
                     bars,
                     state,
                     main_text,
-                    typing_bar,
+                    top_bar,
                 });
             }
             Win32Command::Shutdown => {
@@ -514,7 +514,7 @@ unsafe fn drain_commands(hwnd: HWND, state: &mut ServiceState) {
             bars: &update.bars,
             state: update.state,
             main_text: update.main_text.as_deref(),
-            typing_bar: update.typing_bar.as_ref(),
+            top_bar: update.top_bar.as_ref(),
         }) {
             Ok(()) => state.overlay_error_logged = false,
             Err(error) if !state.overlay_error_logged => {
