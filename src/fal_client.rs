@@ -1,30 +1,32 @@
 //! Speech-to-text through fal.ai's queue API (ElevenLabs Scribe v2).
 //!
 //! Dictation buffers microphone audio locally while recording and calls
-//! [`transcribe_pcm`] once on stop: the WAV uploads to fal's CDN, a queue
-//! request runs the model, and polling waits for completion. A single
-//! full-utterance request produces a more accurate result than committing
-//! streaming partials as they arrive.
+//! [`transcribe_pcm`] once on stop: the WAV is embedded directly in a queue
+//! request and polling waits for completion. A single full-utterance request
+//! produces a more accurate result than committing streaming partials.
 
 use crate::config::AppConfig;
 use crate::logger;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Map, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// fal.ai storage endpoint that mints a one-shot upload URL for the WAV.
-const STORAGE_INITIATE_URL: &str =
-    "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
 /// fal.ai queue gateway; the model id appends as the path.
 const QUEUE_BASE_URL: &str = "https://queue.fal.run";
 /// Pause between queue status polls.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Status polls before giving up (~10 minutes, past any dictation length).
-const POLL_ATTEMPTS: u32 = 300;
-/// Per-request ceiling for upload, submit, status, and result fetches.
+const POLL_ATTEMPTS: u32 = 1_200;
+/// Stop a dead route from inheriting Windows' roughly 21-second TCP wait.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Retry one transient submit failure before surfacing an error.
+const SUBMIT_ATTEMPTS: u32 = 2;
+const SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Per-request ceiling for submit, status, and result fetches.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-const WAV_MIME: &str = "audio/wav";
-const WAV_FILE_NAME: &str = "ashe-dictation.wav";
+const WAV_DATA_URI_PREFIX: &str = "data:audio/wav;base64,";
 
 /// Transcribe a complete recording with one queue request.
 pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -> Result<String> {
@@ -38,16 +40,30 @@ pub async fn transcribe_pcm(config: AppConfig, sample_rate: u32, pcm: Vec<u8>) -
         seconds,
         config.fal_keyterms.len()
     ));
+    let started = Instant::now();
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .context("failed to create HTTP client")?;
     let wav = encode_wav_mono16(&pcm, sample_rate);
-    let audio_url = upload_wav(&client, &config.fal_api_key, wav).await?;
+    let audio_url = wav_data_uri(&wav);
+    let encoded = Instant::now();
     let queued = submit_transcription(&client, &config, &audio_url).await?;
+    let submitted = Instant::now();
     wait_completed(&client, &config.fal_api_key, &queued).await?;
+    let completed = Instant::now();
     let transcript = fetch_transcript(&client, &config.fal_api_key, &queued).await?;
-    logger::info(format!("fal transcript chars={}", transcript.len()));
+    let finished = Instant::now();
+    logger::info(format!(
+        "fal transcript chars={} encode_ms={} submit_ms={} queue_ms={} result_ms={} total_ms={}",
+        transcript.len(),
+        encoded.duration_since(started).as_millis(),
+        submitted.duration_since(encoded).as_millis(),
+        completed.duration_since(submitted).as_millis(),
+        finished.duration_since(completed).as_millis(),
+        finished.duration_since(started).as_millis()
+    ));
     Ok(transcript)
 }
 
@@ -68,32 +84,13 @@ fn auth_header(api_key: &str) -> String {
     format!("Key {}", api_key.trim())
 }
 
-/// Upload the WAV to fal's CDN: initiate for a signed URL, then PUT the
-/// bytes. Returns the public file URL the model downloads.
-async fn upload_wav(client: &reqwest::Client, api_key: &str, wav: Vec<u8>) -> Result<String> {
-    let initiate = client
-        .post(STORAGE_INITIATE_URL)
-        .header("Authorization", auth_header(api_key))
-        .json(&serde_json::json!({"content_type": WAV_MIME, "file_name": WAV_FILE_NAME}))
-        .send()
-        .await
-        .context("fal upload initiate request failed")?
-        .error_for_status()
-        .context("fal upload initiate rejected")?
-        .json::<Value>()
-        .await
-        .context("fal upload initiate returned invalid JSON")?;
-    let (upload_url, file_url) = parse_initiate_response(&initiate)?;
-    client
-        .put(upload_url)
-        .header("Content-Type", WAV_MIME)
-        .body(wav)
-        .send()
-        .await
-        .context("fal audio upload failed")?
-        .error_for_status()
-        .context("fal audio upload rejected")?;
-    Ok(file_url)
+/// Encode a complete WAV as the Base64 data URI accepted by Scribe v2.
+fn wav_data_uri(wav: &[u8]) -> String {
+    let encoded_len = wav.len().div_ceil(3) * 4;
+    let mut uri = String::with_capacity(WAV_DATA_URI_PREFIX.len() + encoded_len);
+    uri.push_str(WAV_DATA_URI_PREFIX);
+    BASE64_STANDARD.encode_string(wav, &mut uri);
+    uri
 }
 
 /// A queued request with the follow-up URLs the queue assigns it. The
@@ -113,17 +110,30 @@ async fn submit_transcription(
     audio_url: &str,
 ) -> Result<QueuedRequest> {
     let url = format!("{QUEUE_BASE_URL}/{}", config.fal_stt_model.trim());
-    let submit = client
-        .post(url)
-        .header("Authorization", auth_header(&config.fal_api_key))
-        .json(&scribe_input(
-            audio_url,
-            &config.fal_language,
-            &config.fal_keyterms,
-        ))
-        .send()
-        .await
-        .context("fal queue submit request failed")?
+    let input = scribe_input(audio_url, &config.fal_language, &config.fal_keyterms);
+    let mut attempt = 1;
+    let response = loop {
+        match client
+            .post(&url)
+            .header("Authorization", auth_header(&config.fal_api_key))
+            .json(&input)
+            .send()
+            .await
+        {
+            Ok(response) => break response,
+            Err(error)
+                if attempt < SUBMIT_ATTEMPTS && (error.is_connect() || error.is_timeout()) =>
+            {
+                logger::info(format!(
+                    "fal queue submit attempt={attempt} failed transiently; retrying: {error}"
+                ));
+                attempt += 1;
+                tokio::time::sleep(SUBMIT_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error).context("fal queue submit request failed"),
+        }
+    };
+    let submit = response
         .error_for_status()
         .context("fal queue submit rejected")?
         .json::<Value>()
@@ -224,23 +234,6 @@ pub fn scribe_input(audio_url: &str, language: &str, keyterms: &[String]) -> Val
     Value::Object(input)
 }
 
-fn parse_initiate_response(body: &Value) -> Result<(String, String)> {
-    let upload_url = body
-        .get("upload_url")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let file_url = body
-        .get("file_url")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if upload_url.is_empty() || file_url.is_empty() {
-        return Err(anyhow!(
-            "fal upload initiate response is missing upload_url or file_url"
-        ));
-    }
-    Ok((upload_url.to_string(), file_url.to_string()))
-}
-
 fn parse_submit_response(body: &Value) -> Result<QueuedRequest> {
     let field = |name: &str| {
         body.get(name)
@@ -321,7 +314,9 @@ pub fn encode_wav_mono16(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{encode_wav_mono16, extract_transcript, parse_status, scribe_input};
-    use super::{parse_initiate_response, parse_submit_response};
+    use super::{parse_submit_response, wav_data_uri};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
 
     #[test]
@@ -366,15 +361,11 @@ mod tests {
     }
 
     #[test]
-    fn initiate_response_yields_both_urls() {
-        let (upload_url, file_url) = parse_initiate_response(&json!({
-            "upload_url": "https://example.com/upload?sig=1",
-            "file_url": "https://example.com/file.wav"
-        }))
-        .unwrap();
-        assert_eq!(upload_url, "https://example.com/upload?sig=1");
-        assert_eq!(file_url, "https://example.com/file.wav");
-        assert!(parse_initiate_response(&json!({"file_url": "x"})).is_err());
+    fn wav_data_uri_round_trips_without_storage() {
+        let wav = encode_wav_mono16(&[1, 2, 3, 4], 48_000);
+        let uri = wav_data_uri(&wav);
+        let encoded = uri.strip_prefix(super::WAV_DATA_URI_PREFIX).unwrap();
+        assert_eq!(BASE64_STANDARD.decode(encoded).unwrap(), wav);
     }
 
     #[test]
