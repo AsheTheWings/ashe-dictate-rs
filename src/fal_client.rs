@@ -226,6 +226,7 @@ async fn fetch_transcript(
 /// Build the Scribe v2 input. Single-speaker dictation wants clean
 /// insertable text, so diarization and audio-event tags stay off.
 /// Keyterms cost ~30% extra, so they are only sent when configured.
+#[cfg(test)]
 pub fn scribe_input(audio_url: &str, language: &str, keyterms: &[String]) -> Value {
     scribe_input_owned(audio_url.to_string(), language, keyterms)
 }
