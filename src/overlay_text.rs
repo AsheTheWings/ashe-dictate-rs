@@ -1,9 +1,7 @@
 //! Text rasterization for the dictation overlay.
 //!
-//! This module owns the cosmic-text rendering behind the layered pill: bar
-//! labels, the typing preview with its line-break marker styling, and the
-//! pixel compositing helpers. It has no Win32 dependencies so the renderer
-//! stays unit-testable on any host; `native_overlay` owns presentation.
+//! Bar labels, the typing preview, and pixel compositing. No Win32
+//! dependencies; `native_overlay` owns presentation.
 
 use crate::pill_renderer::{self, TopBarAlignment, TopBarContent};
 use cosmic_text::{Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping};
@@ -11,9 +9,7 @@ use cosmic_text::{SwashCache, Wrap};
 
 const MAIN_FONT_PIXELS: f32 = 14.0;
 const TOP_BAR_FONT_PIXELS: f32 = 13.2;
-/// Line-break marker scale and color. The `↵` renders larger than the
-/// surrounding bar text in the palette cyan, both as listening feedback
-/// and inline in the typing preview.
+/// Marker scale and color: 1.5x palette cyan, inline and accessory.
 const TOP_BAR_LINE_BREAK_SCALE: f32 = 1.5;
 const LINE_BREAK_CYAN: TextColor = TextColor::rgb(0, 224, 255);
 const LINE_BREAK_MARKER: char = '↵';
@@ -80,16 +76,8 @@ impl TextRasterizer {
                 TextColor::rgb(255, 255, 255),
                 204,
             );
-            // Both centered status (timer, silence notice) and trailing typed
-            // preview share the region right of the insertion count so the
-            // two text runs can never overlap. Centered status stays
-            // optically centered in the remaining space.
-            // Centered status (timer, silence notice) is centered in the
-            // full bar so its midpoint matches the bar midpoint, with the
-            // insertion count balanced by equal space on the right. At the
-            // current strings and sizes this clears the count without
-            // overlap. The typed preview stays in the region right of the
-            // count, right-aligned.
+            // Centered status uses the full bar; the trailing preview stays
+            // right of the count, so the two runs never overlap.
             let (content_rect, alignment) = match content.alignment {
                 TopBarAlignment::Center => (
                     PixelRect::from_logical(
@@ -119,12 +107,10 @@ impl TextRasterizer {
                     )
                 }
             };
-            // The typing preview keeps `↵` markers inline as larger cyan
-            // spans with a space of padding on each side. The padding is
-            // display-only; the committed insertion still holds `\n`.
-            if content.alignment == TopBarAlignment::Trailing
-                && content.content.contains(LINE_BREAK_MARKER)
-            {
+            // Every preview shares one rich path and fixed line box for a
+            // stable baseline. Marker padding is display-only; commits
+            // still hold `\n`.
+            if content.alignment == TopBarAlignment::Trailing {
                 self.draw_line_break_preview(
                     rgba,
                     width,
@@ -235,6 +221,21 @@ impl TextRasterizer {
             .iter()
             .map(|(text, attrs)| (text.as_str(), attrs.clone()))
             .collect();
+        // Mixed-size spans move the laid-out baseline; rebase onto the
+        // uniform-size baseline.
+        let baseline_dy = if preview.contains(LINE_BREAK_MARKER) {
+            let line_height = (font_size * TOP_BAR_LINE_BREAK_SCALE * 1.35).max(1.0);
+            match (
+                self.uniform_line_y(preview, font_size, line_height, clip.height),
+                self.rich_line_y(&refs, font_size, line_height, clip.height),
+            ) {
+                // Match `Buffer::draw`, which truncates the baseline.
+                (Some(canonical), Some(real)) => canonical as i32 - real as i32,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         self.draw_rich_text(
             rgba,
             width,
@@ -245,6 +246,7 @@ impl TextRasterizer {
             alignment,
             TextColor::rgb(255, 255, 255),
             opacity,
+            baseline_dy,
         );
     }
 
@@ -260,12 +262,12 @@ impl TextRasterizer {
         alignment: TextAlign,
         default_color: TextColor,
         opacity: u8,
+        baseline_dy: i32,
     ) {
         if spans.is_empty() || clip.width <= 0 || clip.height <= 0 {
             return;
         }
-        // The buffer line must clear the enlarged marker, not just the
-        // base text, or the marker clips vertically.
+        // Size the line box for the enlarged marker so it never clips.
         let line_height = (base_font_size * TOP_BAR_LINE_BREAK_SCALE * 1.35).max(1.0);
         let mut buffer = Buffer::new(
             &mut self.fonts,
@@ -298,7 +300,63 @@ impl TextRasterizer {
                 });
             },
         );
-        Self::blit(rgba, width, height, &raster, clip, alignment, opacity);
+        Self::blit_pinned(
+            rgba,
+            width,
+            height,
+            &raster,
+            clip,
+            alignment,
+            opacity,
+            line_height,
+            baseline_dy,
+        );
+    }
+
+    /// Laid-out baseline of a uniform-size buffer, in buffer pixels.
+    fn uniform_line_y(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        height: i32,
+    ) -> Option<f32> {
+        let mut buffer = Buffer::new(
+            &mut self.fonts,
+            Metrics::new(font_size.max(1.0), line_height),
+        );
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, Some(height as f32));
+        let attrs = Attrs::new().family(Family::Name("Segoe UI"));
+        buffer.set_text(&mut self.fonts, text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer.layout_runs().next().map(|run| run.line_y)
+    }
+
+    /// Laid-out baseline of the mixed-size rich buffer, in buffer pixels.
+    fn rich_line_y(
+        &mut self,
+        spans: &[(&str, Attrs)],
+        base_font_size: f32,
+        line_height: f32,
+        height: i32,
+    ) -> Option<f32> {
+        let mut buffer = Buffer::new(
+            &mut self.fonts,
+            Metrics::new(base_font_size.max(1.0), line_height),
+        );
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, Some(height as f32));
+        let default_attrs = Attrs::new().family(Family::Name("Segoe UI"));
+        buffer.set_rich_text(
+            &mut self.fonts,
+            spans.iter().map(|(text, attrs)| (*text, attrs.clone())),
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer.layout_runs().next().map(|run| run.line_y)
     }
 
     fn blit(
@@ -320,6 +378,52 @@ impl TextRasterizer {
         };
         let origin_y = clip.top + (clip.height - bounds.height()) / 2 - bounds.top;
 
+        Self::blit_at(
+            rgba, width, height, raster, clip, origin_x, origin_y, opacity,
+        );
+    }
+
+    /// Blit with the vertical origin pinned to the fixed line box, which
+    /// unlike the ink box does not vary with content.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_pinned(
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        raster: &[RasterPixel],
+        clip: PixelRect,
+        alignment: TextAlign,
+        opacity: u8,
+        line_height: f32,
+        baseline_dy: i32,
+    ) {
+        let Some(bounds) = RasterBounds::for_pixels(raster) else {
+            return;
+        };
+        let origin_x = match alignment {
+            TextAlign::Left => clip.left - bounds.left,
+            TextAlign::Center => clip.left + (clip.width - bounds.width()) / 2 - bounds.left,
+            TextAlign::Right => clip.right() - bounds.width() - bounds.left,
+        };
+        let origin_y =
+            clip.top + ((clip.height as f32 - line_height) / 2.0).round() as i32 + baseline_dy;
+
+        Self::blit_at(
+            rgba, width, height, raster, clip, origin_x, origin_y, opacity,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_at(
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        raster: &[RasterPixel],
+        clip: PixelRect,
+        origin_x: i32,
+        origin_y: i32,
+        opacity: u8,
+    ) {
         for pixel in raster {
             for offset_y in 0..pixel.height as i32 {
                 for offset_x in 0..pixel.width as i32 {
@@ -334,9 +438,8 @@ impl TextRasterizer {
     }
 }
 
-/// Split a typing preview into render spans. Base text keeps the default
-/// style; each `↵` becomes a larger cyan span wrapped in one space of
-/// horizontal padding on each side.
+/// Split a preview into render spans; each `↵` becomes a padded, larger
+/// cyan span.
 fn line_break_spans(preview: &str, base_font_size: f32) -> Vec<(String, Attrs<'_>)> {
     let base = Attrs::new().family(Family::Name("Segoe UI"));
     let marker_font = (base_font_size * TOP_BAR_LINE_BREAK_SCALE).max(1.0);
@@ -459,8 +562,62 @@ fn composite_pixel(
 }
 #[cfg(test)]
 mod tests {
-    use super::{LINE_BREAK_CYAN, composite_pixel, line_break_spans};
+    use super::{
+        LINE_BREAK_CYAN, PixelRect, TextAlign, TextRasterizer, composite_pixel, line_break_spans,
+    };
     use cosmic_text::Color;
+
+    fn render_preview(preview: &str) -> Vec<u8> {
+        let clip = PixelRect::from_logical(0.0, 0.0, 300.0, 31.2, 1.0);
+        let mut canvas = vec![0_u8; 300 * 31 * 4];
+        TextRasterizer::new().draw_line_break_preview(
+            &mut canvas,
+            300,
+            31,
+            preview,
+            13.2,
+            clip,
+            TextAlign::Left,
+            204,
+        );
+        canvas
+    }
+
+    fn ink_pixel_count(canvas: &[u8]) -> usize {
+        canvas.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
+    }
+
+    fn assert_shared_prefix_stable(base: &[u8], extended: &[u8], typed: char) {
+        assert!(ink_pixel_count(extended) > ink_pixel_count(base));
+        for (index, (a, b)) in base
+            .chunks_exact(4)
+            .zip(extended.chunks_exact(4))
+            .enumerate()
+        {
+            if a != [0, 0, 0, 0] {
+                assert_eq!(
+                    a, b,
+                    "shared prefix pixel {index} moved after typing '{typed}'"
+                );
+            }
+        }
+    }
+
+    /// Shared prefix pixels are stable when a taller glyph is typed.
+    #[test]
+    fn typing_a_taller_glyph_keeps_shared_prefix_pixels_stable() {
+        let base = render_preview("pro");
+        let taller = render_preview("prol");
+        assert_shared_prefix_stable(&base, &taller, 'l');
+    }
+
+    /// Shared prefix pixels are stable across marker insertion.
+    #[test]
+    fn inserting_a_line_break_keeps_shared_prefix_pixels_stable() {
+        let base = render_preview("ab");
+        let marked = render_preview("ab↵cd");
+        assert_shared_prefix_stable(&base, &marked, '↵');
+    }
 
     #[test]
     fn text_compositing_creates_premultiplied_alpha_on_transparency() {
