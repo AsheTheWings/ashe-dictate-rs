@@ -117,7 +117,7 @@ pub fn view<'a, Message: 'a>(content: PillContent<'a>) -> Element<'a, Message> {
     container(visualizer)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding([8, 20])
+        .padding(8)
         .clip(true)
         .style(move |_| container::Style {
             text_color: Some(Color::from_rgb(0.96, 0.99, 1.0)),
@@ -298,8 +298,12 @@ pub fn apply_native_styles() {
         // Layered-window presentation ignores per-pixel alpha, so without a
         // region the window corners show through around the pill. Clip the
         // OS window to the pill shape; the size is fixed, so once is enough.
+        // The region is a 1-bit mask with no antialiasing, so it is inset
+        // one pixel: the clip then lands inside the solid border instead of
+        // across its antialiased outer fringe, which reads as a clean edge
+        // rather than speckle.
         let (region_w, region_h, corner) = pill_region_px(GetDpiForWindow(hwnd));
-        let region = CreateRoundRectRgn(0, 0, region_w + 1, region_h + 1, corner, corner);
+        let region = CreateRoundRectRgn(1, 1, region_w, region_h, corner - 2, corner - 2);
         if region.is_invalid() {
             logger::info(format!(
                 "Overlay native region skipped reason=create_failed hwnd={:p}",
